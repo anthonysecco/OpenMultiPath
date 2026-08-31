@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+
+	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 )
 
 type ResponderConfig struct {
@@ -11,10 +13,10 @@ type ResponderConfig struct {
 	LoopbackTarget string // local WireGuard's own listen address
 }
 
-// RunResponder relays between the public endpoint (reachable from any of
-// the RV's physical paths) and a local WireGuard interface, duplicating
-// replies to every RV address seen recently. It blocks until a fatal error
-// occurs.
+// RunResponder relays between the public endpoint, reachable from any of
+// the RV's physical paths, and a local WireGuard interface. Replies are
+// duplicated back over every path currently being heard from. It blocks
+// until a fatal error occurs.
 func RunResponder(cfg ResponderConfig) error {
 	pubAddr, err := net.ResolveUDPAddr("udp", cfg.PublicAddr)
 	if err != nil {
@@ -36,21 +38,36 @@ func RunResponder(cfg ResponderConfig) error {
 	}
 	defer wgConn.Close()
 
-	knownRVAddrs := newAddrSet()
+	sess := newSession()
+	go sess.logStats()
 
-	// Any RV path -> local WireGuard, remembering where it came from.
+	// Any RV path -> local WireGuard. Which path a packet came in on is
+	// taken from the header rather than inferred from its source address,
+	// which is what makes the return route survive the RV's addresses
+	// moving under CGNAT: the address is merely recorded against the path
+	// the header names.
 	go readLoop(pubConn, "responder-public", func(buf []byte, from *net.UDPAddr) {
-		knownRVAddrs.add(from)
-		if _, err := wgConn.WriteToUDP(buf, wgTarget); err != nil {
+		h, payload, err := protocol.Parse(buf)
+		if err != nil {
+			log.Printf("responder: bad packet from %s: %v", from, err)
+			return
+		}
+		sess.observe(&h)
+		sess.setRemote(h.PathID, from)
+
+		if _, err := wgConn.WriteToUDP(payload, wgTarget); err != nil {
 			log.Printf("responder: write to wireguard failed: %v", err)
 		}
 	})
 
-	// WireGuard -> duplicate the reply to every RV path address seen so far.
-	go readLoop(wgConn, "responder-wg", func(buf []byte, _ *net.UDPAddr) {
-		for _, addr := range knownRVAddrs.snapshot() {
-			if _, err := pubConn.WriteToUDP(buf, addr); err != nil {
-				log.Printf("responder: write to %s failed: %v", addr, err)
+	// WireGuard -> duplicate the reply back over every known path.
+	scratch := make([]byte, 0, bufSize+maxHeaderLen)
+	go readLoop(wgConn, "responder-wg", func(payload []byte, _ *net.UDPAddr) {
+		globalSeq := sess.nextGlobalSeq()
+		for _, r := range sess.remotes() {
+			out := sess.stamp(r.pathID, globalSeq, payload, scratch)
+			if _, err := pubConn.WriteToUDP(out, r.addr); err != nil {
+				log.Printf("responder: write to path %d at %s failed: %v", r.pathID, r.addr, err)
 			}
 		}
 	})

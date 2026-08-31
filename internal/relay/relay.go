@@ -1,49 +1,32 @@
-// Package relay is a placeholder transport layer for the OpenMultiPath daemon.
+// Package relay is the transport layer of the OpenMultiPath daemon.
 //
-// It sits between the local WireGuard interface (which talks only to
-// loopback) and the physical WAN links, blindly duplicating every packet
-// across all paths in both directions. There is no header, sequencing, or
-// path selection yet - WireGuard's own replay protection is what silently
-// drops the duplicate copies. This exists so the WireGuard interfaces could
-// be collapsed to a single loopback-facing tunnel per scope-v1.md's
-// intended design without leaving the tunnel non-functional in the
-// meantime; the header and real path selection land on top of this.
+// It sits between the local WireGuard interface, which talks only to
+// loopback, and the physical WAN links. Every packet is wrapped in the
+// header from internal/protocol, carrying the sequence numbers and
+// timestamps that per-path measurement is built on, then duplicated across
+// all paths in both directions.
+//
+// Duplication is currently unconditional, and WireGuard's own replay
+// protection is what drops the redundant copies. That is deliberate for
+// now: scope-v1.md wants the tunnel carrying traffic with full per-path
+// telemetry before any scheduling logic exists, so there is no scoring,
+// no path selection, and no classification here yet. Once those land,
+// duplication becomes a policy decision per class and budget band rather
+// than the only behaviour.
 package relay
 
 import (
 	"log"
 	"net"
-	"sync"
 )
 
 const bufSize = 2048
 
-// addrSet tracks the distinct peer addresses recently seen, so the
-// responder knows where to duplicate its replies to.
-type addrSet struct {
-	mu   sync.RWMutex
-	seen map[string]*net.UDPAddr
-}
-
-func newAddrSet() *addrSet {
-	return &addrSet{seen: make(map[string]*net.UDPAddr)}
-}
-
-func (s *addrSet) add(addr *net.UDPAddr) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.seen[addr.String()] = addr
-}
-
-func (s *addrSet) snapshot() []*net.UDPAddr {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]*net.UDPAddr, 0, len(s.seen))
-	for _, a := range s.seen {
-		out = append(out, a)
-	}
-	return out
-}
+// maxHeaderLen is the headroom reserved for the wire header when building
+// an outgoing packet. The echo block grows with the number of paths, so
+// this is sized well past any realistic path count rather than exactly;
+// append handles anything larger correctly, just with an allocation.
+const maxHeaderLen = 256
 
 func readLoop(conn *net.UDPConn, name string, handle func(buf []byte, from *net.UDPAddr)) {
 	buf := make([]byte, bufSize)

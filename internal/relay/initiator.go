@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync/atomic"
 	"syscall"
+
+	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 )
 
 // PathConfig is one physical WAN link the initiator sends duplicate copies
@@ -60,26 +62,43 @@ func RunInitiator(cfg InitiatorConfig) error {
 	// first outbound packet, and where inbound replies get delivered.
 	var wgPeer atomic.Pointer[net.UDPAddr]
 
-	// WireGuard -> duplicate onto every physical path.
-	go readLoop(wgConn, "initiator-wg", func(buf []byte, from *net.UDPAddr) {
+	sess := newSession()
+	go sess.logStats()
+
+	// WireGuard -> duplicate onto every physical path. The global sequence
+	// is allocated once here, before the copies are made, so every copy of
+	// a packet is recognisable as the same packet at the far end.
+	// readLoop calls this from a single goroutine, so one scratch buffer
+	// serves every copy: each is written out before the next is built.
+	scratch := make([]byte, 0, bufSize+maxHeaderLen)
+	go readLoop(wgConn, "initiator-wg", func(payload []byte, from *net.UDPAddr) {
 		wgPeer.Store(from)
+		globalSeq := sess.nextGlobalSeq()
 		for i, conn := range pathConns {
-			if _, err := conn.WriteToUDP(buf, remoteAddr); err != nil {
+			out := sess.stamp(uint8(i), globalSeq, payload, scratch)
+			if _, err := conn.WriteToUDP(out, remoteAddr); err != nil {
 				log.Printf("initiator: write to path %s failed: %v", cfg.Paths[i].Name, err)
 			}
 		}
 	})
 
-	// Each physical path -> local WireGuard (duplicates land here too;
-	// WireGuard's replay protection drops the redundant copy).
+	// Each physical path -> local WireGuard. Duplicates land here too;
+	// WireGuard's replay protection drops the redundant copy.
 	for i, conn := range pathConns {
 		name := cfg.Paths[i].Name
 		go readLoop(conn, "initiator-path-"+name, func(buf []byte, _ *net.UDPAddr) {
+			h, payload, err := protocol.Parse(buf)
+			if err != nil {
+				log.Printf("initiator: bad packet on path %s: %v", name, err)
+				return
+			}
+			sess.observe(&h)
+
 			peer := wgPeer.Load()
 			if peer == nil {
 				return // haven't heard from local WireGuard yet
 			}
-			if _, err := wgConn.WriteToUDP(buf, peer); err != nil {
+			if _, err := wgConn.WriteToUDP(payload, peer); err != nil {
 				log.Printf("initiator: write to wireguard failed: %v", err)
 			}
 		})
