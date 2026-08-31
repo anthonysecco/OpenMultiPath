@@ -76,6 +76,45 @@ type pathStats struct {
 	runLen   int // consecutive losses currently accumulating
 	received uint64
 	lost     uint64
+
+	// Loss over a recent window, kept alongside the lifetime totals.
+	//
+	// A lifetime figure is the wrong thing to lead an instrument with. An
+	// incident that ended ten minutes ago goes on reading as a present
+	// fault, and whoever is looking at it chases something that is
+	// already over. Two windows are held so the reported figure does not
+	// collapse to nothing the instant a window turns over.
+	winStart time.Duration
+	winRecv  uint64
+	winLost  uint64
+	prevRecv uint64
+	prevLost uint64
+}
+
+// lossWindow is how much recent history the reported loss rate covers.
+// Long enough to be a stable figure, short enough that a resolved problem
+// stops being reported as a current one.
+const lossWindow = 30 * time.Second
+
+// rollLossWindow retires the current counting window when it is old enough.
+func (s *pathStats) rollLossWindow(now time.Duration) {
+	if now-s.winStart < lossWindow {
+		return
+	}
+	s.prevRecv, s.prevLost = s.winRecv, s.winLost
+	s.winRecv, s.winLost = 0, 0
+	s.winStart = now
+}
+
+// recentLossPercent is loss across the current and previous windows, so it
+// reflects roughly the last minute rather than all of history.
+func (s *pathStats) recentLossPercent() float64 {
+	recv, lost := s.winRecv+s.prevRecv, s.winLost+s.prevLost
+	total := recv + lost
+	if total == 0 {
+		return 0
+	}
+	return float64(lost) / float64(total) * 100
 }
 
 // observeTransit folds one arrival into the statistics. transit is the raw
@@ -146,6 +185,8 @@ func (s *pathStats) observeTransit(transit uint32, now time.Duration) (peerResta
 
 	s.queueDelay = rel - s.windowMin
 	s.received++
+	s.rollLossWindow(now)
+	s.winRecv++
 	return peerRestarted
 }
 
@@ -161,12 +202,14 @@ func (s *pathStats) rebaseline(transit uint32, now time.Duration) {
 	s.haveEWMA, s.haveLast, s.haveMin = false, false, false
 	s.ewma, s.jitter = 0, 0
 	s.queueDelay = 0
+	s.winStart = now
 }
 
 // observeLoss records a gap of n packets on this path, closing out any
 // burst that was accumulating once delivery resumes.
 func (s *pathStats) observeLoss(n uint32) {
 	s.lost += uint64(n)
+	s.winLost += uint64(n)
 	s.runLen += int(n)
 }
 

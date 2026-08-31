@@ -176,7 +176,8 @@ function renderAggregate(s) {
 
   $("aggregate").innerHTML =
     card("Paths alive", `${a.paths_alive}/${a.paths_total}`) +
-    card("Loss", fmt(a.loss_percent, 2) + "%",
+    card("Loss (recent)", fmt(a.recent_loss_percent, 2) + "%", "last minute") +
+    card("Loss (lifetime)", fmt(a.loss_percent, 2) + "%",
          `${a.lost.toLocaleString()} of ${(a.received + a.lost).toLocaleString()}`) +
     card("Best RTT", a.best_rtt_ms ? fmt(a.best_rtt_ms) + " ms" : "—",
          "lowest across live paths") +
@@ -216,8 +217,10 @@ function renderPaths(s) {
         <div class="metric"><div class="k">p95 spread</div><div class="v">${fmt(p.p95_spread_ms)} ms</div></div>
         <div class="metric"><div class="k">Jitter</div><div class="v">${fmt(p.jitter_ms)} ms</div></div>
         <div class="metric"><div class="k">Queue delay</div><div class="v">${fmt(p.queue_delay_ms)} ms</div></div>
-        <div class="metric"><div class="k">Loss</div>
-          <div class="v" style="color:var(--${lossClass(p.loss_percent)})">${fmt(p.loss_percent, 2)}%</div></div>
+        <div class="metric"><div class="k">Loss (recent)</div>
+          <div class="v" style="color:var(--${lossClass(p.recent_loss_percent)})">${fmt(p.recent_loss_percent, 2)}%</div></div>
+        <div class="metric"><div class="k">Loss (lifetime)</div>
+          <div class="v" title="${p.lost.toLocaleString()} packets since the daemon started">${fmt(p.loss_percent, 2)}%</div></div>
         <div class="metric"><div class="k">Received</div><div class="v">${p.received.toLocaleString()}</div></div>
         <div class="metric"><div class="k">Path MTU</div><div class="v">${p.path_mtu || "—"}</div></div>
         <div class="metric"><div class="k">Samples</div><div class="v">${p.samples}</div></div>

@@ -588,22 +588,23 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 		}
 
 		path := state.Path{
-			ID:              id,
-			Name:            s.names[id],
-			RTTMs:           ms(p.rtt),
-			P95SpreadMs:     msi(st.spread()),
-			JitterMs:        st.jitter / 1000,
-			QueueDelayMs:    msi(st.queueDelay),
-			Received:        st.received,
-			Lost:            st.lost,
-			LossPercent:     lossPercent(st.received, st.lost),
-			Bursts:          burstsOf(st),
-			Samples:         st.filled,
-			Thin:            st.thin(),
-			PathMTU:         p.mtu.confirmed,
-			Usable:          p.mtu.confirmed >= minUsablePathMTU,
-			LastSeenSeconds: lastSeen,
-			Alive:           alive,
+			ID:                id,
+			Name:              s.names[id],
+			RTTMs:             ms(p.rtt),
+			P95SpreadMs:       msi(st.spread()),
+			JitterMs:          st.jitter / 1000,
+			QueueDelayMs:      msi(st.queueDelay),
+			Received:          st.received,
+			Lost:              st.lost,
+			RecentLossPercent: st.recentLossPercent(),
+			LossPercent:       lossPercent(st.received, st.lost),
+			Bursts:            burstsOf(st),
+			Samples:           st.filled,
+			Thin:              st.thin(),
+			PathMTU:           p.mtu.confirmed,
+			Usable:            p.mtu.confirmed >= minUsablePathMTU,
+			LastSeenSeconds:   lastSeen,
+			Alive:             alive,
 		}
 		if p.remote != nil {
 			path.Remote = p.remote.String()
@@ -622,6 +623,17 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 			}
 		}
 	}
+
+	// The aggregate recent rate is taken across the same windows as the
+	// per-path ones rather than averaged from them, so a busy path counts
+	// for more than an idle one.
+	var winRecv, winLost uint64
+	for _, id := range ids {
+		st := &s.paths[id].stats
+		winRecv += st.winRecv + st.prevRecv
+		winLost += st.winLost + st.prevLost
+	}
+	snap.Aggregate.RecentLossPercent = lossPercent(winRecv, winLost)
 
 	snap.Aggregate.PathsTotal = len(ids)
 	snap.Aggregate.BestRTTMs = best

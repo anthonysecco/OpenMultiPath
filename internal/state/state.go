@@ -53,9 +53,14 @@ type Path struct {
 	JitterMs     float64 `json:"jitter_ms"`
 	QueueDelayMs float64 `json:"queue_delay_ms"`
 
-	Received    uint64  `json:"received"`
-	Lost        uint64  `json:"lost"`
-	LossPercent float64 `json:"loss_percent"`
+	Received uint64 `json:"received"`
+	Lost     uint64 `json:"lost"`
+
+	// RecentLossPercent covers roughly the last minute; LossPercent is
+	// for all time. The recent figure is the one to lead with, since a
+	// lifetime rate goes on reporting an incident that is already over.
+	RecentLossPercent float64 `json:"recent_loss_percent"`
+	LossPercent       float64 `json:"loss_percent"`
 
 	// Bursts is the distribution of consecutive-loss run lengths. A rate
 	// alone cannot distinguish scattered loss, which concealment handles,
@@ -82,11 +87,16 @@ type Burst struct {
 
 // Aggregate is the whole tunnel at a glance.
 type Aggregate struct {
-	Received    uint64  `json:"received"`
-	Lost        uint64  `json:"lost"`
-	LossPercent float64 `json:"loss_percent"`
-	PathsTotal  int     `json:"paths_total"`
-	PathsAlive  int     `json:"paths_alive"`
+	Received uint64 `json:"received"`
+	Lost     uint64 `json:"lost"`
+
+	// RecentLossPercent covers roughly the last minute; LossPercent is
+	// for all time. The recent figure is the one to lead with, since a
+	// lifetime rate goes on reporting an incident that is already over.
+	RecentLossPercent float64 `json:"recent_loss_percent"`
+	LossPercent       float64 `json:"loss_percent"`
+	PathsTotal        int     `json:"paths_total"`
+	PathsAlive        int     `json:"paths_alive"`
 
 	// BestRTTMs is the lowest round trip currently measured across live
 	// paths, which is the best the tunnel could do if it were steering

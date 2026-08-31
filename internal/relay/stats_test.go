@@ -157,3 +157,39 @@ func TestThinStatisticsAreFlagged(t *testing.T) {
 		t.Error("a path with 25 samples is still flagged as thin")
 	}
 }
+
+// The instrument has to show what is happening now. A lifetime loss rate
+// keeps reporting an incident long after it ended, which sends whoever is
+// looking at it chasing something already over - this was seen in the
+// field, where a path read 23% loss from a burst during a restart while
+// actually running clean.
+func TestRecentLossForgetsOldIncidents(t *testing.T) {
+	var s pathStats
+	at := func(d time.Duration) time.Duration { return d }
+
+	// A bad patch: a hundred delivered, fifty lost.
+	for i := 0; i < 100; i++ {
+		s.observeTransit(1000, at(0))
+	}
+	s.observeLoss(50)
+	s.observeDelivered()
+
+	if got := s.recentLossPercent(); got < 30 {
+		t.Fatalf("recent loss = %.1f%% during the incident, want it to show", got)
+	}
+
+	// Then a long clean stretch, spanning enough windows for the incident
+	// to age out of both of them.
+	for i := 0; i < 400; i++ {
+		s.observeTransit(1000, at(time.Duration(i)*time.Second))
+	}
+
+	if got := s.recentLossPercent(); got != 0 {
+		t.Errorf("recent loss = %.2f%% long after the incident, want 0", got)
+	}
+	// The lifetime figure still remembers it, which is the point of
+	// keeping both.
+	if got := lossPercent(s.received, s.lost); got == 0 {
+		t.Error("lifetime loss forgot the incident; it should still be recorded")
+	}
+}
