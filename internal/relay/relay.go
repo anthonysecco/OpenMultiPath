@@ -18,15 +18,36 @@ package relay
 import (
 	"log"
 	"net"
+	"syscall"
+
+	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 )
+
+// ipPMTUDiscProbe is IP_PMTUDISC_PROBE from the kernel's linux/in.h. Go's
+// syscall package does not name it.
+const ipPMTUDiscProbe = 3
+
+// setDontFragment marks a socket so its packets are never fragmented.
+//
+// Without this an oversized probe is simply split by the kernel and
+// reassembled at the far end, so it "arrives" and confirms an MTU the path
+// cannot actually carry in one piece - which is measuring reassembly, not
+// path MTU. It also holds the line architecture.md draws about never
+// relying on IP fragmentation, since carriers drop fragments
+// unpredictably.
+//
+// PROBE rather than DO: it additionally ignores the kernel's cached path
+// MTU, so a probe goes out on the wire and is dropped by whatever cannot
+// carry it, instead of being pre-empted locally on a stale cached figure.
+func setDontFragment(fd int) error {
+	return syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU_DISCOVER, ipPMTUDiscProbe)
+}
 
 const bufSize = 2048
 
 // maxHeaderLen is the headroom reserved for the wire header when building
-// an outgoing packet. The echo block grows with the number of paths, so
-// this is sized well past any realistic path count rather than exactly;
-// append handles anything larger correctly, just with an allocation.
-const maxHeaderLen = 256
+// an outgoing packet, so the scratch buffer never has to grow.
+const maxHeaderLen = protocol.MaxHeaderLen
 
 func readLoop(conn *net.UDPConn, name string, handle func(buf []byte, from *net.UDPAddr)) {
 	buf := make([]byte, bufSize)

@@ -71,7 +71,18 @@ const (
 const BaseLen = 15
 
 // EchoEntryLen is the size of a single echo entry.
-const EchoEntryLen = 9
+const EchoEntryLen = 11
+
+// MaxEchoEntries caps how many paths one echo block describes. The cap
+// exists so the header has a hard maximum size that the MTU budget can be
+// computed against, rather than one that grows with the path count. With
+// more paths than this, successive reports cover the rest; at ten reports a
+// second that costs nothing.
+const MaxEchoEntries = 4
+
+// MaxHeaderLen is the largest header this build can emit, which is what
+// the tunnel MTU has to be sized against.
+const MaxHeaderLen = BaseLen + 1 + MaxEchoEntries*EchoEntryLen
 
 const (
 	flagEcho   = 1 << 0
@@ -87,6 +98,9 @@ var (
 	// ErrVersion means the peer is speaking a wire version this build does
 	// not understand.
 	ErrVersion = errors.New("protocol: unsupported header version")
+
+	// ErrMalformed means the header is self-inconsistent. Dropped.
+	ErrMalformed = errors.New("protocol: malformed header")
 )
 
 // EchoEntry reports what the sender saw on one path, so the peer can
@@ -102,6 +116,13 @@ type EchoEntry struct {
 	// receiving it and transmitting this echo. Subtracting it removes our
 	// own think time from the peer's round trip calculation.
 	Delay uint32
+
+	// MaxSeen is the largest packet, in bytes on the wire, received on
+	// this path since the previous report. It is how a padded MTU probe is
+	// confirmed: comparing sizes answers "did my big packet arrive"
+	// directly, with none of the ambiguity of matching timestamps against
+	// a report that only ever names the most recent packet.
+	MaxSeen uint16
 }
 
 // Header is the parsed form of the wire header.
@@ -151,6 +172,7 @@ func (h *Header) AppendTo(dst []byte) []byte {
 			dst = append(dst, e.PathID)
 			dst = binary.BigEndian.AppendUint32(dst, e.TS)
 			dst = binary.BigEndian.AppendUint32(dst, e.Delay)
+			dst = binary.BigEndian.AppendUint16(dst, e.MaxSeen)
 		}
 	}
 	return dst
@@ -185,6 +207,11 @@ func Parse(b []byte) (Header, []byte, error) {
 	}
 	count := int(rest[0])
 	rest = rest[1:]
+	// Bound the count before allocating against it. These packets arrive
+	// off the open internet, so a claimed length is not a promise.
+	if count > MaxEchoEntries {
+		return h, nil, fmt.Errorf("%w: %d echo entries", ErrMalformed, count)
+	}
 	if len(rest) < count*EchoEntryLen {
 		return h, nil, ErrShort
 	}
@@ -192,9 +219,10 @@ func Parse(b []byte) (Header, []byte, error) {
 	for i := range h.Echo {
 		e := rest[i*EchoEntryLen:]
 		h.Echo[i] = EchoEntry{
-			PathID: e[0],
-			TS:     binary.BigEndian.Uint32(e[1:5]),
-			Delay:  binary.BigEndian.Uint32(e[5:9]),
+			PathID:  e[0],
+			TS:      binary.BigEndian.Uint32(e[1:5]),
+			Delay:   binary.BigEndian.Uint32(e[5:9]),
+			MaxSeen: binary.BigEndian.Uint16(e[9:11]),
 		}
 	}
 	return h, rest[count*EchoEntryLen:], nil

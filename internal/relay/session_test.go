@@ -23,7 +23,7 @@ func TestEchoMeasuresRoundTripExcludingPeerHoldTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse outbound: %v", err)
 	}
-	responder.observe(&h)
+	responder.observe(&h, len(out))
 
 	// The far end sits on it before replying.
 	const hold = 150 * time.Millisecond
@@ -37,7 +37,7 @@ func TestEchoMeasuresRoundTripExcludingPeerHoldTime(t *testing.T) {
 	if len(rh.Echo) == 0 {
 		t.Fatal("reply carried no echo block")
 	}
-	initiator.observe(&rh)
+	initiator.observe(&rh, len(reply))
 
 	got := time.Duration(initiator.paths[0].rtt) * time.Microsecond
 	if got > hold/2 {
@@ -49,26 +49,26 @@ func TestEchoMeasuresRoundTripExcludingPeerHoldTime(t *testing.T) {
 func TestPerPathSequenceGapsCountAsLoss(t *testing.T) {
 	s := newSession()
 	recv := func(seq uint32) {
-		s.observe(&protocol.Header{PathID: 1, PathSeq: seq})
+		s.observe(&protocol.Header{PathID: 1, PathSeq: seq}, 100)
 	}
 
 	recv(0)
 	recv(1)
 	recv(2)
-	if got := s.paths[1].lost; got != 0 {
+	if got := s.paths[1].stats.lost; got != 0 {
 		t.Errorf("lost = %d after a clean run, want 0", got)
 	}
 
 	recv(5) // 3 and 4 never showed up
-	if got := s.paths[1].lost; got != 2 {
+	if got := s.paths[1].stats.lost; got != 2 {
 		t.Errorf("lost = %d after a gap of two, want 2", got)
 	}
 
 	recv(6)
-	if got := s.paths[1].lost; got != 2 {
+	if got := s.paths[1].stats.lost; got != 2 {
 		t.Errorf("lost = %d after resuming in order, want it unchanged at 2", got)
 	}
-	if got := s.paths[1].received; got != 5 {
+	if got := s.paths[1].stats.received; got != 5 {
 		t.Errorf("received = %d, want 5", got)
 	}
 }
@@ -78,14 +78,14 @@ func TestPerPathSequenceGapsCountAsLoss(t *testing.T) {
 // the global one.
 func TestLossIsTrackedPerPath(t *testing.T) {
 	s := newSession()
-	s.observe(&protocol.Header{PathID: 0, PathSeq: 0})
-	s.observe(&protocol.Header{PathID: 1, PathSeq: 0})
-	s.observe(&protocol.Header{PathID: 0, PathSeq: 9})
+	s.observe(&protocol.Header{PathID: 0, PathSeq: 0}, 100)
+	s.observe(&protocol.Header{PathID: 1, PathSeq: 0}, 100)
+	s.observe(&protocol.Header{PathID: 0, PathSeq: 9}, 100)
 
-	if got := s.paths[0].lost; got != 8 {
+	if got := s.paths[0].stats.lost; got != 8 {
 		t.Errorf("path 0 lost = %d, want 8", got)
 	}
-	if got := s.paths[1].lost; got != 0 {
+	if got := s.paths[1].stats.lost; got != 0 {
 		t.Errorf("path 1 lost = %d, want 0", got)
 	}
 }

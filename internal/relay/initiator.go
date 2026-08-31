@@ -63,7 +63,27 @@ func RunInitiator(cfg InitiatorConfig) error {
 	var wgPeer atomic.Pointer[net.UDPAddr]
 
 	sess := newSession()
+	for i := range cfg.Paths {
+		// Declare every path up front so reports and probes go down links
+		// nothing has arrived on yet - which are exactly the links worth
+		// probing, since passive measurement is blind on an idle path.
+		sess.registerPath(uint8(i))
+	}
 	go sess.logStats()
+
+	// The initiator's paths are fixed by configuration, one socket each.
+	allPaths := make([]uint8, len(cfg.Paths))
+	for i := range cfg.Paths {
+		allPaths[i] = uint8(i)
+	}
+	go sess.runProbes(
+		func() []uint8 { return allPaths },
+		func(id uint8, pkt []byte) {
+			if _, err := pathConns[id].WriteToUDP(pkt, remoteAddr); err != nil {
+				log.Printf("initiator: probe on path %s failed: %v", cfg.Paths[id].Name, err)
+			}
+		},
+	)
 
 	// WireGuard -> duplicate onto every physical path. The global sequence
 	// is allocated once here, before the copies are made, so every copy of
@@ -92,8 +112,13 @@ func RunInitiator(cfg InitiatorConfig) error {
 				log.Printf("initiator: bad packet on path %s: %v", name, err)
 				return
 			}
-			sess.observe(&h)
+			sess.observe(&h, len(buf))
 
+			// Reports and probes carry no tunnel traffic; they exist only
+			// to keep measurement flowing when data is not.
+			if h.Type != protocol.TypeData {
+				return
+			}
 			peer := wgPeer.Load()
 			if peer == nil {
 				return // haven't heard from local WireGuard yet
@@ -118,7 +143,10 @@ func listenOnDevice(ifaceName, bindIP string) (*net.UDPConn, error) {
 	lc := net.ListenConfig{
 		Control: func(_, _ string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
-				controlErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifaceName)
+				if controlErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifaceName); controlErr != nil {
+					return
+				}
+				controlErr = setDontFragment(int(fd))
 			})
 		},
 	}

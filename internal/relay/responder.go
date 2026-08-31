@@ -1,9 +1,11 @@
 package relay
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
+	"syscall"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 )
@@ -18,14 +20,24 @@ type ResponderConfig struct {
 // duplicated back over every path currently being heard from. It blocks
 // until a fatal error occurs.
 func RunResponder(cfg ResponderConfig) error {
-	pubAddr, err := net.ResolveUDPAddr("udp", cfg.PublicAddr)
-	if err != nil {
-		return fmt.Errorf("relay: resolve public addr: %w", err)
+	// The public socket also carries this end's MTU probes back toward the
+	// RV, so it needs the same don't-fragment marking: paths are
+	// asymmetric and each direction has to be measured on its own.
+	var controlErr error
+	lc := net.ListenConfig{
+		Control: func(_, _ string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) { controlErr = setDontFragment(int(fd)) })
+		},
 	}
-	pubConn, err := net.ListenUDP("udp", pubAddr)
+	pc, err := lc.ListenPacket(context.Background(), "udp", cfg.PublicAddr)
 	if err != nil {
 		return fmt.Errorf("relay: listen on public addr: %w", err)
 	}
+	if controlErr != nil {
+		pc.Close()
+		return fmt.Errorf("relay: set don't-fragment on public socket: %w", controlErr)
+	}
+	pubConn := pc.(*net.UDPConn)
 	defer pubConn.Close()
 
 	wgTarget, err := net.ResolveUDPAddr("udp", cfg.LoopbackTarget)
@@ -41,6 +53,28 @@ func RunResponder(cfg ResponderConfig) error {
 	sess := newSession()
 	go sess.logStats()
 
+	// The responder never dials out, so its paths are only the ones the
+	// far end has made contact on.
+	go sess.runProbes(
+		func() []uint8 {
+			rs := sess.remotes()
+			ids := make([]uint8, len(rs))
+			for i, r := range rs {
+				ids[i] = r.pathID
+			}
+			return ids
+		},
+		func(id uint8, pkt []byte) {
+			addr := sess.remoteFor(id)
+			if addr == nil {
+				return
+			}
+			if _, err := pubConn.WriteToUDP(pkt, addr); err != nil {
+				log.Printf("responder: probe on path %d failed: %v", id, err)
+			}
+		},
+	)
+
 	// Any RV path -> local WireGuard. Which path a packet came in on is
 	// taken from the header rather than inferred from its source address,
 	// which is what makes the return route survive the RV's addresses
@@ -52,9 +86,14 @@ func RunResponder(cfg ResponderConfig) error {
 			log.Printf("responder: bad packet from %s: %v", from, err)
 			return
 		}
-		sess.observe(&h)
+		sess.observe(&h, len(buf))
 		sess.setRemote(h.PathID, from)
 
+		// Reports and probes carry no tunnel traffic; they exist only to
+		// keep measurement flowing when data is not.
+		if h.Type != protocol.TypeData {
+			return
+		}
 		if _, err := wgConn.WriteToUDP(payload, wgTarget); err != nil {
 			log.Printf("responder: write to wireguard failed: %v", err)
 		}

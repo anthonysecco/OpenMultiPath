@@ -44,8 +44,8 @@ func TestRoundTripWithEcho(t *testing.T) {
 		PathSeq:   42,
 		SendTS:    1000,
 		Echo: []EchoEntry{
-			{PathID: 1, TS: 900, Delay: 250},
-			{PathID: 2, TS: 880, Delay: 17000},
+			{PathID: 1, TS: 900, Delay: 250, MaxSeen: 1472},
+			{PathID: 2, TS: 880, Delay: 17000, MaxSeen: 0},
 		},
 	}
 	payload := []byte{0x01, 0x02, 0x03}
@@ -81,6 +81,20 @@ func TestParseTruncated(t *testing.T) {
 		if _, _, err := Parse(full[:n]); !errors.Is(err, ErrShort) {
 			t.Errorf("Parse(%d bytes) error = %v, want ErrShort", n, err)
 		}
+	}
+}
+
+// A claimed entry count is not a promise; these packets arrive off the
+// open internet.
+func TestParseRejectsImplausibleEchoCount(t *testing.T) {
+	wire := (&Header{
+		PathID: 1,
+		Echo:   []EchoEntry{{PathID: 1}},
+	}).AppendTo(nil)
+	wire[BaseLen] = MaxEchoEntries + 1
+
+	if _, _, err := Parse(wire); !errors.Is(err, ErrMalformed) {
+		t.Errorf("error = %v, want ErrMalformed", err)
 	}
 }
 
