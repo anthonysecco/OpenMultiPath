@@ -59,7 +59,7 @@ func TestLargeQueueIsNotMistakenForRestart(t *testing.T) {
 // noticing, every subsequent packet reads as ancient against the counter
 // we were expecting and sequence tracking never recovers.
 func TestPeerRestartRecoversSequenceTracking(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 
 	// Establish a run at a high sequence, from a peer that has been up for
 	// a while.

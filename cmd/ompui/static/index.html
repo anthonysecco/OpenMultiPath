@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenMultiPath</title>
+<style>
+  /* Dark, high contrast, large figures. This gets read on a phone, at
+     night, by someone who is already annoyed about something. */
+  :root {
+    --bg: #12151a; --panel: #1a1f27; --line: #2a323d;
+    --text: #e6edf3; --dim: #8b98a8;
+    --good: #3fb950; --warn: #d29922; --bad: #f85149; --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    padding: 14px 18px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  }
+  h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: .2px; }
+  .role { color: var(--dim); font-size: 13px; }
+  main { padding: 18px; max-width: 1100px; margin: 0 auto; }
+  section { margin-bottom: 26px; }
+  h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--dim); margin: 0 0 10px; font-weight: 600;
+  }
+
+  /* The staleness banner is the most important thing on the page: every
+     other number is only as true as this one is recent. */
+  #freshness {
+    padding: 10px 14px; border-radius: 8px; margin-bottom: 20px;
+    font-weight: 600; border: 1px solid transparent;
+  }
+  .fresh { background: #10281a; color: var(--good); border-color: #1c4429 !important; }
+  .stale { background: #2d1618; color: var(--bad); border-color: #5c2326 !important; }
+
+  .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .card .label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+  .card .value { font-size: 26px; font-weight: 650; margin-top: 3px; font-variant-numeric: tabular-nums; }
+  .card .sub { color: var(--dim); font-size: 12px; margin-top: 2px; }
+
+  .path {
+    background: var(--panel); border: 1px solid var(--line);
+    border-left: 4px solid var(--line); border-radius: 8px;
+    padding: 14px 16px; margin-bottom: 12px;
+  }
+  .path.alive { border-left-color: var(--good); }
+  .path.dead  { border-left-color: var(--bad); }
+  .path-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .path-name { font-weight: 650; font-size: 16px; }
+  .metrics { display: grid; gap: 10px 16px; grid-template-columns: repeat(auto-fit, minmax(105px, 1fr)); }
+  .metric .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  .metric .v { font-size: 17px; font-variant-numeric: tabular-nums; margin-top: 1px; }
+
+  .tag {
+    font-size: 11px; padding: 2px 7px; border-radius: 20px;
+    border: 1px solid var(--line); color: var(--dim);
+  }
+  .tag.good { color: var(--good); border-color: #1c4429; }
+  .tag.bad  { color: var(--bad);  border-color: #5c2326; }
+  .tag.warn { color: var(--warn); border-color: #4a3a12; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 10px 5px 0; }
+  th { color: var(--dim); font-weight: 500; }
+  td { font-variant-numeric: tabular-nums; }
+
+  form { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .field { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; margin-bottom: 12px; }
+  .field label { font-size: 14px; }
+  .field .hint { color: var(--dim); font-size: 12px; grid-column: 1 / -1; margin-top: -6px; }
+  input[type=number] {
+    background: #0d1117; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 9px; width: 130px; font: inherit;
+    font-variant-numeric: tabular-nums;
+  }
+  button {
+    background: var(--accent); color: #04121f; border: 0; border-radius: 6px;
+    padding: 8px 15px; font: inherit; font-weight: 650; cursor: pointer;
+  }
+  button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  button:hover { filter: brightness(1.1); }
+  .saved { color: var(--good); font-size: 13px; margin-left: 10px; }
+
+  pre#logs {
+    background: #0d1117; border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px; max-height: 340px; overflow: auto;
+    font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #b9c5d3; white-space: pre-wrap; word-break: break-word;
+  }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .muted { color: var(--dim); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="node">OpenMultiPath</h1>
+  <span class="role" id="role"></span>
+  <span class="role" id="uptime"></span>
+</header>
+
+<main>
+  <div id="freshness" class="stale">Waiting for the daemon&hairsp;&hellip;</div>
+
+  <section>
+    <h2>Aggregate</h2>
+    <div class="cards" id="aggregate"></div>
+  </section>
+
+  <section>
+    <h2>Paths</h2>
+    <div id="paths"></div>
+  </section>
+
+  <section>
+    <h2>Settings</h2>
+    <form id="config">
+      <div id="fields"></div>
+      <div class="row">
+        <button type="submit">Save</button>
+        <span class="muted">Applied to the running daemon within a few seconds. Out-of-range values are corrected.</span>
+        <span class="saved" id="saved" hidden>Saved</span>
+      </div>
+    </form>
+  </section>
+
+  <section>
+    <h2>Daemon log</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button class="secondary" id="refresh-logs" type="button">Refresh</button>
+      <button class="secondary" id="restart" type="button">Restart daemon</button>
+      <span class="muted" id="restart-note"></span>
+    </div>
+    <pre id="logs">Loading&hellip;</pre>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = (n, d = 1) => (n === undefined || n === null) ? "—" : Number(n).toFixed(d);
+
+function duration(sec) {
+  if (sec < 60) return Math.round(sec) + "s";
+  if (sec < 3600) return Math.floor(sec / 60) + "m " + Math.round(sec % 60) + "s";
+  const h = Math.floor(sec / 3600);
+  return h + "h " + Math.floor((sec % 3600) / 60) + "m";
+}
+
+// A path's own loss rate is what decides whether its numbers are worth
+// believing, so colour it rather than leaving it as one figure among many.
+function lossClass(pct) {
+  if (pct >= 2) return "bad";
+  if (pct >= 0.5) return "warn";
+  return "good";
+}
+
+function card(label, value, sub) {
+  return `<div class="card"><div class="label">${label}</div>` +
+         `<div class="value">${value}</div>` +
+         (sub ? `<div class="sub">${sub}</div>` : "") + `</div>`;
+}
+
+function renderAggregate(s) {
+  const a = s.aggregate;
+  const mtuSub = s.recommended_tunnel_mtu
+    ? (s.recommended_tunnel_mtu === s.tunnel_mtu
+        ? "matches the measured paths"
+        : `paths measured at ${s.recommended_tunnel_mtu}`)
+    : "paths not yet measured";
+
+  $("aggregate").innerHTML =
+    card("Paths alive", `${a.paths_alive}/${a.paths_total}`) +
+    card("Loss", fmt(a.loss_percent, 2) + "%",
+         `${a.lost.toLocaleString()} of ${(a.received + a.lost).toLocaleString()}`) +
+    card("Best RTT", a.best_rtt_ms ? fmt(a.best_rtt_ms) + " ms" : "—",
+         "lowest across live paths") +
+    card("Received", a.received.toLocaleString()) +
+    card("Tunnel MTU", s.tunnel_mtu || "—", mtuSub);
+}
+
+function renderPaths(s) {
+  if (!s.paths || !s.paths.length) {
+    $("paths").innerHTML = `<p class="muted">No paths yet.</p>`;
+    return;
+  }
+  $("paths").innerHTML = s.paths.map(p => {
+    const tags = [
+      p.alive ? `<span class="tag good">alive</span>`
+              : `<span class="tag bad">no traffic</span>`,
+      p.thin ? `<span class="tag warn">thin statistics</span>` : "",
+      (p.path_mtu && !p.usable) ? `<span class="tag bad">below tunnel floor</span>` : "",
+      p.remote ? `<span class="tag">${p.remote}</span>` : "",
+    ].join(" ");
+
+    const bursts = (p.bursts || []).filter(b => b.count > 0);
+    const burstRow = bursts.length
+      ? `<table style="margin-top:12px"><tr><th>Loss bursts</th>` +
+        bursts.map(b => `<th>${b.label}</th>`).join("") + `</tr><tr><td></td>` +
+        bursts.map(b => `<td>${b.count}</td>`).join("") + `</tr></table>`
+      : "";
+
+    return `<div class="path ${p.alive ? "alive" : "dead"}">
+      <div class="path-head">
+        <span class="path-name">${p.name || "path " + p.id}</span>
+        <span class="muted">#${p.id}</span>
+        ${tags}
+      </div>
+      <div class="metrics">
+        <div class="metric"><div class="k">RTT</div><div class="v">${fmt(p.rtt_ms)} ms</div></div>
+        <div class="metric"><div class="k">p95 spread</div><div class="v">${fmt(p.p95_spread_ms)} ms</div></div>
+        <div class="metric"><div class="k">Jitter</div><div class="v">${fmt(p.jitter_ms)} ms</div></div>
+        <div class="metric"><div class="k">Queue delay</div><div class="v">${fmt(p.queue_delay_ms)} ms</div></div>
+        <div class="metric"><div class="k">Loss</div>
+          <div class="v" style="color:var(--${lossClass(p.loss_percent)})">${fmt(p.loss_percent, 2)}%</div></div>
+        <div class="metric"><div class="k">Received</div><div class="v">${p.received.toLocaleString()}</div></div>
+        <div class="metric"><div class="k">Path MTU</div><div class="v">${p.path_mtu || "—"}</div></div>
+        <div class="metric"><div class="k">Samples</div><div class="v">${p.samples}</div></div>
+        <div class="metric"><div class="k">Last seen</div>
+          <div class="v">${p.last_seen_seconds < 0 ? "never" : duration(p.last_seen_seconds)}</div></div>
+      </div>
+      ${burstRow}
+    </div>`;
+  }).join("");
+}
+
+async function refreshState() {
+  let r;
+  try {
+    r = await (await fetch("/api/state")).json();
+  } catch (e) {
+    $("freshness").className = "stale";
+    $("freshness").textContent = "Cannot reach this interface.";
+    return;
+  }
+
+  if (!r.available) {
+    $("freshness").className = "stale";
+    $("freshness").textContent = "The daemon has not written any state. It may not be running. " + (r.error || "");
+    return;
+  }
+
+  const s = r.state, age = r.age_seconds;
+  // Two report intervals of slack before calling it stale, so a single
+  // missed write does not raise an alarm.
+  const limit = Math.max(5, (s.config.state_interval_ms / 1000) * 3);
+  if (age > limit) {
+    $("freshness").className = "stale";
+    $("freshness").textContent =
+      `Data is ${duration(age)} old — the daemon has stopped updating it. Everything below is history.`;
+  } else {
+    $("freshness").className = "fresh";
+    $("freshness").textContent = `Live — updated ${age < 1.5 ? "just now" : duration(age) + " ago"}.`;
+  }
+
+  $("node").textContent = s.node || "OpenMultiPath";
+  $("role").textContent = s.role;
+  $("uptime").textContent = "up " + duration(s.uptime_seconds);
+  renderAggregate(s);
+  renderPaths(s);
+}
+
+const FIELDS = [
+  ["echo_interval_ms", "Report interval", "ms",
+   "How often measurement feedback is sent. Bounds how quickly a change in a path can be noticed."],
+  ["probe_interval_seconds", "MTU probe interval", "s",
+   "How often path MTU is re-tested. It changes on tower handover and 5G-to-LTE fallback."],
+  ["state_interval_ms", "State refresh", "ms",
+   "How often the daemon writes the data this page reads."],
+  ["stats_interval_seconds", "Log interval", "s",
+   "How often measurements are written to the daemon log."],
+];
+
+async function loadConfig() {
+  const r = await (await fetch("/api/config")).json();
+  $("fields").innerHTML = FIELDS.map(([key, label, unit, hint]) => {
+    const b = r.bounds[key] || {};
+    return `<div class="field">
+      <label for="${key}">${label}</label>
+      <span><input type="number" id="${key}" name="${key}" value="${r.config[key]}"
+        min="${b.Min}" max="${b.Max}" step="1"> <span class="muted">${unit}</span></span>
+      <div class="hint">${hint} Range ${b.Min}–${b.Max}.</div>
+    </div>`;
+  }).join("");
+}
+
+$("config").addEventListener("submit", async e => {
+  e.preventDefault();
+  const body = {};
+  for (const [key] of FIELDS) body[key] = Number($(key).value);
+
+  const res = await fetch("/api/config", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    alert("Could not save: " + await res.text());
+    return;
+  }
+  // Re-read rather than trusting what was typed: values out of range come
+  // back corrected, and the form should show what actually took effect.
+  const r = await res.json();
+  for (const [key] of FIELDS) $(key).value = r.config[key];
+  $("saved").hidden = false;
+  setTimeout(() => { $("saved").hidden = true; }, 2500);
+});
+
+async function loadLogs() {
+  const r = await (await fetch("/api/logs")).json();
+  const el = $("logs");
+  el.textContent = (r.lines || []).join("\n");
+  el.scrollTop = el.scrollHeight;
+}
+
+$("refresh-logs").addEventListener("click", loadLogs);
+
+$("restart").addEventListener("click", async () => {
+  if (!confirm("Restart the daemon? The tunnel drops for a moment.")) return;
+  $("restart-note").textContent = "Restarting…";
+  const res = await fetch("/api/restart", {method: "POST"});
+  $("restart-note").textContent = res.ok ? "Restarted." : "Failed: " + await res.text();
+  setTimeout(loadLogs, 1500);
+});
+
+refreshState();
+loadConfig();
+loadLogs();
+setInterval(refreshState, 1000);
+</script>
+</body>
+</html>

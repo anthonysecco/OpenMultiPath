@@ -7,12 +7,18 @@ import (
 	"net"
 	"syscall"
 
+	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 )
 
 type ResponderConfig struct {
 	PublicAddr     string // the forwarded port, e.g. "0.0.0.0:48219"
 	LoopbackTarget string // local WireGuard's own listen address
+
+	Node        string         // this box's name, for the web interface
+	StatePath   string         // where to write the snapshot the interface reads
+	WGInterface string         // tunnel interface, read for its current MTU
+	Settings    *config.Holder // adjustable settings, reloaded while running
 }
 
 // RunResponder relays between the public endpoint, reachable from any of
@@ -50,8 +56,11 @@ func RunResponder(cfg ResponderConfig) error {
 	}
 	defer wgConn.Close()
 
-	sess := newSession()
+	sess := newSession(cfg.Settings, cfg.Node, "responder")
 	go sess.logStats()
+	if cfg.StatePath != "" {
+		go sess.writeState(cfg.StatePath, cfg.WGInterface)
+	}
 
 	// The responder never dials out, so its paths are only the ones the
 	// far end has made contact on.

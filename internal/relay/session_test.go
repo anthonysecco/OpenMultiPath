@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 )
 
@@ -11,12 +12,19 @@ import (
 // it sat on a packet, so its think time can be subtracted back out. Both
 // sessions here are in the same process, so the true round trip is
 // microseconds no matter how long the far end holds the packet.
+// newTestSession builds a session with the default settings.
+func newTestSession() *session { return newSession(nil, "test-node", "test") }
+
+// testEchoInterval is the default report cadence, which several tests need
+// to step past.
+var testEchoInterval = config.Defaults().EchoInterval()
+
 func TestEchoMeasuresRoundTripExcludingPeerHoldTime(t *testing.T) {
-	initiator := newSession()
-	responder := newSession()
+	initiator := newTestSession()
+	responder := newTestSession()
 
 	// Age both sessions past the echo interval so feedback is attached.
-	time.Sleep(2 * echoInterval)
+	time.Sleep(2 * testEchoInterval)
 
 	out := initiator.stamp(0, initiator.nextGlobalSeq(), []byte("payload"), nil)
 	h, _, err := protocol.Parse(out)
@@ -47,7 +55,7 @@ func TestEchoMeasuresRoundTripExcludingPeerHoldTime(t *testing.T) {
 }
 
 func TestPerPathSequenceGapsCountAsLoss(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	recv := func(seq uint32) {
 		s.observe(&protocol.Header{PathID: 1, PathSeq: seq}, 100)
 	}
@@ -77,7 +85,7 @@ func TestPerPathSequenceGapsCountAsLoss(t *testing.T) {
 // separate is the whole reason there is a per-path sequence in addition to
 // the global one.
 func TestLossIsTrackedPerPath(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	s.observe(&protocol.Header{PathID: 0, PathSeq: 0}, 100)
 	s.observe(&protocol.Header{PathID: 1, PathSeq: 0}, 100)
 	s.observe(&protocol.Header{PathID: 0, PathSeq: 9}, 100)
@@ -94,7 +102,7 @@ func TestLossIsTrackedPerPath(t *testing.T) {
 // since that is what identifies them as the same packet at the far end,
 // while each path's own sequence advances independently.
 func TestDuplicatedCopiesShareGlobalSequence(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	payload := []byte("packet")
 
 	seq := s.nextGlobalSeq()

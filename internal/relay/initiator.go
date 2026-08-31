@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 )
 
@@ -22,6 +23,11 @@ type InitiatorConfig struct {
 	LoopbackAddr string // where the local WireGuard peer sends to/listens on
 	Paths        []PathConfig
 	RemoteAddr   string // home's public endpoint, e.g. "162.231.243.253:48219"
+
+	Node        string         // this box's name, for the web interface
+	StatePath   string         // where to write the snapshot the interface reads
+	WGInterface string         // tunnel interface, read for its current MTU
+	Settings    *config.Holder // adjustable settings, reloaded while running
 }
 
 // RunInitiator relays between a local WireGuard interface and the home
@@ -62,14 +68,18 @@ func RunInitiator(cfg InitiatorConfig) error {
 	// first outbound packet, and where inbound replies get delivered.
 	var wgPeer atomic.Pointer[net.UDPAddr]
 
-	sess := newSession()
+	sess := newSession(cfg.Settings, cfg.Node, "initiator")
 	for i := range cfg.Paths {
 		// Declare every path up front so reports and probes go down links
 		// nothing has arrived on yet - which are exactly the links worth
 		// probing, since passive measurement is blind on an idle path.
 		sess.registerPath(uint8(i))
+		sess.nameFor(uint8(i), cfg.Paths[i].Name)
 	}
 	go sess.logStats()
+	if cfg.StatePath != "" {
+		go sess.writeState(cfg.StatePath, cfg.WGInterface)
+	}
 
 	// The initiator's paths are fixed by configuration, one socket each.
 	allPaths := make([]uint8, len(cfg.Paths))

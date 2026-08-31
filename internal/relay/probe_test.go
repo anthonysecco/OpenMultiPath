@@ -12,7 +12,7 @@ import (
 // experiences different serialisation delay than a full-sized packet,
 // enough to bias comparisons between paths.
 func TestProbeIsPaddedToTheSizeUnderTest(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	s.registerPath(0)
 
 	pkt := s.buildProbe(0, nil)
@@ -36,7 +36,7 @@ func TestProbeIsPaddedToTheSizeUnderTest(t *testing.T) {
 // which answers the question directly instead of inferring it from a
 // report that only ever names the most recent packet.
 func TestProbeConfirmationAdvancesTheSearch(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	s.registerPath(0)
 
 	pkt := s.buildProbe(0, nil)
@@ -64,7 +64,7 @@ func TestProbeConfirmationAdvancesTheSearch(t *testing.T) {
 // A report that only mentions smaller packets says nothing about whether
 // the probe arrived, and must not be taken as confirmation.
 func TestSmallerReportDoesNotConfirmProbe(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	s.registerPath(0)
 	s.buildProbe(0, nil)
 
@@ -81,7 +81,7 @@ func TestSmallerReportDoesNotConfirmProbe(t *testing.T) {
 // A size that never comes back has to retire, or the search would keep
 // re-sending packets the path has already shown it cannot carry.
 func TestRepeatedlyUnconfirmedSizeRetires(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	s.registerPath(0)
 
 	for i := 0; i < probeMisses; i++ {
@@ -108,7 +108,7 @@ func TestRepeatedlyUnconfirmedSizeRetires(t *testing.T) {
 // A packet sized for a large path cannot be moved onto a small one, so the
 // tunnel has to be sized to the smallest path rather than the best.
 func TestRecommendedMTUTakesTheSmallestPath(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	s.registerPath(0)
 	s.registerPath(1)
 
@@ -127,7 +127,7 @@ func TestRecommendedMTUTakesTheSmallestPath(t *testing.T) {
 // tunnel down with it. Clamping it up to the floor instead would recommend
 // an MTU the path has already shown it cannot carry.
 func TestUnusablePathIsExcludedNotClamped(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	s.registerPath(0)
 	s.registerPath(1)
 
@@ -156,7 +156,7 @@ func TestUnusablePathIsExcludedNotClamped(t *testing.T) {
 // With nothing able to carry the floor there is no honest recommendation
 // to make, and inventing one would be worse than admitting it.
 func TestNoRecommendationWhenEveryPathIsTooSmall(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	s.registerPath(0)
 
 	s.mu.Lock()
@@ -182,7 +182,7 @@ func TestLadderStartsAtAUsableSize(t *testing.T) {
 }
 
 func TestRecommendedMTUUnknownUntilSomethingConfirms(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	s.registerPath(0)
 	if got := s.recommendedTunnelMTU(); got != 0 {
 		t.Errorf("recommended mtu = %d before anything confirmed, want 0", got)
@@ -192,7 +192,7 @@ func TestRecommendedMTUUnknownUntilSomethingConfirms(t *testing.T) {
 // Feedback rides on data whenever there is data, and only needs a packet
 // of its own when the reverse direction has gone quiet.
 func TestStandaloneReportsOnlyWhenIdle(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	s.registerPath(0)
 
 	s.stamp(0, s.nextGlobalSeq(), []byte("data"), nil)
@@ -202,7 +202,7 @@ func TestStandaloneReportsOnlyWhenIdle(t *testing.T) {
 
 	// Wind the last-sent reading back past the interval.
 	s.mu.Lock()
-	s.lastSent = s.elapsed() - 2*echoInterval
+	s.lastSent = s.elapsed() - 2*testEchoInterval
 	s.mu.Unlock()
 
 	if !s.dueForReport() {
@@ -228,7 +228,7 @@ func TestStandaloneReportsOnlyWhenIdle(t *testing.T) {
 // Reports have to keep flowing on a path nothing has arrived on, since
 // passive measurement is blind exactly there.
 func TestReportsGoOutOnSilentPaths(t *testing.T) {
-	s := newSession()
+	s := newTestSession()
 	s.registerPath(0)
 	s.registerPath(1)
 
@@ -236,7 +236,7 @@ func TestReportsGoOutOnSilentPaths(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		s.mu.Lock()
-		s.lastSent = s.elapsed() - 2*echoInterval
+		s.lastSent = s.elapsed() - 2*testEchoInterval
 		s.mu.Unlock()
 
 		for _, id := range []uint8{0, 1} {

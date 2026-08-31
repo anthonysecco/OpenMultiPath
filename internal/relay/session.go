@@ -1,29 +1,28 @@
 package relay
 
 import (
+	"fmt"
 	"log"
+	"math"
 	"net"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
+	"github.com/anthonysecco/OpenMultiPath/internal/state"
 )
-
-// echoInterval is how often measurement feedback goes out. protocol.md
-// puts ~10 reports/sec at a few kbps: cheap enough to be worth it,
-// frequent enough for the 100-200 ms reaction target.
-const echoInterval = 100 * time.Millisecond
 
 // staleEcho is the age past which a recorded arrival is dropped rather
 // than echoed. A reading this old says nothing about current conditions,
 // and echoing it would risk overflowing the microsecond hold time on the
 // wire.
 const staleEcho = 10 * time.Second
-
-// statsInterval is how often measurements are logged. Scaffolding until
-// the state file and web UI exist.
-const statsInterval = 30 * time.Second
 
 // Overheads below the tunnel, used to turn a discovered path MTU into a
 // usable inner MTU.
@@ -57,11 +56,6 @@ const probeTimeout = 2 * time.Second
 
 // probeMisses is how many unconfirmed attempts retire a candidate size.
 const probeMisses = 3
-
-// probeInterval is how often an MTU probe is attempted. Path MTU changes
-// on tower handover and 5G-to-LTE fallback, so this has to keep running,
-// but it changes rarely enough not to warrant a fast cadence.
-const probeInterval = 15 * time.Second
 
 // mtuProbe tracks the path MTU search for one path. Sizes are physical
 // MTUs: what the link carries including the outer IP and UDP headers.
@@ -125,17 +119,41 @@ type session struct {
 	start     time.Time
 	globalSeq atomic.Uint32
 
+	// cfg carries the settings that can change while running, so a
+	// cadence altered through the web interface takes effect without a
+	// restart.
+	cfg *config.Holder
+
+	node string
+	role string
+
 	mu       sync.Mutex
 	paths    map[uint8]*pathState
+	names    map[uint8]string
 	lastEcho time.Duration
 	lastSent time.Duration
 }
 
-func newSession() *session {
+func newSession(cfg *config.Holder, node, role string) *session {
+	if cfg == nil {
+		cfg = config.NewHolder(config.Defaults())
+	}
 	return &session{
 		start: time.Now(),
+		cfg:   cfg,
+		node:  node,
+		role:  role,
 		paths: make(map[uint8]*pathState),
+		names: make(map[uint8]string),
 	}
+}
+
+// nameFor labels a path with the interface it leaves by, where that is
+// known. The responder only ever learns path numbers.
+func (s *session) nameFor(id uint8, name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.names[id] = name
 }
 
 // elapsed is the single clock reading everything else derives from.
@@ -233,7 +251,7 @@ func (s *session) build(typ, pathID uint8, globalSeq uint32, payload, buf []byte
 	}
 	p.nextSeq++
 
-	if now-s.lastEcho >= echoInterval {
+	if now-s.lastEcho >= s.cfg.Get().EchoInterval() {
 		h.Echo = s.collectEchoLocked(now)
 		if len(h.Echo) > 0 {
 			s.lastEcho = now
@@ -281,7 +299,7 @@ func (s *session) collectEchoLocked(now time.Duration) []protocol.EchoEntry {
 func (s *session) dueForReport() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.elapsed()-s.lastSent >= echoInterval
+	return s.elapsed()-s.lastSent >= s.cfg.Get().EchoInterval()
 }
 
 // buildReport produces a standalone feedback packet for a path, carrying
@@ -348,22 +366,25 @@ var zeroPad = make([]byte, mtuLadder[len(mtuLadder)-1])
 // currently worth sending on, which for the responder only becomes known
 // as the far end makes contact.
 func (s *session) runProbes(pathIDs func() []uint8, send func(pathID uint8, pkt []byte)) {
-	reports := time.NewTicker(echoInterval)
-	defer reports.Stop()
-	probes := time.NewTicker(probeInterval)
-	defer probes.Stop()
+	// A fixed fast tick with the intervals checked against the clock,
+	// rather than tickers built from them. The cadences are adjustable
+	// while running, and this way a change takes effect on the next tick
+	// instead of needing the tickers torn down and rebuilt.
+	const tick = 20 * time.Millisecond
+	var lastProbe time.Duration
 
 	buf := make([]byte, 0, bufSize+maxHeaderLen)
-	for {
-		select {
-		case <-reports.C:
-			if !s.dueForReport() {
-				continue // data is flowing; feedback rides along with it
-			}
+	for range time.Tick(tick) {
+		now := s.elapsed()
+
+		if s.dueForReport() {
 			for _, id := range pathIDs() {
 				send(id, s.buildReport(id, buf))
 			}
-		case <-probes.C:
+		}
+
+		if now-lastProbe >= s.cfg.Get().ProbeInterval() {
+			lastProbe = now
 			for _, id := range pathIDs() {
 				if pkt := s.buildProbe(id, buf); pkt != nil {
 					send(id, pkt)
@@ -461,7 +482,13 @@ func (s *session) recommendedTunnelMTU() int {
 // logStats reports what the measurement layer is seeing. Scaffolding until
 // the state file and web UI land.
 func (s *session) logStats() {
-	for range time.Tick(statsInterval) {
+	var last time.Duration
+	for range time.Tick(time.Second) {
+		if now := s.elapsed(); now-last < s.cfg.Get().StatsInterval() {
+			continue
+		} else {
+			last = now
+		}
 		s.mu.Lock()
 		for id, p := range s.paths {
 			st := &p.stats
@@ -518,6 +545,143 @@ func (s *session) unusablePathsLocked() []uint8 {
 		}
 	}
 	return out
+}
+
+// aliveWithin is how recently a path must have delivered something to be
+// called alive. It is deliberately several times the slowest report
+// cadence, so a path is not declared dead for missing one.
+const aliveWithin = 5 * time.Second
+
+// snapshot renders the current measurements for the web interface.
+func (s *session) snapshot(tunnelMTU int) state.Snapshot {
+	now := s.elapsed()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	snap := state.Snapshot{
+		Node:                 s.node,
+		Role:                 s.role,
+		UpdatedUnix:          float64(time.Now().UnixNano()) / 1e9,
+		UptimeSeconds:        now.Seconds(),
+		TunnelMTU:            tunnelMTU,
+		RecommendedTunnelMTU: s.recommendedTunnelMTULocked(),
+		Config:               s.cfg.Get(),
+	}
+
+	ids := make([]uint8, 0, len(s.paths))
+	for id := range s.paths {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	var best float64
+	for _, id := range ids {
+		p := s.paths[id]
+		st := &p.stats
+
+		lastSeen := math.Inf(1)
+		alive := false
+		if p.stats.received > 0 {
+			lastSeen = (now - p.seenAt).Seconds()
+			alive = now-p.seenAt < aliveWithin
+		}
+
+		path := state.Path{
+			ID:              id,
+			Name:            s.names[id],
+			RTTMs:           ms(p.rtt),
+			P95SpreadMs:     msi(st.spread()),
+			JitterMs:        st.jitter / 1000,
+			QueueDelayMs:    msi(st.queueDelay),
+			Received:        st.received,
+			Lost:            st.lost,
+			LossPercent:     lossPercent(st.received, st.lost),
+			Bursts:          burstsOf(st),
+			Samples:         st.filled,
+			Thin:            st.thin(),
+			PathMTU:         p.mtu.confirmed,
+			Usable:          p.mtu.confirmed >= minUsablePathMTU,
+			LastSeenSeconds: lastSeen,
+			Alive:           alive,
+		}
+		if p.remote != nil {
+			path.Remote = p.remote.String()
+		}
+		if math.IsInf(lastSeen, 1) {
+			path.LastSeenSeconds = -1 // never heard from
+		}
+		snap.Paths = append(snap.Paths, path)
+
+		snap.Aggregate.Received += st.received
+		snap.Aggregate.Lost += st.lost
+		if alive {
+			snap.Aggregate.PathsAlive++
+			if rtt := ms(p.rtt); rtt > 0 && (best == 0 || rtt < best) {
+				best = rtt
+			}
+		}
+	}
+
+	snap.Aggregate.PathsTotal = len(ids)
+	snap.Aggregate.BestRTTMs = best
+	snap.Aggregate.LossPercent = lossPercent(snap.Aggregate.Received, snap.Aggregate.Lost)
+	return snap
+}
+
+// lossPercent expresses loss against everything that was meant to arrive,
+// which is what did arrive plus what did not.
+func lossPercent(received, lost uint64) float64 {
+	total := received + lost
+	if total == 0 {
+		return 0
+	}
+	return float64(lost) / float64(total) * 100
+}
+
+func burstsOf(st *pathStats) []state.Burst {
+	out := make([]state.Burst, 0, len(st.bursts))
+	for i, n := range st.bursts {
+		// There is one more bucket than there are boundaries: the last
+		// one catches every run longer than the largest named size, and
+		// has no boundary of its own to be labelled with.
+		label := fmt.Sprintf(">%d", burstBuckets[len(burstBuckets)-1])
+		if i < len(burstBuckets) {
+			label = fmt.Sprintf("<=%d", burstBuckets[i])
+		}
+		out = append(out, state.Burst{Label: label, Count: n})
+	}
+	return out
+}
+
+// writeState keeps the state file current for the web interface.
+func (s *session) writeState(path, wgInterface string) {
+	var last time.Duration
+	for range time.Tick(100 * time.Millisecond) {
+		if now := s.elapsed(); now-last < s.cfg.Get().StateInterval() {
+			continue
+		} else {
+			last = now
+		}
+		if err := state.Write(path, s.snapshot(readInterfaceMTU(wgInterface))); err != nil {
+			log.Printf("state: write to %s failed: %v", path, err)
+		}
+	}
+}
+
+// readInterfaceMTU reports what the tunnel interface is actually set to,
+// so the interface can show the configured MTU beside the measured
+// recommendation. Returns 0 if it cannot be read.
+func readInterfaceMTU(name string) int {
+	b, err := os.ReadFile("/sys/class/net/" + name + "/mtu")
+	if err != nil {
+		return 0
+	}
+	mtu, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return 0
+	}
+	return mtu
 }
 
 func ms(micros uint32) float64 { return float64(micros) / 1000 }
