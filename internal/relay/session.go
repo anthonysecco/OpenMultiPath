@@ -396,7 +396,14 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 	// two share no epoch, so the value is meaningless on its own, but
 	// jitter and queue delay are both differences in which the constant
 	// offset cancels.
-	p.stats.observeTransit(protocol.MicrosSince(nowTS, h.SendTS), now)
+	if p.stats.observeTransit(protocol.MicrosSince(nowTS, h.SendTS), now) {
+		// The peer restarted. Its per-path sequence went back to zero
+		// with everything else, and the counter we were expecting is now
+		// far ahead of anything it will send. Left alone, every packet
+		// from here on would read as ancient and sequence tracking would
+		// never recover.
+		p.started = false
+	}
 
 	// Per-path sequences are strictly monotonic, so a jump past what was
 	// expected is real loss on this path. A global sequence gap would mean

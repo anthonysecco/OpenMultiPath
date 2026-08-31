@@ -29,6 +29,17 @@ const minWindow = 10 * time.Second
 // silence.
 var burstBuckets = [...]int{1, 2, 4, 8, 16}
 
+// epochJump is the swing in relative transit taken as evidence that the
+// peer restarted rather than that the network changed.
+//
+// Readings are held against a peer's clock, and a restart moves that clock
+// back to zero, which shifts every reading by however long the peer had
+// been up. The threshold sits far above any plausible network delay - a
+// cellular carrier holding two seconds of packets in its own buffer is
+// nowhere near it - so nothing the network does can be mistaken for a
+// restart.
+const epochJump = int32(30 * time.Second / time.Microsecond)
+
 // pathStats accumulates what the scheduler will eventually score on.
 //
 // Every delay figure here is a *relative* transit reading: the arrival
@@ -70,13 +81,22 @@ type pathStats struct {
 // observeTransit folds one arrival into the statistics. transit is the raw
 // mixed-clock reading; now is our own elapsed time, used only to age the
 // rolling minimum window.
-func (s *pathStats) observeTransit(transit uint32, now time.Duration) {
+//
+// It reports whether the peer appears to have restarted, in which case
+// everything held against the old clock has been discarded and the
+// caller's own per-path state - sequence numbers above all - is equally
+// stale.
+func (s *pathStats) observeTransit(transit uint32, now time.Duration) (peerRestarted bool) {
 	if !s.haveBaseline {
-		s.haveBaseline = true
-		s.baseline = transit
-		s.windowStart = now
+		s.rebaseline(transit, now)
 	}
 	rel := int32(transit - s.baseline)
+
+	if rel > epochJump || rel < -epochJump {
+		s.rebaseline(transit, now)
+		rel = 0
+		peerRestarted = true
+	}
 
 	s.samples[s.next] = rel
 	s.next = (s.next + 1) % sampleWindow
@@ -126,6 +146,21 @@ func (s *pathStats) observeTransit(transit uint32, now time.Duration) {
 
 	s.queueDelay = rel - s.windowMin
 	s.received++
+	return peerRestarted
+}
+
+// rebaseline starts the delay measurements over against a new clock,
+// discarding everything derived from the old one. The cumulative delivery
+// counters are left alone: they are not held against any clock, and the
+// history they carry is still true.
+func (s *pathStats) rebaseline(transit uint32, now time.Duration) {
+	s.haveBaseline = true
+	s.baseline = transit
+	s.windowStart = now
+	s.next, s.filled = 0, 0
+	s.haveEWMA, s.haveLast, s.haveMin = false, false, false
+	s.ewma, s.jitter = 0, 0
+	s.queueDelay = 0
 }
 
 // observeLoss records a gap of n packets on this path, closing out any
