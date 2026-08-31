@@ -1,0 +1,20 @@
+# Local secrets / access material — never commit
+*.env
+.env.*
+*secret*
+*credential*
+*.pem
+*.key
+!*.pub.key
+wireguard/*.conf
+**/wg-keys/
+
+# Build artifacts
+bin/
+dist/
+*.o
+*.ko
+
+# Editor/OS cruft
+.DS_Store
+*.swp
