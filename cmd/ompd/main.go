@@ -1,7 +1,7 @@
-// Command ompd is the OpenMultiPath transport daemon. It currently only
-// implements the blind-duplication relay described in internal/relay;
-// header-based sequencing, measurement and path selection land on top of
-// this in later steps.
+// Command ompd is the OpenMultiPath transport daemon. It carries traffic
+// over every WAN link that is currently up, measures each one
+// continuously, and records what it sees. Path selection is the next step
+// and is not written yet: duplication is still unconditional.
 package main
 
 import (
@@ -28,10 +28,11 @@ func main() {
 	role := flag.String("role", "", "initiator (RV) or responder (home)")
 	loopback := flag.String("loopback", "127.0.0.1:51900", "initiator only: local address WireGuard's peer Endpoint points at (this daemon listens here)")
 	wgTarget := flag.String("wg-target", "127.0.0.1:51821", "responder only: local address WireGuard itself is listening on (its ListenPort)")
-	paths := flag.String("paths", "", "initiator only: comma-separated name=bind-ip pairs, e.g. enp1s0=100.110.247.30,enp2s0=192.168.225.3")
+	paths := flag.String("paths", "", "initiator only: comma-separated interface names, e.g. enp1s0,enp2s0; each may be given as name=ip to pin a local address instead of discovering it")
 	remote := flag.String("remote", "", "initiator only: home's public endpoint, e.g. 162.231.243.253:48219")
 	public := flag.String("public", "0.0.0.0:48219", "responder only: the forwarded public port to listen on")
 	statePath := flag.String("state", "/var/lib/openmultipath/state.json", "where to write the snapshot the web interface reads")
+	recordPath := flag.String("record", "/var/lib/openmultipath/history.jsonl", "where to append the rotating telemetry history; empty disables recording")
 	configPath := flag.String("config", "/etc/openmultipath/config.json", "adjustable settings, reloaded when the file changes")
 	wgInterface := flag.String("wg-interface", "wg0", "tunnel interface, read for its current MTU")
 	node := flag.String("node", hostname(), "this box's name, shown in the web interface")
@@ -55,6 +56,7 @@ func main() {
 			Paths:        parsePaths(*paths),
 			Node:         *node,
 			StatePath:    *statePath,
+			RecordPath:   *recordPath,
 			WGInterface:  *wgInterface,
 			Settings:     holder,
 		}
@@ -67,6 +69,7 @@ func main() {
 			LoopbackTarget: *wgTarget,
 			Node:           *node,
 			StatePath:      *statePath,
+			RecordPath:     *recordPath,
 			WGInterface:    *wgInterface,
 			Settings:       holder,
 		}
@@ -78,6 +81,15 @@ func main() {
 	}
 }
 
+// parsePaths reads the configured links. An entry is an interface name on
+// its own, which is the normal case: the address is discovered from the
+// interface and rediscovered whenever it changes. An entry may also be
+// written name=ip to pin a specific local address.
+//
+// No address is looked up here. A link that is not up yet is a path that
+// is currently down, not a configuration error, and deciding that at
+// startup is exactly the mistake that stops the daemon from ever coming
+// up on a cold boot.
 func parsePaths(s string) []relay.PathConfig {
 	var out []relay.PathConfig
 	for _, part := range strings.Split(s, ",") {
@@ -85,9 +97,10 @@ func parsePaths(s string) []relay.PathConfig {
 		if part == "" {
 			continue
 		}
-		name, bind, ok := strings.Cut(part, "=")
-		if !ok {
-			log.Fatalf("ompd: invalid -paths entry %q, expected name=bind-ip", part)
+		name, bind, _ := strings.Cut(part, "=")
+		name, bind = strings.TrimSpace(name), strings.TrimSpace(bind)
+		if name == "" {
+			log.Fatalf("ompd: invalid -paths entry %q, expected an interface name", part)
 		}
 		out = append(out, relay.PathConfig{Name: name, Bind: bind})
 	}

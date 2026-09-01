@@ -16,6 +16,7 @@
 package relay
 
 import (
+	"errors"
 	"log"
 	"net"
 	"syscall"
@@ -54,7 +55,12 @@ func readLoop(conn *net.UDPConn, name string, handle func(buf []byte, from *net.
 	for {
 		n, from, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("%s: read error: %v", name, err)
+			// A closed socket is how a path is deliberately retired when
+			// its link goes away or its address moves, and the caller has
+			// already said so. Only an unexpected failure is worth a line.
+			if !errors.Is(err, net.ErrClosed) {
+				log.Printf("%s: read error: %v", name, err)
+			}
 			return
 		}
 		handle(buf[:n], from)

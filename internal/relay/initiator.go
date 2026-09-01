@@ -1,22 +1,27 @@
 package relay
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"net"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
+	"github.com/anthonysecco/OpenMultiPath/internal/record"
 )
 
 // PathConfig is one physical WAN link the initiator sends duplicate copies
 // of every packet out of.
 type PathConfig struct {
-	Name string // e.g. "enp1s0", for logging only
-	Bind string // local IP to bind to, forcing egress via that link's route
+	Name string // interface name, e.g. "enp1s0"
+
+	// Bind pins the local IP to bind to. Leave it empty for the normal
+	// case: the address is discovered from the interface and rediscovered
+	// whenever it changes, which is what lets a path survive a lease
+	// renewal or a tower handover. Pinning is for a box with several
+	// addresses on one interface where the choice matters.
+	Bind string
 }
 
 type InitiatorConfig struct {
@@ -26,13 +31,19 @@ type InitiatorConfig struct {
 
 	Node        string         // this box's name, for the web interface
 	StatePath   string         // where to write the snapshot the interface reads
+	RecordPath  string         // where to append the history log; empty disables it
 	WGInterface string         // tunnel interface, read for its current MTU
 	Settings    *config.Holder // adjustable settings, reloaded while running
 }
 
 // RunInitiator relays between a local WireGuard interface and the home
-// endpoint, duplicating every packet across every configured path. It
-// blocks until a fatal error occurs.
+// endpoint, duplicating every packet across every path that is currently
+// up. It blocks until a fatal error occurs.
+//
+// A configured link that is absent, down, or has no address yet is not an
+// error: it is a path that is currently down, and it will be bound the
+// moment it appears. The daemon comes up with none of its links present,
+// because on a cold boot in a campground that is the normal case.
 func RunInitiator(cfg InitiatorConfig) error {
 	if len(cfg.Paths) == 0 {
 		return fmt.Errorf("relay: initiator needs at least one path")
@@ -53,120 +64,81 @@ func RunInitiator(cfg InitiatorConfig) error {
 		return fmt.Errorf("relay: resolve remote addr: %w", err)
 	}
 
-	pathConns := make([]*net.UDPConn, 0, len(cfg.Paths))
-	for _, p := range cfg.Paths {
-		conn, err := listenOnDevice(p.Name, p.Bind)
-		if err != nil {
-			return fmt.Errorf("relay: bind path %s (%s): %w", p.Name, p.Bind, err)
-		}
-		defer conn.Close()
-		pathConns = append(pathConns, conn)
-		log.Printf("initiator: path %s bound to %s, sending to %s", p.Name, p.Bind, cfg.RemoteAddr)
-	}
-
 	// The address the local WireGuard peer sends from, learned from its
 	// first outbound packet, and where inbound replies get delivered.
 	var wgPeer atomic.Pointer[net.UDPAddr]
 
-	sess := newSession(cfg.Settings, cfg.Node, "initiator")
-	for i := range cfg.Paths {
-		// Declare every path up front so reports and probes go down links
-		// nothing has arrived on yet - which are exactly the links worth
-		// probing, since passive measurement is blind on an idle path.
+	sess := newSession(cfg.Settings, cfg.Node, roleInitiator)
+
+	// Path ids are indices into the configured list, so a path keeps its
+	// identity across every unbind and rebind. A link that vanishes for
+	// ten minutes comes back as the same path with its history intact,
+	// rather than as a new one starting from nothing.
+	specs := make([]pathSpec, len(cfg.Paths))
+	for i, p := range cfg.Paths {
+		specs[i] = pathSpec{id: uint8(i), name: p.Name, pin: p.Bind}
+
+		// Declare every path up front, bound or not, so a link that has
+		// never come up is visible as a path that is down rather than
+		// missing from the interface entirely.
 		sess.registerPath(uint8(i))
-		sess.nameFor(uint8(i), cfg.Paths[i].Name)
+		sess.nameFor(uint8(i), p.Name)
 	}
+
 	go sess.logStats()
 	if cfg.StatePath != "" {
 		go sess.writeState(cfg.StatePath, cfg.WGInterface)
 	}
-
-	// The initiator's paths are fixed by configuration, one socket each.
-	allPaths := make([]uint8, len(cfg.Paths))
-	for i := range cfg.Paths {
-		allPaths[i] = uint8(i)
+	if cfg.RecordPath != "" {
+		w := record.New(cfg.RecordPath, func() (int64, int) {
+			c := cfg.Settings.Get()
+			return c.RecordMaxBytes(), c.RecordKeepFiles
+		})
+		log.Printf("initiator: recording history to %s", cfg.RecordPath)
+		go sess.recordHistory(w, cfg.WGInterface)
 	}
-	go sess.runProbes(
-		func() []uint8 { return allPaths },
-		func(id uint8, pkt []byte) {
-			if _, err := pathConns[id].WriteToUDP(pkt, remoteAddr); err != nil {
-				log.Printf("initiator: probe on path %s failed: %v", cfg.Paths[id].Name, err)
-			}
-		},
-	)
 
-	// WireGuard -> duplicate onto every physical path. The global sequence
-	// is allocated once here, before the copies are made, so every copy of
-	// a packet is recognisable as the same packet at the far end.
-	// readLoop calls this from a single goroutine, so one scratch buffer
-	// serves every copy: each is written out before the next is built.
+	// Each physical path -> local WireGuard. Duplicates land here too;
+	// WireGuard's replay protection drops the redundant copy.
+	paths := newPathSet(specs, sess, remoteAddr, func(id uint8, buf []byte) {
+		h, payload, err := protocol.Parse(buf)
+		if err != nil {
+			log.Printf("initiator: bad packet on path %d: %v", id, err)
+			return
+		}
+		sess.observe(&h, len(buf))
+
+		// Reports and probes carry no tunnel traffic; they exist only to
+		// keep measurement flowing when data is not.
+		if h.Type != protocol.TypeData {
+			return
+		}
+		peer := wgPeer.Load()
+		if peer == nil {
+			return // haven't heard from local WireGuard yet
+		}
+		if _, err := wgConn.WriteToUDP(payload, peer); err != nil {
+			log.Printf("initiator: write to wireguard failed: %v", err)
+		}
+	})
+	go paths.run()
+
+	go sess.runProbes(paths.active, paths.send)
+
+	// WireGuard -> duplicate onto every path currently up. The global
+	// sequence is allocated once here, before the copies are made, so
+	// every copy of a packet is recognisable as the same packet at the far
+	// end. readLoop calls this from a single goroutine, so one scratch
+	// buffer serves every copy: each is written out before the next is
+	// built.
 	scratch := make([]byte, 0, bufSize+maxHeaderLen)
 	go readLoop(wgConn, "initiator-wg", func(payload []byte, from *net.UDPAddr) {
 		wgPeer.Store(from)
 		globalSeq := sess.nextGlobalSeq()
-		for i, conn := range pathConns {
-			out := sess.stamp(uint8(i), globalSeq, payload, scratch)
-			if _, err := conn.WriteToUDP(out, remoteAddr); err != nil {
-				log.Printf("initiator: write to path %s failed: %v", cfg.Paths[i].Name, err)
-			}
+		for _, id := range paths.active() {
+			paths.send(id, sess.stamp(id, globalSeq, payload, scratch))
 		}
 	})
 
-	// Each physical path -> local WireGuard. Duplicates land here too;
-	// WireGuard's replay protection drops the redundant copy.
-	for i, conn := range pathConns {
-		name := cfg.Paths[i].Name
-		go readLoop(conn, "initiator-path-"+name, func(buf []byte, _ *net.UDPAddr) {
-			h, payload, err := protocol.Parse(buf)
-			if err != nil {
-				log.Printf("initiator: bad packet on path %s: %v", name, err)
-				return
-			}
-			sess.observe(&h, len(buf))
-
-			// Reports and probes carry no tunnel traffic; they exist only
-			// to keep measurement flowing when data is not.
-			if h.Type != protocol.TypeData {
-				return
-			}
-			peer := wgPeer.Load()
-			if peer == nil {
-				return // haven't heard from local WireGuard yet
-			}
-			if _, err := wgConn.WriteToUDP(payload, peer); err != nil {
-				log.Printf("initiator: write to wireguard failed: %v", err)
-			}
-		})
-	}
-
 	select {} // run forever; readLoop goroutines log and return on fatal errors
-}
-
-// listenOnDevice opens a UDP socket bound to both a specific local IP and a
-// specific network interface (SO_BINDTODEVICE), so egress is pinned to that
-// physical link regardless of what the main routing table would otherwise
-// pick. Binding the local IP alone is not enough - Linux's weak host model
-// will happily route out a different interface for a destination-based
-// lookup even when the source address belongs to another NIC.
-func listenOnDevice(ifaceName, bindIP string) (*net.UDPConn, error) {
-	var controlErr error
-	lc := net.ListenConfig{
-		Control: func(_, _ string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				if controlErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifaceName); controlErr != nil {
-					return
-				}
-				controlErr = setDontFragment(int(fd))
-			})
-		},
-	}
-	pc, err := lc.ListenPacket(context.Background(), "udp", bindIP+":0")
-	if err != nil {
-		return nil, err
-	}
-	if controlErr != nil {
-		pc.Close()
-		return nil, fmt.Errorf("SO_BINDTODEVICE %s: %w", ifaceName, controlErr)
-	}
-	return pc.(*net.UDPConn), nil
 }

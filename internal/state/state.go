@@ -37,6 +37,13 @@ type Snapshot struct {
 	TunnelMTU            int `json:"tunnel_mtu"`
 	RecommendedTunnelMTU int `json:"recommended_tunnel_mtu"`
 
+	// ManagesPaths says whether this end owns its physical sockets. The
+	// initiator binds one per WAN link and so can report each as bound or
+	// not; the responder only ever learns paths from what arrives, and
+	// its per-path bind fields would read as "down" for every healthy
+	// path if the interface did not know to leave them out.
+	ManagesPaths bool `json:"manages_paths"`
+
 	Paths     []Path        `json:"paths"`
 	Aggregate Aggregate     `json:"aggregate"`
 	Config    config.Config `json:"config"`
@@ -77,6 +84,24 @@ type Path struct {
 
 	LastSeenSeconds float64 `json:"last_seen_seconds"`
 	Alive           bool    `json:"alive"`
+
+	// Bound is whether this end currently holds an open socket on the
+	// link, and Local the address it is bound to. Only meaningful when
+	// the snapshot's ManagesPaths is set.
+	//
+	// Bound and Alive answer different questions and both are needed: a
+	// path bound but not alive means the link is up here and something
+	// past it is broken, while a path neither bound nor alive means the
+	// modem has not come back yet.
+	Bound bool   `json:"bound,omitempty"`
+	Local string `json:"local,omitempty"`
+
+	// Drops counts how many times this link has gone away since the
+	// daemon started, address changes included. A link that has dropped
+	// forty times on one drive is the most useful single thing the field
+	// data can say about it, and it is what the flap penalty will be
+	// built on.
+	Drops uint64 `json:"drops,omitempty"`
 }
 
 // Burst is one bucket of the loss run-length distribution.

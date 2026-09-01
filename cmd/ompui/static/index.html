@@ -190,12 +190,25 @@ function renderPaths(s) {
     $("paths").innerHTML = `<p class="muted">No paths yet.</p>`;
     return;
   }
+  // Only the initiator owns its sockets, so only it can say whether a
+  // link is bound. On the responder these fields are absent and the
+  // interface must not read that absence as every path being down.
+  const owns = s.manages_paths;
+
   $("paths").innerHTML = s.paths.map(p => {
+    // A link that is not bound and a link that is bound but silent are
+    // different faults with different fixes - the modem has not come back
+    // versus something past it is broken - so they get different words.
+    const status = (owns && !p.bound)
+      ? `<span class="tag bad">link down</span>`
+      : p.alive ? `<span class="tag good">alive</span>`
+                : `<span class="tag bad">no traffic</span>`;
+
     const tags = [
-      p.alive ? `<span class="tag good">alive</span>`
-              : `<span class="tag bad">no traffic</span>`,
+      status,
       p.thin ? `<span class="tag warn">thin statistics</span>` : "",
       (p.path_mtu && !p.usable) ? `<span class="tag bad">below tunnel floor</span>` : "",
+      (owns && p.local) ? `<span class="tag">via ${p.local}</span>` : "",
       p.remote ? `<span class="tag">${p.remote}</span>` : "",
     ].join(" ");
 
@@ -206,7 +219,12 @@ function renderPaths(s) {
         bursts.map(b => `<td>${b.count}</td>`).join("") + `</tr></table>`
       : "";
 
-    return `<div class="path ${p.alive ? "alive" : "dead"}">
+    const bindRow = owns
+      ? `<div class="metric"><div class="k">Link drops</div>
+           <div class="v" title="times this link has gone away since the daemon started, address changes included">${p.drops || 0}</div></div>`
+      : "";
+
+    return `<div class="path ${(owns && !p.bound) ? "dead" : p.alive ? "alive" : "dead"}">
       <div class="path-head">
         <span class="path-name">${p.name || "path " + p.id}</span>
         <span class="muted">#${p.id}</span>
@@ -226,6 +244,7 @@ function renderPaths(s) {
         <div class="metric"><div class="k">Samples</div><div class="v">${p.samples}</div></div>
         <div class="metric"><div class="k">Last seen</div>
           <div class="v">${p.last_seen_seconds < 0 ? "never" : duration(p.last_seen_seconds)}</div></div>
+        ${bindRow}
       </div>
       ${burstRow}
     </div>`;
@@ -277,6 +296,12 @@ const FIELDS = [
    "How often the daemon writes the data this page reads."],
   ["stats_interval_seconds", "Log interval", "s",
    "How often measurements are written to the daemon log."],
+  ["record_interval_seconds", "History interval", "s",
+   "How often a snapshot is appended to the history log, which is what a drive leaves behind to look at afterwards."],
+  ["record_max_megabytes", "History file size", "MB",
+   "Size at which the history log rotates."],
+  ["record_keep_files", "History files kept", "files",
+   "How many rotated history files to keep. Size times count is the hard ceiling on disk."],
 ];
 
 async function loadConfig() {

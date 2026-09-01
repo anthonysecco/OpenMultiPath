@@ -51,10 +51,13 @@ func TestValuesAreClampedIntoRange(t *testing.T) {
 // A value inside its range is left exactly as given.
 func TestValidValuesSurviveUntouched(t *testing.T) {
 	c := Config{
-		EchoIntervalMs:       250,
-		ProbeIntervalSeconds: 60,
-		StateIntervalMs:      2_000,
-		StatsIntervalSeconds: 45,
+		EchoIntervalMs:        250,
+		ProbeIntervalSeconds:  60,
+		StateIntervalMs:       2_000,
+		StatsIntervalSeconds:  45,
+		RecordIntervalSeconds: 10,
+		RecordMaxMegabytes:    64,
+		RecordKeepFiles:       4,
 	}
 	if got := c.Sanitised(); got != c {
 		t.Errorf("got %+v, want it unchanged at %+v", got, c)
@@ -64,10 +67,13 @@ func TestValidValuesSurviveUntouched(t *testing.T) {
 func TestSaveAndLoadRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	want := Config{
-		EchoIntervalMs:       150,
-		ProbeIntervalSeconds: 30,
-		StateIntervalMs:      500,
-		StatsIntervalSeconds: 60,
+		EchoIntervalMs:        150,
+		ProbeIntervalSeconds:  30,
+		StateIntervalMs:       500,
+		StatsIntervalSeconds:  60,
+		RecordIntervalSeconds: 2,
+		RecordMaxMegabytes:    16,
+		RecordKeepFiles:       12,
 	}
 	if err := Save(path, want); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -95,5 +101,33 @@ func TestCorruptFileFallsBackToDefaults(t *testing.T) {
 	}
 	if c != Defaults() {
 		t.Errorf("got %+v, want the defaults so the daemon can still run", c)
+	}
+}
+
+// A file written before a setting existed is the normal case after any
+// upgrade: the boxes in the field are carrying one right now. The settings
+// it does name must survive, and the ones it does not must come up at
+// their defaults rather than at zero.
+func TestPartialFileKeepsWhatItNamesAndDefaultsTheRest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"echo_interval_ms": 200}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.EchoIntervalMs != 200 {
+		t.Errorf("echo interval = %d, want the 200 the file asked for", got.EchoIntervalMs)
+	}
+	if want := Bounds["record_interval_seconds"].Default; got.RecordIntervalSeconds != want {
+		t.Errorf("record interval = %d, want the default %d", got.RecordIntervalSeconds, want)
+	}
+	if want := Bounds["record_keep_files"].Default; got.RecordKeepFiles != want {
+		t.Errorf("record keep files = %d, want the default %d", got.RecordKeepFiles, want)
+	}
+	if got.RecordMaxBytes() <= 0 {
+		t.Error("rotation threshold is not positive, so the recorder would rotate on every write")
 	}
 }

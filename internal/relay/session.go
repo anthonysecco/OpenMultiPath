@@ -15,7 +15,16 @@ import (
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
+	"github.com/anthonysecco/OpenMultiPath/internal/record"
 	"github.com/anthonysecco/OpenMultiPath/internal/state"
+)
+
+// The two ends run the same session code and differ only in role. The
+// initiator owns the physical sockets and so has paths that can be bound
+// or not; the responder learns its paths from whatever arrives.
+const (
+	roleInitiator = "initiator"
+	roleResponder = "responder"
 )
 
 // staleEcho is the age past which a recorded arrival is dropped rather
@@ -106,6 +115,18 @@ type pathState struct {
 	// pins its paths to sockets instead, one per WAN link.
 	remote *net.UDPAddr
 
+	// bound, local and drops describe the physical socket behind this
+	// path. Only the initiator owns sockets; the responder learns its
+	// paths from arriving packets and leaves these alone.
+	//
+	// bound is deliberately separate from whether the path is delivering.
+	// A path that is bound but silent says the link is up locally and
+	// something beyond it is broken, which is a different fault from a
+	// modem that has not registered, and wants telling apart at 2am.
+	bound bool
+	local string
+	drops uint64
+
 	rtt   uint32 // most recent round trip, microseconds
 	stats pathStats
 	mtu   mtuProbe
@@ -172,6 +193,29 @@ func (s *session) registerPath(id uint8) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pathLocked(id)
+}
+
+// setBound records that a path's socket is open on a local address.
+func (s *session) setBound(id uint8, local string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.pathLocked(id)
+	p.bound, p.local = true, local
+}
+
+// setUnbound records that a path's socket has gone away, and counts it.
+//
+// The count is kept because the flap penalty in protocol.md will need it,
+// and because a link that has gone down forty times on one drive is the
+// single most useful thing the field data can tell us about it.
+func (s *session) setUnbound(id uint8) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.pathLocked(id)
+	if p.bound {
+		p.drops++
+	}
+	p.bound, p.local = false, ""
 }
 
 // pathLocked returns the state for a path, creating it on first use. The
@@ -566,6 +610,7 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 		UptimeSeconds:        now.Seconds(),
 		TunnelMTU:            tunnelMTU,
 		RecommendedTunnelMTU: s.recommendedTunnelMTULocked(),
+		ManagesPaths:         s.role == roleInitiator,
 		Config:               s.cfg.Get(),
 	}
 
@@ -605,6 +650,11 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 			Usable:            p.mtu.confirmed >= minUsablePathMTU,
 			LastSeenSeconds:   lastSeen,
 			Alive:             alive,
+		}
+		if snap.ManagesPaths {
+			path.Bound = p.bound
+			path.Local = p.local
+			path.Drops = p.drops
 		}
 		if p.remote != nil {
 			path.Remote = p.remote.String()
@@ -678,6 +728,59 @@ func (s *session) writeState(path, wgInterface string) {
 		if err := state.Write(path, s.snapshot(readInterfaceMTU(wgInterface))); err != nil {
 			log.Printf("state: write to %s failed: %v", path, err)
 		}
+	}
+}
+
+// clockSane is the earliest wall-clock time a recorded timestamp is
+// believed. A box with no RTC comes up in 1970 and only learns the real
+// time once NTP completes over whatever link registers first, which on a
+// cold boot in a campground can be minutes.
+//
+// Measurement itself needs none of this - every delay figure is relative
+// to a process-local clock and the two ends share no epoch - so nothing is
+// lost by waiting. What would be lost is the history: records stamped
+// 1970 cannot be lined up against anything, and a drive whose first ten
+// minutes claim to predate the last one is worse than a drive missing
+// them.
+var clockSane = time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// recordHistory appends a snapshot to the history log on a cadence of its
+// own, so a drive leaves behind a file that can be looked at afterwards.
+//
+// A failure to write is logged and the loop continues. History is
+// valuable, but not so valuable that losing the disk should take the
+// tunnel down with it.
+func (s *session) recordHistory(w *record.Writer, wgInterface string) {
+	var last time.Duration
+	waiting, failed := false, false
+
+	for range time.Tick(time.Second) {
+		now := s.elapsed()
+		if now-last < s.cfg.Get().RecordInterval() {
+			continue
+		}
+		if time.Now().Before(clockSane) {
+			if !waiting {
+				log.Printf("record: holding off, system clock reads %s and is not yet believable",
+					time.Now().Format(time.RFC3339))
+				waiting = true
+			}
+			continue
+		}
+		if waiting {
+			log.Printf("record: clock now reads %s, recording history", time.Now().Format(time.RFC3339))
+			waiting = false
+		}
+		last = now
+
+		if err := w.Write(s.snapshot(readInterfaceMTU(wgInterface))); err != nil {
+			if !failed {
+				log.Printf("record: write failed, continuing without history: %v", err)
+				failed = true
+			}
+			continue
+		}
+		failed = false
 	}
 }
 

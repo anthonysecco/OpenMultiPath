@@ -9,6 +9,7 @@ import (
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
+	"github.com/anthonysecco/OpenMultiPath/internal/record"
 )
 
 type ResponderConfig struct {
@@ -17,6 +18,7 @@ type ResponderConfig struct {
 
 	Node        string         // this box's name, for the web interface
 	StatePath   string         // where to write the snapshot the interface reads
+	RecordPath  string         // where to append the history log; empty disables it
 	WGInterface string         // tunnel interface, read for its current MTU
 	Settings    *config.Holder // adjustable settings, reloaded while running
 }
@@ -56,10 +58,21 @@ func RunResponder(cfg ResponderConfig) error {
 	}
 	defer wgConn.Close()
 
-	sess := newSession(cfg.Settings, cfg.Node, "responder")
+	sess := newSession(cfg.Settings, cfg.Node, roleResponder)
 	go sess.logStats()
 	if cfg.StatePath != "" {
 		go sess.writeState(cfg.StatePath, cfg.WGInterface)
+	}
+	// The home end records too. It sees the same links from the other
+	// side, and asymmetry is one of the things the field data has to
+	// settle - a path can be fine outbound and unusable inbound.
+	if cfg.RecordPath != "" {
+		w := record.New(cfg.RecordPath, func() (int64, int) {
+			c := cfg.Settings.Get()
+			return c.RecordMaxBytes(), c.RecordKeepFiles
+		})
+		log.Printf("responder: recording history to %s", cfg.RecordPath)
+		go sess.recordHistory(w, cfg.WGInterface)
 	}
 
 	// The responder never dials out, so its paths are only the ones the

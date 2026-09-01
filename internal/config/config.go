@@ -45,6 +45,20 @@ type Config struct {
 	// StatsIntervalSeconds is how often measurements are written to the
 	// log.
 	StatsIntervalSeconds int `json:"stats_interval_seconds"`
+
+	// RecordIntervalSeconds is how often a snapshot is appended to the
+	// history log. Finer than this buys little for the questions the
+	// field data has to answer - how long an outage lasted, how often a
+	// link flapped - and costs disk on a box nobody visits for months.
+	RecordIntervalSeconds int `json:"record_interval_seconds"`
+
+	// RecordMaxMegabytes is the size at which the history log rotates,
+	// and RecordKeepFiles how many older generations are kept. The two
+	// together are a hard ceiling on disk: the default 32 MB across 8
+	// generations is 256 MB, which at the default cadence holds roughly
+	// a fortnight of driving.
+	RecordMaxMegabytes int `json:"record_max_megabytes"`
+	RecordKeepFiles    int `json:"record_keep_files"`
 }
 
 // bound describes the permitted range of one setting, and is also what the
@@ -61,6 +75,10 @@ var Bounds = map[string]bound{
 	"probe_interval_seconds": {Min: 5, Max: 3_600, Default: 15},
 	"state_interval_ms":      {Min: 200, Max: 60_000, Default: 1_000},
 	"stats_interval_seconds": {Min: 5, Max: 3_600, Default: 30},
+
+	"record_interval_seconds": {Min: 1, Max: 3_600, Default: 5},
+	"record_max_megabytes":    {Min: 1, Max: 4_096, Default: 32},
+	"record_keep_files":       {Min: 1, Max: 100, Default: 8},
 }
 
 // Defaults returns a configuration that is correct to run with as-is.
@@ -70,6 +88,10 @@ func Defaults() Config {
 		ProbeIntervalSeconds: Bounds["probe_interval_seconds"].Default,
 		StateIntervalMs:      Bounds["state_interval_ms"].Default,
 		StatsIntervalSeconds: Bounds["stats_interval_seconds"].Default,
+
+		RecordIntervalSeconds: Bounds["record_interval_seconds"].Default,
+		RecordMaxMegabytes:    Bounds["record_max_megabytes"].Default,
+		RecordKeepFiles:       Bounds["record_keep_files"].Default,
 	}
 }
 
@@ -96,6 +118,10 @@ func (c Config) Sanitised() Config {
 		ProbeIntervalSeconds: clamp(c.ProbeIntervalSeconds, Bounds["probe_interval_seconds"]),
 		StateIntervalMs:      clamp(c.StateIntervalMs, Bounds["state_interval_ms"]),
 		StatsIntervalSeconds: clamp(c.StatsIntervalSeconds, Bounds["stats_interval_seconds"]),
+
+		RecordIntervalSeconds: clamp(c.RecordIntervalSeconds, Bounds["record_interval_seconds"]),
+		RecordMaxMegabytes:    clamp(c.RecordMaxMegabytes, Bounds["record_max_megabytes"]),
+		RecordKeepFiles:       clamp(c.RecordKeepFiles, Bounds["record_keep_files"]),
 	}
 }
 
@@ -113,6 +139,15 @@ func (c Config) StateInterval() time.Duration {
 
 func (c Config) StatsInterval() time.Duration {
 	return time.Duration(c.StatsIntervalSeconds) * time.Second
+}
+
+func (c Config) RecordInterval() time.Duration {
+	return time.Duration(c.RecordIntervalSeconds) * time.Second
+}
+
+// RecordMaxBytes is the rotation threshold in bytes.
+func (c Config) RecordMaxBytes() int64 {
+	return int64(c.RecordMaxMegabytes) << 20
 }
 
 // Load reads a configuration file. A missing file yields the defaults,
