@@ -66,6 +66,18 @@ const probeTimeout = 2 * time.Second
 // probeMisses is how many unconfirmed attempts retire a candidate size.
 const probeMisses = 3
 
+// mtuCeilingRetryAfter is how long a ceiling holds before the search tries
+// again from scratch.
+//
+// Three misses at the default cadence is ~45s, which a real dead zone
+// clears easily - the scenario walkthrough in scope-v1.md has these running
+// to minutes. Without a retry, a ceiling set during an ordinary outage
+// would never be reconsidered: confirmed stays 0 forever, the path reads as
+// unable to carry the tunnel floor, and only a daemon restart clears it.
+// That is exactly backwards for a project whose premise is that links come
+// back.
+const mtuCeilingRetryAfter = 3 * time.Minute
+
 // mtuProbe tracks the path MTU search for one path. Sizes are physical
 // MTUs: what the link carries including the outer IP and UDP headers.
 type mtuProbe struct {
@@ -73,7 +85,8 @@ type mtuProbe struct {
 	probing   int // size currently outstanding, 0 when idle
 	sentAt    time.Duration
 	misses    int
-	ceiling   int // sizes at or above this have failed; stop reaching
+	ceiling   int           // sizes at or above this have failed; stop reaching
+	ceilingAt time.Duration // when ceiling was set, so it can be retried later
 }
 
 // next returns the size to probe for, or 0 when the search has settled.
@@ -127,6 +140,36 @@ type pathState struct {
 	local string
 	drops uint64
 
+	// lastSentAt is when anything last went out on this path, which is
+	// what paces the standalone reports. It is per-path and not
+	// session-wide for a reason that only appeared once scheduling did:
+	// with one path carrying the traffic, a session-wide timer is kept
+	// permanently fresh by the chosen path and the idle ones are never
+	// reported on at all. They then stop being measured, which loses
+	// exactly the paths worth knowing about - the ones a call might have
+	// to be moved onto.
+	//
+	// It also gives protocol.md's stated rule for free: probe rate
+	// inversely proportional to traffic on that path. A busy path is never
+	// due, an idle one gets the full cadence.
+	lastSentAt time.Duration
+
+	// sentSince counts packets put into this path since anything last
+	// arrived on it. Silence on its own is the ordinary state of an idle
+	// path; silence while we are actively sending is a path that has
+	// stopped working, and telling those apart is what stops an unused
+	// link being declared dead for failing to answer a question nobody
+	// asked it.
+	sentSince uint64
+
+	// confirmedAt is when the peer last echoed a packet we sent on this
+	// path, which is the only direct evidence that our transmissions
+	// arrive. Receiving on a path proves the reverse direction only.
+	// Make-before-break turns on this distinction: committing a handover
+	// on inbound evidence alone would move a call onto a path that is fine
+	// coming back and dead going out.
+	confirmedAt time.Duration
+
 	rtt   uint32 // most recent round trip, microseconds
 	stats pathStats
 	mtu   mtuProbe
@@ -148,11 +191,16 @@ type session struct {
 	node string
 	role string
 
+	// sched publishes the current scheduling verdict. It is set once
+	// before the relay starts and only ever read here, for the snapshot.
+	// The snapshot copes with it being nil, because the measurement layer
+	// is tested on its own without a scheduler attached.
+	sched *scheduler
+
 	mu       sync.Mutex
 	paths    map[uint8]*pathState
 	names    map[uint8]string
 	lastEcho time.Duration
-	lastSent time.Duration
 }
 
 func newSession(cfg *config.Holder, node, role string) *session {
@@ -294,6 +342,7 @@ func (s *session) build(typ, pathID uint8, globalSeq uint32, payload, buf []byte
 		SendTS:    uint32(now.Microseconds()),
 	}
 	p.nextSeq++
+	p.sentSince++
 
 	if now-s.lastEcho >= s.cfg.Get().EchoInterval() {
 		h.Echo = s.collectEchoLocked(now)
@@ -301,7 +350,7 @@ func (s *session) build(typ, pathID uint8, globalSeq uint32, payload, buf []byte
 			s.lastEcho = now
 		}
 	}
-	s.lastSent = now
+	p.lastSentAt = now
 	s.mu.Unlock()
 
 	return append(h.AppendTo(buf[:0]), payload...)
@@ -336,14 +385,14 @@ func (s *session) collectEchoLocked(now time.Duration) []protocol.EchoEntry {
 	return out
 }
 
-// dueForReport reports whether the reverse direction has been quiet long
-// enough that feedback needs a packet of its own. Piggybacking on data is
-// free, so it is always preferred; this only fires when there is no data
-// to ride along with.
-func (s *session) dueForReport() bool {
+// dueForReport reports whether a path has been quiet long enough that
+// feedback needs a packet of its own. Piggybacking on data is free, so it
+// is always preferred; this only fires for a path with no data to ride
+// along with.
+func (s *session) dueForReport(id uint8) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.elapsed()-s.lastSent >= s.cfg.Get().EchoInterval()
+	return s.elapsed()-s.pathLocked(id).lastSentAt >= s.cfg.Get().EchoInterval()
 }
 
 // buildReport produces a standalone feedback packet for a path, carrying
@@ -373,9 +422,15 @@ func (s *session) buildProbe(pathID uint8, buf []byte) []byte {
 		p.mtu.misses++
 		if p.mtu.misses >= probeMisses {
 			p.mtu.ceiling = p.mtu.probing
+			p.mtu.ceilingAt = now
 			p.mtu.misses = 0
 		}
 		p.mtu.probing = 0
+	}
+	if p.mtu.ceiling != 0 && now-p.mtu.ceilingAt >= mtuCeilingRetryAfter {
+		// Give the search another chance rather than trusting a ceiling
+		// that may only ever have meant "the path was down at the time."
+		p.mtu.ceiling = 0
 	}
 	size := p.mtu.next()
 	if size == 0 {
@@ -421,8 +476,8 @@ func (s *session) runProbes(pathIDs func() []uint8, send func(pathID uint8, pkt 
 	for range time.Tick(tick) {
 		now := s.elapsed()
 
-		if s.dueForReport() {
-			for _, id := range pathIDs() {
+		for _, id := range pathIDs() {
+			if s.dueForReport(id) {
 				send(id, s.buildReport(id, buf))
 			}
 		}
@@ -453,6 +508,7 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 	p.peerTS = h.SendTS
 	p.seenAt = now
 	p.pending = true
+	p.sentSince = 0
 	if uint16(wireLen) > p.maxSeen {
 		p.maxSeen = uint16(wireLen)
 	}
@@ -502,6 +558,9 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 		if round >= e.Delay {
 			ep.rtt = round - e.Delay
 		}
+		// The peer is reporting a packet it received on this path, so our
+		// transmit direction is working as of now.
+		ep.confirmedAt = now
 		// A probe is confirmed when the peer reports having seen a packet
 		// at least as large as the one sent, which answers the question
 		// directly rather than inferring it from a timestamp.
@@ -511,6 +570,50 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 			ep.mtu.misses = 0
 		}
 	}
+}
+
+// metrics assembles what the scheduler evaluates, one entry per known
+// path. It is taken under the lock and handed back by value so that
+// evaluation - which sorts, scores and logs - never holds the lock the data
+// path needs to send a packet.
+func (s *session) metrics(now time.Duration) []pathMetric {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	managed := s.role == roleInitiator
+	out := make([]pathMetric, 0, len(s.paths))
+	for id, p := range s.paths {
+		st := &p.stats
+
+		// A path that has never delivered anything has been silent for as
+		// long as this process has been running. The initiator registers
+		// every configured path at startup, so that is the truth for a
+		// link that has never come up; the responder only learns a path
+		// by hearing from it, so the case does not arise there.
+		silent := now
+		if st.received > 0 {
+			silent = now - p.seenAt
+		}
+
+		out = append(out, pathMetric{
+			id:             id,
+			name:           s.names[id],
+			managed:        managed,
+			bound:          p.bound,
+			silentFor:      silent,
+			sentSinceHeard: p.sentSince,
+			confirmedAt:    p.confirmedAt,
+			rttMs:          ms(p.rtt),
+			p95SpreadMs:    msi(st.spread()),
+			jitterMs:       st.jitter / 1000,
+			queueDelayMs:   msi(st.queueDelay),
+			recentLoss:     st.recentLossPercent(),
+			burstRatio:     st.recentBurstRatio(),
+			thin:           st.thin(),
+			unusable:       p.mtu.ceiling != 0 && p.mtu.confirmed < minUsablePathMTU,
+		})
+	}
+	return out
 }
 
 // recommendedTunnelMTU is the inner MTU the discovered paths can carry,
@@ -533,16 +636,24 @@ func (s *session) logStats() {
 		} else {
 			last = now
 		}
+		d := emptyDecision
+		if s.sched != nil {
+			d = s.sched.current()
+		}
+
 		s.mu.Lock()
 		for id, p := range s.paths {
 			st := &p.stats
-			log.Printf("path %d: rtt %.1fms p95-spread %.1fms jitter %.1fms queue %.1fms | "+
+			log.Printf("path %d: %s | rtt %.1fms p95-spread %.1fms jitter %.1fms queue %.1fms | "+
 				"rx %d lost %d bursts %v | samples %d%s | mtu %d",
-				id,
+				id, describe(d, id),
 				ms(p.rtt), msi(st.spread()), st.jitter/1000, msi(st.queueDelay),
 				st.received, st.lost, st.bursts,
 				st.filled, thinNote(st.thin()),
 				p.mtu.confirmed)
+		}
+		if d.blind {
+			log.Printf("scheduler: %s", d.reason)
 		}
 		if mtu := s.recommendedTunnelMTULocked(); mtu != 0 {
 			log.Printf("recommended tunnel mtu: %d", mtu)
@@ -600,6 +711,15 @@ const aliveWithin = 5 * time.Second
 func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 	now := s.elapsed()
 
+	// Read the scheduler's verdict before taking the lock. It is an
+	// immutable published value, so there is nothing to coordinate, and
+	// reaching for it under the lock would be inviting a deadlock for no
+	// benefit.
+	d := emptyDecision
+	if s.sched != nil {
+		d = s.sched.current()
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -651,6 +771,17 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 			LastSeenSeconds:   lastSeen,
 			Alive:             alive,
 		}
+		if v, ok := d.views[id]; ok {
+			path.State = v.State
+			path.StateReason = v.Reason
+			path.RFactor = v.RFactor
+			path.Score = v.Score
+			path.MOS = v.MOS
+			path.Flapping = v.Flapping
+			path.Transitions = v.Transitions
+			path.Sending = v.Sending
+			path.Primary = d.havePrimary && d.primary == id
+		}
 		if snap.ManagesPaths {
 			path.Bound = p.bound
 			path.Local = p.local
@@ -688,6 +819,22 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 	snap.Aggregate.PathsTotal = len(ids)
 	snap.Aggregate.BestRTTMs = best
 	snap.Aggregate.LossPercent = lossPercent(snap.Aggregate.Received, snap.Aggregate.Lost)
+
+	snap.Scheduler = state.Scheduler{
+		Primary:       -1,
+		SwitchingTo:   -1,
+		Switching:     d.switching,
+		Blind:         d.blind,
+		Reason:        d.reason,
+		DuplicateMode: snap.Config.DuplicateMode,
+		Ranking:       d.ranking,
+	}
+	if d.havePrimary {
+		snap.Scheduler.Primary = int(d.primary)
+	}
+	if d.switching {
+		snap.Scheduler.SwitchingTo = int(d.switchingTo)
+	}
 	return snap
 }
 
@@ -807,4 +954,29 @@ func thinNote(thin bool) string {
 		return " (thin)"
 	}
 	return ""
+}
+
+// describe renders a path's scheduling verdict for the log line, so that
+// reading the journal answers "which path was carrying the call and why"
+// without cross-referencing anything.
+func describe(d *decision, id uint8) string {
+	v, ok := d.views[id]
+	if !ok {
+		return "unscheduled"
+	}
+	out := v.State
+	if v.Reason != "" {
+		out += " (" + v.Reason + ")"
+	}
+	out += fmt.Sprintf(" mos %.1f", v.MOS)
+	switch {
+	case d.havePrimary && d.primary == id:
+		out += " PRIMARY"
+	case v.Sending:
+		out += " sending"
+	}
+	if v.Flapping {
+		out += " FLAPPING"
+	}
+	return out
 }

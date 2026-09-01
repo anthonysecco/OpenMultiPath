@@ -77,15 +77,17 @@ func RunResponder(cfg ResponderConfig) error {
 
 	// The responder never dials out, so its paths are only the ones the
 	// far end has made contact on.
+	known := func() []uint8 {
+		rs := sess.remotes()
+		ids := make([]uint8, len(rs))
+		for i, r := range rs {
+			ids[i] = r.pathID
+		}
+		return ids
+	}
+
 	go sess.runProbes(
-		func() []uint8 {
-			rs := sess.remotes()
-			ids := make([]uint8, len(rs))
-			for i, r := range rs {
-				ids[i] = r.pathID
-			}
-			return ids
-		},
+		known,
 		func(id uint8, pkt []byte) {
 			addr := sess.remoteFor(id)
 			if addr == nil {
@@ -121,14 +123,32 @@ func RunResponder(cfg ResponderConfig) error {
 		}
 	})
 
-	// WireGuard -> duplicate the reply back over every known path.
+	sched := newScheduler(sess, cfg.Settings, known)
+	sess.sched = sched
+	go sched.run()
+
+	// WireGuard -> whichever paths the scheduler has chosen.
+	//
+	// Both ends schedule independently and neither tells the other what it
+	// decided. That is deliberate: paths are asymmetric, a link can be
+	// clean inbound and unusable outbound, and each end has measured its
+	// own receive direction directly rather than been told about it.
 	scratch := make([]byte, 0, bufSize+maxHeaderLen)
 	go readLoop(wgConn, "responder-wg", func(payload []byte, _ *net.UDPAddr) {
 		globalSeq := sess.nextGlobalSeq()
-		for _, r := range sess.remotes() {
-			out := sess.stamp(r.pathID, globalSeq, payload, scratch)
-			if _, err := pubConn.WriteToUDP(out, r.addr); err != nil {
-				log.Printf("responder: write to path %d at %s failed: %v", r.pathID, r.addr, err)
+
+		tx := sched.txPaths()
+		if len(tx) == 0 {
+			tx = known()
+		}
+		for _, id := range tx {
+			addr := sess.remoteFor(id)
+			if addr == nil {
+				continue // never heard from, so nowhere to send
+			}
+			out := sess.stamp(id, globalSeq, payload, scratch)
+			if _, err := pubConn.WriteToUDP(out, addr); err != nil {
+				log.Printf("responder: write to path %d at %s failed: %v", id, addr, err)
 			}
 		}
 	})

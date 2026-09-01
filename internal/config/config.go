@@ -23,10 +23,12 @@ import (
 
 // Config is the set of settings that can be changed on a running daemon.
 //
-// Only the measurement cadences are here so far, because they are the only
-// things that currently exist to tune. The path state machine's thresholds
-// and hysteresis windows belong here too once there is a state machine to
-// apply them.
+// The scheduler's thresholds are here alongside the measurement cadences,
+// and every one of them is a guess. They were chosen from the reasoning in
+// protocol.md rather than from field data, because the drive that would
+// have produced the data has not happened. That is the whole reason they
+// are adjustable at runtime: the expectation is that they are wrong and
+// will be corrected from the passenger seat, not that they are right.
 type Config struct {
 	// EchoIntervalMs is how often measurement feedback is sent. It bounds
 	// how quickly a change in a path can be noticed, so protocol.md ties
@@ -59,7 +61,100 @@ type Config struct {
 	// a fortnight of driving.
 	RecordMaxMegabytes int `json:"record_max_megabytes"`
 	RecordKeepFiles    int `json:"record_keep_files"`
+
+	// EvalIntervalMs is how often the path state machine runs. protocol.md
+	// ties the reaction target to 100-200 ms: a degraded path stays
+	// selected for one of these, and that delay is audible.
+	EvalIntervalMs int `json:"eval_interval_ms"`
+
+	// The thresholds that separate a stable path from a degraded one.
+	// Breaching any of them counts as a breach; none of them is a
+	// comparison against another path, because "unstable" means degraded
+	// against its own floor, not worse than its neighbour. Which path wins
+	// is a scoring question, kept deliberately separate.
+	UnstableLossPercent  int `json:"unstable_loss_percent"`
+	UnstableQueueDelayMs int `json:"unstable_queue_delay_ms"`
+	UnstableJitterMs     int `json:"unstable_jitter_ms"`
+
+	// DemoteIntervals and PromoteIntervals are the asymmetric hysteresis.
+	// Promotion deliberately takes longer than demotion: a path that has
+	// just come back has proved much less than a path that has just
+	// broken.
+	DemoteIntervals  int `json:"demote_intervals"`
+	PromoteIntervals int `json:"promote_intervals"`
+
+	// DownSilenceMs and DownProbePackets are both required before a path
+	// is called down. protocol.md is explicit that a path with no traffic
+	// must not be declared dead on probe loss alone, so silence only
+	// counts once we have actually sent something into it.
+	DownSilenceMs    int `json:"down_silence_ms"`
+	DownProbePackets int `json:"down_probe_packets"`
+
+	// The flap penalty. A path that oscillates is penalised for
+	// oscillating, independently of how good it looks at this instant.
+	// This is what stops an hour under forest canopy turning into an hour
+	// of steering the call back and forth.
+	FlapWindowSeconds int `json:"flap_window_seconds"`
+	FlapThreshold     int `json:"flap_threshold"`
+
+	// Scoring penalties and margins, in E-model R points. R is used rather
+	// than MOS because it is naturally an integer scale, and because the
+	// impairments the model adds up are additive in R and not in MOS.
+	FlapPenaltyR     int `json:"flap_penalty_r"`
+	UnstablePenaltyR int `json:"unstable_penalty_r"`
+	SwitchMarginR    int `json:"switch_margin_r"`
+	MinAcceptableR   int `json:"min_acceptable_r"`
+
+	// SwitchHoldIntervals is how long a challenger has to stay better
+	// before the flow actually moves. Stickiness is mandatory: without it
+	// an established flow oscillates every time two scores cross.
+	SwitchHoldIntervals int `json:"switch_hold_intervals"`
+
+	// BaseDelayMs is the mouth-to-ear delay the network is not responsible
+	// for - codec framing, the far end's fixed buffer, the hairpin through
+	// home. It is added to the measured delay before scoring so the
+	// G.107 curve is walked at roughly the right place on its knee rather
+	// than from zero.
+	BaseDelayMs int `json:"base_delay_ms"`
+
+	// Make-before-break bounds. MBBMinMs is the shortest overlap worth
+	// having, MBBMaxMs the point at which an unconfirmed new path stops
+	// being worth paying double for.
+	MBBMinMs int `json:"mbb_min_ms"`
+	MBBMaxMs int `json:"mbb_max_ms"`
+
+	// DuplicateMode decides when a packet goes out more than one path.
+	// See DuplicateModes for the meanings.
+	DuplicateMode string `json:"duplicate_mode"`
 }
+
+// The duplication policies, in increasing order of cost.
+const (
+	// DuplicateOff sends one copy, always. Switching becomes
+	// break-before-make, which is audible; this exists for a link where
+	// every byte is counted.
+	DuplicateOff = "off"
+
+	// DuplicateSwitching duplicates only during a make-before-break
+	// handover. This is the default, and until classification lands it is
+	// the only honest setting: with every packet still ClassUnknown, any
+	// broader policy would duplicate bulk as readily as audio, which is
+	// what saturated the 512k Starlink standby link in the first place.
+	DuplicateSwitching = "switching"
+
+	// DuplicateUnstable additionally duplicates while the chosen path is
+	// degraded. Correct for real-time once there is a real-time class to
+	// apply it to; costly before then.
+	DuplicateUnstable = "unstable"
+
+	// DuplicateAlways is the old unconditional behaviour, kept as an
+	// escape hatch.
+	DuplicateAlways = "always"
+)
+
+// DuplicateModes is every accepted value, in the order the interface
+// offers them.
+var DuplicateModes = []string{DuplicateOff, DuplicateSwitching, DuplicateUnstable, DuplicateAlways}
 
 // bound describes the permitted range of one setting, and is also what the
 // web interface renders as the field's limits.
@@ -79,6 +174,48 @@ var Bounds = map[string]bound{
 	"record_interval_seconds": {Min: 1, Max: 3_600, Default: 5},
 	"record_max_megabytes":    {Min: 1, Max: 4_096, Default: 32},
 	"record_keep_files":       {Min: 1, Max: 100, Default: 8},
+
+	// 200 ms puts the state machine at the slow end of protocol.md's
+	// 100-200 ms reaction target, which is deliberate while every
+	// threshold below it is still a guess: reacting slowly to a wrong
+	// threshold is cheaper than reacting quickly to one.
+	"eval_interval_ms": {Min: 20, Max: 5_000, Default: 200},
+
+	"unstable_loss_percent":   {Min: 1, Max: 100, Default: 2},
+	"unstable_queue_delay_ms": {Min: 5, Max: 5_000, Default: 100},
+	"unstable_jitter_ms":      {Min: 1, Max: 1_000, Default: 30},
+
+	// Three intervals to demote, ten to promote, straight from
+	// protocol.md. At the default cadence that is 600 ms down and 2 s up.
+	"demote_intervals":  {Min: 1, Max: 100, Default: 3},
+	"promote_intervals": {Min: 1, Max: 1_000, Default: 10},
+
+	"down_silence_ms":    {Min: 200, Max: 60_000, Default: 3_000},
+	"down_probe_packets": {Min: 1, Max: 1_000, Default: 5},
+
+	"flap_window_seconds": {Min: 10, Max: 86_400, Default: 600},
+	"flap_threshold":      {Min: 2, Max: 1_000, Default: 6},
+
+	// 15 R points is roughly a whole MOS point in the middle of the scale,
+	// which is the intent: a flapping path should lose to a steadily
+	// mediocre one rather than merely be ranked below it.
+	"flap_penalty_r":     {Min: 0, Max: 100, Default: 15},
+	"unstable_penalty_r": {Min: 0, Max: 100, Default: 10},
+	"switch_margin_r":    {Min: 0, Max: 100, Default: 5},
+
+	// R 70 is the bottom of ITU-T G.109's "low" category and about MOS
+	// 3.6. Below it a call is degraded enough that moving is worth the
+	// risk of moving.
+	"min_acceptable_r": {Min: 0, Max: 100, Default: 70},
+
+	"switch_hold_intervals": {Min: 1, Max: 1_000, Default: 5},
+
+	// G.114 gives 40-60 ms to codec and jitter buffer before the network
+	// is touched, and D-004 knowingly added a hairpin on top.
+	"base_delay_ms": {Min: 0, Max: 1_000, Default: 50},
+
+	"mbb_min_ms": {Min: 0, Max: 10_000, Default: 200},
+	"mbb_max_ms": {Min: 100, Max: 60_000, Default: 2_000},
 }
 
 // Defaults returns a configuration that is correct to run with as-is.
@@ -92,21 +229,60 @@ func Defaults() Config {
 		RecordIntervalSeconds: Bounds["record_interval_seconds"].Default,
 		RecordMaxMegabytes:    Bounds["record_max_megabytes"].Default,
 		RecordKeepFiles:       Bounds["record_keep_files"].Default,
+
+		EvalIntervalMs:       Bounds["eval_interval_ms"].Default,
+		UnstableLossPercent:  Bounds["unstable_loss_percent"].Default,
+		UnstableQueueDelayMs: Bounds["unstable_queue_delay_ms"].Default,
+		UnstableJitterMs:     Bounds["unstable_jitter_ms"].Default,
+		DemoteIntervals:      Bounds["demote_intervals"].Default,
+		PromoteIntervals:     Bounds["promote_intervals"].Default,
+		DownSilenceMs:        Bounds["down_silence_ms"].Default,
+		DownProbePackets:     Bounds["down_probe_packets"].Default,
+		FlapWindowSeconds:    Bounds["flap_window_seconds"].Default,
+		FlapThreshold:        Bounds["flap_threshold"].Default,
+		FlapPenaltyR:         Bounds["flap_penalty_r"].Default,
+		UnstablePenaltyR:     Bounds["unstable_penalty_r"].Default,
+		SwitchMarginR:        Bounds["switch_margin_r"].Default,
+		MinAcceptableR:       Bounds["min_acceptable_r"].Default,
+		SwitchHoldIntervals:  Bounds["switch_hold_intervals"].Default,
+		BaseDelayMs:          Bounds["base_delay_ms"].Default,
+		MBBMinMs:             Bounds["mbb_min_ms"].Default,
+		MBBMaxMs:             Bounds["mbb_max_ms"].Default,
+
+		DuplicateMode: DuplicateSwitching,
 	}
 }
 
-// clamp brings one value inside its permitted range, substituting the
-// default for anything unset.
+// clamp brings one value inside its permitted range.
+//
+// A zero is treated as a value like any other, not as "unset". Several of
+// the scoring settings have a legitimate zero - it is how a penalty is
+// switched off - and reading that as "use the default" would silently
+// restore the very penalty someone had just turned off, which is a
+// miserable thing to work out from a campground. Absent settings are
+// instead filled in with the defaults before Sanitised ever sees them; see
+// Load, and note that anything decoding JSON into a Config must start from
+// Defaults() for the same reason.
 func clamp(v int, b bound) int {
 	switch {
-	case v == 0:
-		return b.Default
 	case v < b.Min:
 		return b.Min
 	case v > b.Max:
 		return b.Max
 	}
 	return v
+}
+
+// duplicateMode brings the duplication policy to something meaningful. An
+// unrecognised value is not an error: it is a typo, and the default is a
+// better answer to a typo than a daemon that will not start.
+func duplicateMode(s string) string {
+	for _, m := range DuplicateModes {
+		if s == m {
+			return s
+		}
+	}
+	return DuplicateSwitching
 }
 
 // Sanitised returns the configuration with every value brought inside its
@@ -122,6 +298,27 @@ func (c Config) Sanitised() Config {
 		RecordIntervalSeconds: clamp(c.RecordIntervalSeconds, Bounds["record_interval_seconds"]),
 		RecordMaxMegabytes:    clamp(c.RecordMaxMegabytes, Bounds["record_max_megabytes"]),
 		RecordKeepFiles:       clamp(c.RecordKeepFiles, Bounds["record_keep_files"]),
+
+		EvalIntervalMs:       clamp(c.EvalIntervalMs, Bounds["eval_interval_ms"]),
+		UnstableLossPercent:  clamp(c.UnstableLossPercent, Bounds["unstable_loss_percent"]),
+		UnstableQueueDelayMs: clamp(c.UnstableQueueDelayMs, Bounds["unstable_queue_delay_ms"]),
+		UnstableJitterMs:     clamp(c.UnstableJitterMs, Bounds["unstable_jitter_ms"]),
+		DemoteIntervals:      clamp(c.DemoteIntervals, Bounds["demote_intervals"]),
+		PromoteIntervals:     clamp(c.PromoteIntervals, Bounds["promote_intervals"]),
+		DownSilenceMs:        clamp(c.DownSilenceMs, Bounds["down_silence_ms"]),
+		DownProbePackets:     clamp(c.DownProbePackets, Bounds["down_probe_packets"]),
+		FlapWindowSeconds:    clamp(c.FlapWindowSeconds, Bounds["flap_window_seconds"]),
+		FlapThreshold:        clamp(c.FlapThreshold, Bounds["flap_threshold"]),
+		FlapPenaltyR:         clamp(c.FlapPenaltyR, Bounds["flap_penalty_r"]),
+		UnstablePenaltyR:     clamp(c.UnstablePenaltyR, Bounds["unstable_penalty_r"]),
+		SwitchMarginR:        clamp(c.SwitchMarginR, Bounds["switch_margin_r"]),
+		MinAcceptableR:       clamp(c.MinAcceptableR, Bounds["min_acceptable_r"]),
+		SwitchHoldIntervals:  clamp(c.SwitchHoldIntervals, Bounds["switch_hold_intervals"]),
+		BaseDelayMs:          clamp(c.BaseDelayMs, Bounds["base_delay_ms"]),
+		MBBMinMs:             clamp(c.MBBMinMs, Bounds["mbb_min_ms"]),
+		MBBMaxMs:             clamp(c.MBBMaxMs, Bounds["mbb_max_ms"]),
+
+		DuplicateMode: duplicateMode(c.DuplicateMode),
 	}
 }
 
@@ -150,8 +347,43 @@ func (c Config) RecordMaxBytes() int64 {
 	return int64(c.RecordMaxMegabytes) << 20
 }
 
+func (c Config) EvalInterval() time.Duration {
+	return time.Duration(c.EvalIntervalMs) * time.Millisecond
+}
+
+func (c Config) DownSilence() time.Duration {
+	return time.Duration(c.DownSilenceMs) * time.Millisecond
+}
+
+func (c Config) FlapWindow() time.Duration {
+	return time.Duration(c.FlapWindowSeconds) * time.Second
+}
+
+func (c Config) MBBMin() time.Duration {
+	return time.Duration(c.MBBMinMs) * time.Millisecond
+}
+
+// MBBMax is never allowed to fall below MBBMin. The two are edited
+// independently through a web form, and a maximum under the minimum would
+// otherwise end every handover before its overlap had run - turning
+// make-before-break silently into the break-before-make it exists to
+// prevent.
+func (c Config) MBBMax() time.Duration {
+	if c.MBBMaxMs < c.MBBMinMs {
+		return c.MBBMin()
+	}
+	return time.Duration(c.MBBMaxMs) * time.Millisecond
+}
+
 // Load reads a configuration file. A missing file yields the defaults,
 // since running without one is the expected case rather than a problem.
+//
+// Decoding starts from the defaults rather than from a zero Config, so a
+// setting the file does not mention keeps its default while a setting the
+// file explicitly sets to zero stays zero. A file written before a setting
+// existed is the normal case after every upgrade - the boxes in the field
+// are carrying one right now - and it must not silently zero the settings
+// it predates.
 func Load(path string) (Config, error) {
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -160,7 +392,7 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Defaults(), err
 	}
-	var c Config
+	c := Defaults()
 	if err := json.Unmarshal(b, &c); err != nil {
 		return Defaults(), fmt.Errorf("config: %s: %w", path, err)
 	}

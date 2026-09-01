@@ -89,6 +89,13 @@ type pathStats struct {
 	winLost  uint64
 	prevRecv uint64
 	prevLost uint64
+
+	// Bursts closed within those same windows. The count is what turns a
+	// loss rate into a burst ratio: the scoring model weighs clustered
+	// loss far more heavily than scattered loss, and cannot tell them
+	// apart from a rate alone.
+	winBursts  uint64
+	prevBursts uint64
 }
 
 // lossWindow is how much recent history the reported loss rate covers.
@@ -102,7 +109,8 @@ func (s *pathStats) rollLossWindow(now time.Duration) {
 		return
 	}
 	s.prevRecv, s.prevLost = s.winRecv, s.winLost
-	s.winRecv, s.winLost = 0, 0
+	s.prevBursts = s.winBursts
+	s.winRecv, s.winLost, s.winBursts = 0, 0, 0
 	s.winStart = now
 }
 
@@ -223,7 +231,33 @@ func (s *pathStats) observeDelivered() {
 		i++
 	}
 	s.bursts[i]++
+	s.winBursts++
 	s.runLen = 0
+}
+
+// recentBurstRatio reports how clustered the recent loss was, as the mean
+// observed burst length against the mean that random loss at the same rate
+// would have produced. It returns 1 when loss is scattered exactly as
+// chance would scatter it, and climbs as loss arrives in runs.
+//
+// Random loss at probability p produces bursts averaging 1/(1-p) packets,
+// so dividing by that is the same as multiplying by (1-p).
+func (s *pathStats) recentBurstRatio() float64 {
+	lost := s.winLost + s.prevLost
+	bursts := s.winBursts + s.prevBursts
+	if lost == 0 || bursts == 0 {
+		return 1
+	}
+	total := lost + s.winRecv + s.prevRecv
+	if total == 0 {
+		return 1
+	}
+	p := float64(lost) / float64(total)
+	ratio := (float64(lost) / float64(bursts)) * (1 - p)
+	if ratio < 1 {
+		return 1
+	}
+	return ratio
 }
 
 // percentile returns the given percentile of the transit samples, relative

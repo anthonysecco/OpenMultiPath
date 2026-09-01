@@ -75,7 +75,7 @@
   .field { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; margin-bottom: 12px; }
   .field label { font-size: 14px; }
   .field .hint { color: var(--dim); font-size: 12px; grid-column: 1 / -1; margin-top: -6px; }
-  input[type=number] {
+  input[type=number], select {
     background: #0d1117; color: var(--text); border: 1px solid var(--line);
     border-radius: 6px; padding: 6px 9px; width: 130px; font: inherit;
     font-variant-numeric: tabular-nums;
@@ -111,6 +111,11 @@
   <section>
     <h2>Aggregate</h2>
     <div class="cards" id="aggregate"></div>
+  </section>
+
+  <section>
+    <h2>Scheduling</h2>
+    <div id="scheduler"></div>
   </section>
 
   <section>
@@ -185,6 +190,68 @@ function renderAggregate(s) {
     card("Tunnel MTU", s.tunnel_mtu || "—", mtuSub);
 }
 
+// A path's state is the first thing to read when the choice looks wrong,
+// so it gets a colour rather than being one word among many.
+function stateClass(state) {
+  if (state === "stable") return "good";
+  if (state === "unstable") return "warn";
+  return "bad";
+}
+
+// MOS is the score restated on the 1-to-5 scale people already have
+// intuitions about. Anything under 3.6 is the point at which the scheduler
+// itself considers a path inadequate.
+function mosClass(mos) {
+  if (mos >= 4) return "good";
+  if (mos >= 3.6) return "warn";
+  return "bad";
+}
+
+function renderScheduler(s) {
+  const sc = s.scheduler || {};
+  const named = id => {
+    const p = (s.paths || []).find(p => p.id === id);
+    return p ? (p.name || "path " + id) : "path " + id;
+  };
+
+  // Blind means the measurements have stopped being able to help and
+  // traffic is going everywhere in the hope something gets through. It is
+  // the fail-to-a-working-state behaviour and it should be impossible to
+  // miss.
+  if (sc.blind) {
+    $("scheduler").innerHTML =
+      `<div class="path dead"><div class="path-head">
+         <span class="path-name">No usable path</span>
+         <span class="tag bad">sending on everything</span>
+       </div>
+       <p class="muted">${sc.reason || ""} Every path is down, so traffic is being duplicated across
+       every link that is still bound rather than dropped.</p></div>`;
+    return;
+  }
+
+  if (sc.primary === undefined || sc.primary < 0) {
+    $("scheduler").innerHTML = `<p class="muted">No path chosen yet.</p>`;
+    return;
+  }
+
+  const handover = sc.switching
+    ? `<span class="tag warn">handing over to ${named(sc.switching_to)}</span>`
+    : "";
+
+  const order = (sc.ranking || []).map((id, i) =>
+    `${i + 1}. ${named(id)}`).join("&nbsp; ");
+
+  $("scheduler").innerHTML =
+    `<div class="path alive"><div class="path-head">
+       <span class="path-name">Carrying traffic on ${named(sc.primary)}</span>
+       ${handover}
+       <span class="tag">${sc.duplicate_mode || ""}</span>
+     </div>
+     <p class="muted">${sc.reason || ""}</p>
+     ${order ? `<p class="muted">Ranked: ${order}</p>` : ""}
+     </div>`;
+}
+
 function renderPaths(s) {
   if (!s.paths || !s.paths.length) {
     $("paths").innerHTML = `<p class="muted">No paths yet.</p>`;
@@ -206,11 +273,21 @@ function renderPaths(s) {
 
     const tags = [
       status,
+      p.state ? `<span class="tag ${stateClass(p.state)}">${p.state}${p.state_reason ? " · " + p.state_reason : ""}</span>` : "",
+      p.primary ? `<span class="tag good">primary</span>`
+                : p.sending ? `<span class="tag">sending</span>` : "",
+      p.flapping ? `<span class="tag bad">flapping</span>` : "",
       p.thin ? `<span class="tag warn">thin statistics</span>` : "",
       (p.path_mtu && !p.usable) ? `<span class="tag bad">below tunnel floor</span>` : "",
       (owns && p.local) ? `<span class="tag">via ${p.local}</span>` : "",
       p.remote ? `<span class="tag">${p.remote}</span>` : "",
     ].join(" ");
+
+    // Score differing from the raw quality figure is the visible evidence
+    // of a penalty: a healthy R with a poor score means the path is being
+    // held back for its history, not for its current measurements.
+    const penalty = (p.r_factor - p.score) >= 1
+      ? `penalised ${fmt(p.r_factor - p.score, 0)} R` : "raw quality";
 
     const bursts = (p.bursts || []).filter(b => b.count > 0);
     const burstRow = bursts.length
@@ -231,6 +308,10 @@ function renderPaths(s) {
         ${tags}
       </div>
       <div class="metrics">
+        <div class="metric"><div class="k">Quality</div>
+          <div class="v" style="color:var(--${mosClass(p.mos)})" title="${penalty}">${fmt(p.mos, 2)} MOS</div></div>
+        <div class="metric"><div class="k">Score</div>
+          <div class="v" title="E-model R factor after penalties; the scheduler ranks on this">${fmt(p.score, 0)} R</div></div>
         <div class="metric"><div class="k">RTT</div><div class="v">${fmt(p.rtt_ms)} ms</div></div>
         <div class="metric"><div class="k">p95 spread</div><div class="v">${fmt(p.p95_spread_ms)} ms</div></div>
         <div class="metric"><div class="k">Jitter</div><div class="v">${fmt(p.jitter_ms)} ms</div></div>
@@ -284,6 +365,7 @@ async function refreshState() {
   $("role").textContent = s.role;
   $("uptime").textContent = "up " + duration(s.uptime_seconds);
   renderAggregate(s);
+  renderScheduler(s);
   renderPaths(s);
 }
 
@@ -302,10 +384,60 @@ const FIELDS = [
    "Size at which the history log rotates."],
   ["record_keep_files", "History files kept", "files",
    "How many rotated history files to keep. Size times count is the hard ceiling on disk."],
+
+  ["eval_interval_ms", "Scheduler interval", "ms",
+   "How often paths are re-judged. A degraded path stays selected for one of these, and that delay is audible."],
+  ["unstable_loss_percent", "Unstable above loss", "%",
+   "Recent loss that marks a path degraded. Judged against the path itself, not against other paths."],
+  ["unstable_queue_delay_ms", "Unstable above queue delay", "ms",
+   "Delay above the path's own rolling minimum that marks it degraded. This is what catches a carrier buffering seconds of traffic."],
+  ["unstable_jitter_ms", "Unstable above jitter", "ms",
+   "Interarrival jitter that marks a path degraded."],
+  ["demote_intervals", "Intervals to demote", "intervals",
+   "Consecutive breaching intervals before a path is called unstable. One bad measurement is a bad measurement, not a degraded link."],
+  ["promote_intervals", "Intervals to promote", "intervals",
+   "Consecutive clean intervals before a path is trusted again. Deliberately longer than demotion."],
+  ["down_silence_ms", "Down after silence", "ms",
+   "Silence before a path may be called down. Only counts alongside the probe count below, so an idle path is never declared dead."],
+  ["down_probe_packets", "Down after unanswered", "packets",
+   "How many packets must go unanswered, alongside the silence above, before a path is down."],
+  ["flap_window_seconds", "Flap window", "s",
+   "How far back state changes are counted when deciding a path is flapping."],
+  ["flap_threshold", "Flap threshold", "changes",
+   "State changes within the window before a path is treated as flapping. This is what stops an hour under tree cover becoming an hour of handovers."],
+  ["flap_penalty_r", "Flap penalty", "R",
+   "Score penalty for a flapping path. Roughly a whole MOS point at 15. Zero switches the penalty off."],
+  ["unstable_penalty_r", "Unstable penalty", "R",
+   "Score penalty for a degraded path, so a steady path wins when scores are close. Zero switches it off."],
+  ["switch_margin_r", "Switch margin", "R",
+   "How much better a challenger must score before it is even considered. Zero makes the scheduler move on any improvement."],
+  ["min_acceptable_r", "Quality floor", "R",
+   "Below this the current path is inadequate and the scheduler moves without waiting for the margin. 70 R is about 3.6 MOS."],
+  ["switch_hold_intervals", "Switch hold", "intervals",
+   "How long a challenger must stay better before the traffic actually moves. This is the stickiness."],
+  ["base_delay_ms", "Base delay", "ms",
+   "Mouth-to-ear delay the network is not responsible for: codec, the far end's buffer, and the hairpin through home."],
+  ["mbb_min_ms", "Handover minimum overlap", "ms",
+   "Shortest time both paths carry traffic during a handover."],
+  ["mbb_max_ms", "Handover maximum overlap", "ms",
+   "Longest to keep paying for two copies while waiting for the new path to be confirmed."],
 ];
+
+// The one setting that is not a number. Duplication is the difference
+// between resilience and saturating a 512k link, so it is worth being able
+// to change without editing a file.
+const DUPLICATE_HINTS = {
+  "off": "One copy, always. A handover becomes cut-then-connect, which is audible.",
+  "switching": "One copy, except during a handover. The default.",
+  "unstable": "Also duplicate while the chosen path is degraded. Costly until classification can limit this to real-time traffic.",
+  "always": "Every packet on every usable path. This is what saturated the standby-plan link.",
+};
 
 async function loadConfig() {
   const r = await (await fetch("/api/config")).json();
+  const modes = Object.keys(DUPLICATE_HINTS);
+  const current = r.config.duplicate_mode || "switching";
+
   $("fields").innerHTML = FIELDS.map(([key, label, unit, hint]) => {
     const b = r.bounds[key] || {};
     return `<div class="field">
@@ -314,13 +446,25 @@ async function loadConfig() {
         min="${b.Min}" max="${b.Max}" step="1"> <span class="muted">${unit}</span></span>
       <div class="hint">${hint} Range ${b.Min}–${b.Max}.</div>
     </div>`;
-  }).join("");
+  }).join("") +
+  `<div class="field">
+     <label for="duplicate_mode">Duplication</label>
+     <span><select id="duplicate_mode" name="duplicate_mode">
+       ${modes.map(m => `<option value="${m}"${m === current ? " selected" : ""}>${m}</option>`).join("")}
+     </select></span>
+     <div class="hint" id="duplicate_hint">${DUPLICATE_HINTS[current]}</div>
+   </div>`;
+
+  $("duplicate_mode").addEventListener("change", e => {
+    $("duplicate_hint").textContent = DUPLICATE_HINTS[e.target.value] || "";
+  });
 }
 
 $("config").addEventListener("submit", async e => {
   e.preventDefault();
   const body = {};
   for (const [key] of FIELDS) body[key] = Number($(key).value);
+  body.duplicate_mode = $("duplicate_mode").value;
 
   const res = await fetch("/api/config", {
     method: "POST",
@@ -335,6 +479,7 @@ $("config").addEventListener("submit", async e => {
   // back corrected, and the form should show what actually took effect.
   const r = await res.json();
   for (const [key] of FIELDS) $(key).value = r.config[key];
+  $("duplicate_mode").value = r.config.duplicate_mode;
   $("saved").hidden = false;
   setTimeout(() => { $("saved").hidden = true; }, 2500);
 });

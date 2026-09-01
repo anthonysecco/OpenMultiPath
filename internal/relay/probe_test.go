@@ -196,17 +196,17 @@ func TestStandaloneReportsOnlyWhenIdle(t *testing.T) {
 	s.registerPath(0)
 
 	s.stamp(0, s.nextGlobalSeq(), []byte("data"), nil)
-	if s.dueForReport() {
+	if s.dueForReport(0) {
 		t.Error("a standalone report is due immediately after sending data")
 	}
 
-	// Wind the last-sent reading back past the interval.
+	// Wind this path's last-sent reading back past the interval.
 	s.mu.Lock()
-	s.lastSent = s.elapsed() - 2*testEchoInterval
+	s.pathLocked(0).lastSentAt = s.elapsed() - 2*testEchoInterval
 	s.mu.Unlock()
 
-	if !s.dueForReport() {
-		t.Error("no report due after the reverse direction went quiet")
+	if !s.dueForReport(0) {
+		t.Error("no report due after the path went quiet")
 	}
 
 	report := s.buildReport(0, nil)
@@ -220,7 +220,7 @@ func TestStandaloneReportsOnlyWhenIdle(t *testing.T) {
 	if len(payload) != 0 {
 		t.Errorf("report carries %d bytes of payload, want none", len(payload))
 	}
-	if s.dueForReport() {
+	if s.dueForReport(0) {
 		t.Error("still due for a report immediately after sending one")
 	}
 }
@@ -235,10 +235,6 @@ func TestReportsGoOutOnSilentPaths(t *testing.T) {
 	sent := map[uint8]int{}
 	done := make(chan struct{})
 	go func() {
-		s.mu.Lock()
-		s.lastSent = s.elapsed() - 2*testEchoInterval
-		s.mu.Unlock()
-
 		for _, id := range []uint8{0, 1} {
 			if pkt := s.buildReport(id, nil); len(pkt) > 0 {
 				sent[id]++
@@ -257,5 +253,33 @@ func TestReportsGoOutOnSilentPaths(t *testing.T) {
 		if sent[id] != 1 {
 			t.Errorf("path %d got %d reports, want 1", id, sent[id])
 		}
+	}
+}
+
+// The trap that scheduling introduced. While duplication was unconditional
+// every path saw every packet, so a session-wide "have we sent recently"
+// timer was good enough to pace reports. Once one path carries the traffic
+// that timer is kept permanently fresh by the chosen path, and the idle
+// ones are never reported on again - so they stop being measured, which
+// loses precisely the paths a call might need to be moved onto.
+func TestBusyPathDoesNotSuppressReportsOnIdlePaths(t *testing.T) {
+	s := newTestSession()
+	s.registerPath(0)
+	s.registerPath(1)
+
+	// Age the session past the cadence, so a path that has never been sent
+	// on is genuinely overdue rather than merely new.
+	time.Sleep(2 * testEchoInterval)
+
+	// Path 0 is carrying traffic; path 1 has never been used.
+	for i := 0; i < 5; i++ {
+		s.stamp(0, s.nextGlobalSeq(), []byte("data"), nil)
+	}
+
+	if s.dueForReport(0) {
+		t.Error("the busy path is due for a standalone report despite carrying data")
+	}
+	if !s.dueForReport(1) {
+		t.Error("the idle path is not due for a report; it would never be measured again")
 	}
 }

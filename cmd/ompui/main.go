@@ -102,7 +102,16 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"config": c, "bounds": config.Bounds})
 
 	case http.MethodPost:
-		var c config.Config
+		// Decode onto what is already saved, so a submission that names
+		// only some settings changes only those. A zero is a real value
+		// now rather than "unset", so decoding onto an empty Config would
+		// quietly reset every setting the form did not happen to include -
+		// which is precisely what happens the first time someone adds a
+		// field to the page and forgets one.
+		c, err := config.Load(s.configPath)
+		if err != nil {
+			c = config.Defaults()
+		}
 		if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
 			http.Error(w, "could not read the submitted settings: "+err.Error(), http.StatusBadRequest)
 			return
@@ -180,6 +189,15 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		{"omp_path_mtu_bytes", "Largest packet confirmed to cross the path.", "gauge", func(p state.Path) float64 { return float64(p.PathMTU) }},
 		{"omp_path_alive", "Whether the path has delivered anything recently.", "gauge", func(p state.Path) float64 { return b2f(p.Alive) }},
 		{"omp_path_samples", "Delay samples held for this path.", "gauge", func(p state.Path) float64 { return float64(p.Samples) }},
+		{"omp_path_score", "E-model R factor after the scheduler's penalties; higher is better.", "gauge", func(p state.Path) float64 { return p.Score }},
+		{"omp_path_r_factor", "E-model R factor before penalties.", "gauge", func(p state.Path) float64 { return p.RFactor }},
+		{"omp_path_mos", "Score restated on the 1-to-5 scale.", "gauge", func(p state.Path) float64 { return p.MOS }},
+		{"omp_path_stable", "Whether the path is meeting all of its thresholds.", "gauge", func(p state.Path) float64 { return b2f(p.State == "stable") }},
+		{"omp_path_down", "Whether the path is considered down.", "gauge", func(p state.Path) float64 { return b2f(p.State == "down") }},
+		{"omp_path_flapping", "Whether the path has changed state too often to be trusted.", "gauge", func(p state.Path) float64 { return b2f(p.Flapping) }},
+		{"omp_path_transitions", "State changes within the flap window.", "gauge", func(p state.Path) float64 { return float64(p.Transitions) }},
+		{"omp_path_sending", "Whether traffic is currently going out of this path.", "gauge", func(p state.Path) float64 { return b2f(p.Sending) }},
+		{"omp_path_primary", "Whether this is the chosen path.", "gauge", func(p state.Path) float64 { return b2f(p.Primary) }},
 	} {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", m.name, m.help, m.name, m.typ)
 		for _, p := range snap.Paths {
@@ -198,6 +216,14 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "omp_tunnel_mtu_bytes{node=%q} %d\n", node, snap.TunnelMTU)
 	fmt.Fprintf(w, "# HELP omp_recommended_tunnel_mtu_bytes MTU the measured paths support.\n# TYPE omp_recommended_tunnel_mtu_bytes gauge\n")
 	fmt.Fprintf(w, "omp_recommended_tunnel_mtu_bytes{node=%q} %d\n", node, snap.RecommendedTunnelMTU)
+
+	// Blind is the one alarm worth wiring up: it means no path is in a
+	// usable state and traffic is being sprayed at every link in the hope
+	// something lands.
+	fmt.Fprintf(w, "# HELP omp_scheduler_blind No path is usable; traffic is going everywhere.\n# TYPE omp_scheduler_blind gauge\n")
+	fmt.Fprintf(w, "omp_scheduler_blind{node=%q} %g\n", node, b2f(snap.Scheduler.Blind))
+	fmt.Fprintf(w, "# HELP omp_scheduler_switching A make-before-break handover is in progress.\n# TYPE omp_scheduler_switching gauge\n")
+	fmt.Fprintf(w, "omp_scheduler_switching{node=%q} %g\n", node, b2f(snap.Scheduler.Switching))
 }
 
 func b2f(b bool) float64 {

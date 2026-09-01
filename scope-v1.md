@@ -6,6 +6,9 @@
 - Userspace multipath daemon with the header from `protocol.md`
 - Passive measurement from data packets; active probes scaled inversely to path traffic
 - Queue delay inferred from delay above rolling minimum (no clock sync required)
+- Reactive per-path bandwidth ceiling from queue-delay onset during real traffic - no
+  active bandwidth probes; gates duplication targets and primary handovers, never a hard
+  veto (see D-023)
 - Three-state path machine with asymmetric hysteresis and flap penalty
 - Real-time class: single path, duplication, make-before-break, heavy stickiness
 - Bulk class: **single best path** for v1 (multipath deferred, see below)
@@ -57,7 +60,15 @@ of reasoning up front.
 4. **Web UI and state file.** Live per-path telemetry, historical graphs, log access.
    This is the instrument for everything after it.
 5. **Field data collection.** Drive. Collect. Look at what the links actually do.
-6. **State machine.** Thresholds informed by step 5.
+   **Deferred, deliberately** (2026-09-01): there was no time for the drive. Recording
+   runs continuously on both ends, so this can happen later without further code. Every
+   threshold below was therefore set from reasoning rather than measurement, and all of
+   them are adjustable at runtime precisely because they are expected to be wrong.
+6. **State machine.** Thresholds informed by step 5. **Built** (2026-09-01) without them.
+6b. **Bandwidth ceiling.** Reactive, from queue-delay onset under real traffic; no active
+    probes. Feeds duplication-target and handover eligibility ahead of classification, and
+    ahead of it being usable to split bulk's path choice from real-time's once step 7
+    lands. See D-023.
 7. **Classification.** STUN watching first; it is the highest-value piece.
 8. **Scheduling and real-time handling.** Duplication, make-before-break, stickiness.
 9. **Admission control.** Alongside the scheduler, not after.

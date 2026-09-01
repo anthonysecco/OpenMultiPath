@@ -256,6 +256,134 @@ exclusion.
 
 ---
 
+## D-020 · The daemon moves above WireGuard for classification
+
+**Decision.** The daemon takes a TUN device and reads plaintext inner packets. Each WAN
+link gets its own WireGuard interface on the RV, pinned to that link by fwmark and policy
+routing; home keeps one interface on one public port with one peer per link.
+
+**Rationale.** The daemon currently sits *below* WireGuard, relaying already-encrypted
+UDP, which means it never sees an inner packet. Step 7 is impossible from there: STUN
+watching needs a 5-tuple, the behavioural heuristic needs per-flow size and inter-packet
+gap, and all flows are multiplexed into one WireGuard session so even the packet sizes
+that survive encryption cannot be attributed to a flow. A class cannot cross a crypto
+boundary; either you do not cross it, or you run one crypto channel per class.
+
+This also settles where later steps live. Admission control (step 9) is described as "the
+part that saves the meeting" and wants to sit where queue delay is measured, in one
+process rather than split between the daemon and a separate tc/CAKE layer. MSS clamping
+returns in-house too - `architecture.md` asks for it at tunnel ingress, and it has been
+sitting in nftables because the daemon had no TCP header to clamp.
+
+**Rejected.** One WireGuard tunnel per class (class known from which loopback socket a
+packet arrives on): cheapest option preserving per-flow steering, but the class decision
+lives permanently in nftables and policy routing on both boxes, and two tunnel IPs mean a
+flow reclassified mid-life changes source address, so the behavioural catch-all could only
+ever tag future flows. Also rejected: no per-packet class at all, inferring size through
+the encryption and duplicating small packets during a call - cheapest of the three, but it
+gives up per-class path splitting permanently, which is the canyon walkthrough.
+
+**Cost accepted.** A data-path rewrite, per-link fwmark routing on the RV, and the loss of
+the daemon's own bind/rebind visibility (it currently distinguishes "bound but silent" from
+"not bound", which wants recovering by reading interface state).
+
+**Note.** Supersedes the single-tunnel relay shape the daemon was built with, and restores
+what `CLAUDE.md` and `architecture.md` always described. Not yet implemented: step 6 was
+built first, and is independent of this.
+
+---
+
+## D-021 · Composite E-model scoring, in R points, not a weighted sum
+
+**Decision.** Paths are scored with the ITU-T G.107 E-model. Every scoring threshold and
+penalty in the configuration is expressed in R points.
+
+**Rationale.** `protocol.md` asks for this directly: the relative weight of loss against
+jitter against delay for perceived quality is well-researched, and hand-tuning
+coefficients would produce something worse after a month. With no field data to tune
+against, borrowing a researched model matters more than usual. R rather than MOS because
+impairments are additive in R and not in MOS - subtracting "half a MOS point" means
+different things at either end of the scale. MOS is derived for display only.
+
+**Consequences worth knowing.** The model measures *impairment*, so two paths both
+comfortably under the delay knee both score the maximum and tie. Ties break on lower
+effective delay; without that they broke on path id, and path 0 is the metered satellite
+link. The model is a voice model applied to all traffic, which is the right bias for the
+primary use case but does mean bulk is scored on criteria it does not care about.
+
+**Note.** The state machine deliberately does *not* score. It judges each path against its
+own absolute thresholds, so a steadily slow satellite link stays stable rather than being
+demoted for being a satellite link.
+
+---
+
+## D-022 · Duplication defaults to handovers only
+
+**Decision.** Four policies - off, switching, unstable, always. The default is
+**switching**: one copy, except during a make-before-break handover.
+
+**Rationale.** Unconditional duplication was scaffolding, and it has a measured cost. With
+every packet riding every path, any real load saturates the weakest link: a 10 MB copy
+produced 8000+ lost packets on the Starlink path, almost all in runs longer than 16, while
+the other path stayed clean. That link is on the 512k standby plan, so duplication is not
+the negligible cost `protocol.md` assumes when it reasons about 40 kbps of audio.
+
+Duplicating during a handover is where the redundancy actually buys something - it is what
+makes the switch gapless - and it is time-bounded.
+
+**Revisit when classification lands.** The right policy is per class and per budget band:
+audio duplicated whenever a second path exists and budget is green, video only when a link
+is unstable or an unmetered path is available. That cannot be expressed until packets
+carry a class, so **unstable** and **always** exist as manual escape hatches until then.
+
+**Note.** Duplication should become capacity-aware, not just budget-aware. The docs assume
+duplication is nearly free; on a 512k link, 40 kbps of audio is 8% of capacity and the
+1.5 Mbps video case is simply impossible.
+
+---
+
+## D-023 · Reactive bandwidth ceiling, not active probing
+
+**Decision.** Estimate each path's usable capacity from queue-delay onset during real
+traffic, not from dedicated bandwidth probes. Track a rolling baseline (quiet) delay per
+path; when delay pulls away from baseline while the path is carrying load, record the
+send rate at that moment as the observed ceiling. A path that has never carried enough
+load to trigger an onset has no estimate and falls back to a configured
+`max_bitrate_kbps`, default unset.
+
+**Rationale.** Active bandwidth probing - packet trains, pair dispersion - is unreliable
+on a variable-bandwidth link and directly counterproductive on a metered one: the probe
+itself spends the capacity it is trying to measure. Queue delay is already computed for
+every path from the echo channel for the state machine; reusing it as a capacity signal
+adds no wire format, no probe cadence, and no cost beyond bookkeeping.
+
+**Revision.** Downward revision, on an observed onset, is trusted immediately. Upward
+revision only creeps up a little per clean interval carrying real load - additive
+increase, not an instant reset - so one bad reading doesn't permanently cap a path that
+has since recovered. An estimate for a path that has gone back to idle ages in
+confidence, not in value: the number is not discarded, but it is no longer treated as
+current.
+
+**Consequence for D-022.** This is the capacity-awareness that decision's closing note
+asked for. Duplication targets and primary handovers should reject a candidate whose
+ceiling (or configured fallback, if unconfirmed) cannot cover the load already being
+offered to it. This is a soft gate, never a hard veto - a link-starved RV must still be
+able to fail over to its only remaining option, however capacity-poor.
+
+**After classification (step 7).** Splits further: real-time stays duplicated broadly,
+since its bandwidth needs are small enough that ceiling rarely excludes anything. Bulk
+should never be a duplication target at all, ceiling aside - TCP already retransmits, so
+duplicating a bulk stream buys nothing. Ceiling's main job after step 7 narrows to
+choosing bulk's single best path (headroom-driven) independently of real-time's primary
+(quality-driven), so a saturating download no longer drags a live call's path down with
+it.
+
+**Deferred.** Using the ceiling to actively pace or shape the daemon's own outbound
+writes - inducing backpressure on the sender's TCP stack rather than only informing path
+choice - is a distinct, larger capability and is not part of this decision.
+
+---
+
 ## D-019 · STUN watching as the primary classifier
 
 **Decision.** Watch for STUN binding requests to learn media 5-tuples before media flows.

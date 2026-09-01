@@ -22,16 +22,19 @@ func TestMissingFileYieldsDefaults(t *testing.T) {
 // diagnosing something else. A zero that turned a report cadence into a
 // busy loop would be a poor way to discover that.
 func TestValuesAreClampedIntoRange(t *testing.T) {
-	wild := Config{
-		EchoIntervalMs:       0,
-		ProbeIntervalSeconds: -5,
-		StateIntervalMs:      10_000_000,
-		StatsIntervalSeconds: 1,
-	}
+	wild := Defaults()
+	wild.EchoIntervalMs = 0
+	wild.ProbeIntervalSeconds = -5
+	wild.StateIntervalMs = 10_000_000
+	wild.StatsIntervalSeconds = 1
 	got := wild.Sanitised()
 
-	if want := Bounds["echo_interval_ms"].Default; got.EchoIntervalMs != want {
-		t.Errorf("echo interval = %d from a zero, want the default %d", got.EchoIntervalMs, want)
+	// A zero on a setting whose floor is above zero is out of range like
+	// any other out-of-range value, and is pulled up to the floor. It is
+	// no longer read as "unset": see TestExplicitZeroIsKeptWhereZeroIsValid
+	// for why that distinction had to be made.
+	if want := Bounds["echo_interval_ms"].Min; got.EchoIntervalMs != want {
+		t.Errorf("echo interval = %d from a zero, want the minimum %d", got.EchoIntervalMs, want)
 	}
 	if want := Bounds["probe_interval_seconds"].Min; got.ProbeIntervalSeconds != want {
 		t.Errorf("probe interval = %d from a negative, want the minimum %d", got.ProbeIntervalSeconds, want)
@@ -50,31 +53,71 @@ func TestValuesAreClampedIntoRange(t *testing.T) {
 
 // A value inside its range is left exactly as given.
 func TestValidValuesSurviveUntouched(t *testing.T) {
-	c := Config{
-		EchoIntervalMs:        250,
-		ProbeIntervalSeconds:  60,
-		StateIntervalMs:       2_000,
-		StatsIntervalSeconds:  45,
-		RecordIntervalSeconds: 10,
-		RecordMaxMegabytes:    64,
-		RecordKeepFiles:       4,
-	}
+	c := Defaults()
+	c.EchoIntervalMs = 250
+	c.ProbeIntervalSeconds = 60
+	c.StateIntervalMs = 2_000
+	c.StatsIntervalSeconds = 45
+	c.RecordIntervalSeconds = 10
+	c.RecordMaxMegabytes = 64
+	c.RecordKeepFiles = 4
+
 	if got := c.Sanitised(); got != c {
 		t.Errorf("got %+v, want it unchanged at %+v", got, c)
 	}
 }
 
+// Several scoring settings have a legitimate zero: it is how a penalty is
+// switched off. Reading that as "unset, use the default" would silently
+// restore the penalty someone had just disabled, and they would have no way
+// to tell from the form that it had not taken.
+func TestExplicitZeroIsKeptWhereZeroIsValid(t *testing.T) {
+	c := Defaults()
+	c.FlapPenaltyR = 0
+	c.SwitchMarginR = 0
+	c.BaseDelayMs = 0
+
+	got := c.Sanitised()
+	if got.FlapPenaltyR != 0 {
+		t.Errorf("flap penalty = %d, want the 0 that switches it off", got.FlapPenaltyR)
+	}
+	if got.SwitchMarginR != 0 {
+		t.Errorf("switch margin = %d, want 0", got.SwitchMarginR)
+	}
+	if got.BaseDelayMs != 0 {
+		t.Errorf("base delay = %d, want 0", got.BaseDelayMs)
+	}
+}
+
+// An unrecognised duplication policy is a typo, and a typo should not stop
+// the daemon starting.
+func TestUnknownDuplicateModeFallsBackToTheDefault(t *testing.T) {
+	c := Defaults()
+	c.DuplicateMode = "sometimes"
+	if got := c.Sanitised().DuplicateMode; got != DuplicateSwitching {
+		t.Errorf("duplicate mode = %q, want %q", got, DuplicateSwitching)
+	}
+	for _, mode := range DuplicateModes {
+		c.DuplicateMode = mode
+		if got := c.Sanitised().DuplicateMode; got != mode {
+			t.Errorf("duplicate mode %q was changed to %q", mode, got)
+		}
+	}
+}
+
 func TestSaveAndLoadRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	want := Config{
-		EchoIntervalMs:        150,
-		ProbeIntervalSeconds:  30,
-		StateIntervalMs:       500,
-		StatsIntervalSeconds:  60,
-		RecordIntervalSeconds: 2,
-		RecordMaxMegabytes:    16,
-		RecordKeepFiles:       12,
-	}
+	want := Defaults()
+	want.EchoIntervalMs = 150
+	want.ProbeIntervalSeconds = 30
+	want.StateIntervalMs = 500
+	want.StatsIntervalSeconds = 60
+	want.RecordIntervalSeconds = 2
+	want.RecordMaxMegabytes = 16
+	want.RecordKeepFiles = 12
+	want.DuplicateMode = DuplicateUnstable
+	want.FlapPenaltyR = 0
+
 	if err := Save(path, want); err != nil {
 		t.Fatalf("Save: %v", err)
 	}

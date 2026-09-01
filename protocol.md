@@ -73,6 +73,12 @@ you need to know about before steering onto them.
 
 - **Probe rate inversely proportional to data volume on that path.** Busy path, probe
   rarely. Idle path, full cadence. Down path, slow keepalive to detect recovery.
+  **This has to be per path, and the reason only appears once scheduling exists.** While
+  duplication was unconditional every path saw every packet, so a session-wide "have we
+  sent recently" timer paced reports correctly. Once one path carries the traffic, that
+  timer is held permanently fresh by the chosen path and the idle ones are never probed
+  again — so they stop being measured, which loses exactly the paths a call might have to
+  be moved onto.
 - **Cadence must match the reaction target: roughly 100–200 ms per path.** Probing
   slower means a degraded path stays selected for the probe interval, which is audible.
 - **Pad probes to typical data packet size.** A 60 B probe experiences different

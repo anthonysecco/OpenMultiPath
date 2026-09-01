@@ -123,10 +123,18 @@ func RunInitiator(cfg InitiatorConfig) error {
 	})
 	go paths.run()
 
+	// Probes and reports go out every bound path, not just the chosen
+	// one. That is the whole point of them: passive measurement is
+	// structurally blind on an idle path, and an idle path is exactly the
+	// one that has to be understood before a call is ever steered onto it.
 	go sess.runProbes(paths.active, paths.send)
 
-	// WireGuard -> duplicate onto every path currently up. The global
-	// sequence is allocated once here, before the copies are made, so
+	sched := newScheduler(sess, cfg.Settings, paths.active)
+	sess.sched = sched
+	go sched.run()
+
+	// WireGuard -> whichever paths the scheduler has chosen. The global
+	// sequence is allocated once here, before any copies are made, so
 	// every copy of a packet is recognisable as the same packet at the far
 	// end. readLoop calls this from a single goroutine, so one scratch
 	// buffer serves every copy: each is written out before the next is
@@ -135,7 +143,15 @@ func RunInitiator(cfg InitiatorConfig) error {
 	go readLoop(wgConn, "initiator-wg", func(payload []byte, from *net.UDPAddr) {
 		wgPeer.Store(from)
 		globalSeq := sess.nextGlobalSeq()
-		for _, id := range paths.active() {
+
+		// Before the first evaluation the scheduler has no opinion, so
+		// fall back to every bound path. Coming up sending nothing would
+		// leave the tunnel dead until the first tick.
+		tx := sched.txPaths()
+		if len(tx) == 0 {
+			tx = paths.active()
+		}
+		for _, id := range tx {
 			paths.send(id, sess.stamp(id, globalSeq, payload, scratch))
 		}
 	})

@@ -46,7 +46,40 @@ type Snapshot struct {
 
 	Paths     []Path        `json:"paths"`
 	Aggregate Aggregate     `json:"aggregate"`
+	Scheduler Scheduler     `json:"scheduler"`
 	Config    config.Config `json:"config"`
+}
+
+// Scheduler is what the path selector currently believes.
+type Scheduler struct {
+	// Primary is the path carrying traffic, or -1 when none has been
+	// chosen. SwitchingTo is the path being handed over to during a
+	// make-before-break overlap, or -1.
+	Primary     int  `json:"primary"`
+	Switching   bool `json:"switching"`
+	SwitchingTo int  `json:"switching_to"`
+
+	// Blind means no path is in a usable state and traffic is being sent
+	// on everything available in the hope that something gets through.
+	// It is the fail-to-a-working-state behaviour, and it deserves to be
+	// conspicuous: it means the measurements have stopped being able to
+	// say anything useful.
+	Blind bool `json:"blind"`
+
+	// Reason is the scheduler's own one-line account of the current
+	// choice, which is the first thing worth reading when the choice looks
+	// wrong.
+	Reason        string `json:"reason,omitempty"`
+	DuplicateMode string `json:"duplicate_mode,omitempty"`
+
+	// Ranking is every eligible path, best first. architecture.md's
+	// fallback needs exactly this written down somewhere a script can read
+	// it, because the scheduler is the thing that will have died.
+	//
+	// Held as int rather than uint8 because encoding/json treats a []uint8
+	// as a byte string and base64s it, which turns the one field a
+	// recovery script has to read into "AQA=".
+	Ranking []int `json:"ranking,omitempty"`
 }
 
 // Path is one link's measurements.
@@ -81,6 +114,35 @@ type Path struct {
 
 	PathMTU int  `json:"path_mtu"`
 	Usable  bool `json:"usable"`
+
+	// State is stable, unstable or down, and StateReason says what put it
+	// there. The reason matters as much as the state: "unstable (jitter)"
+	// and "unstable (below the tunnel floor)" call for entirely different
+	// responses from whoever is reading this at the roadside.
+	State       string `json:"state,omitempty"`
+	StateReason string `json:"state_reason,omitempty"`
+
+	// RFactor is the raw E-model quality score for the path and Score is
+	// that figure after the scheduler's penalties. The two differing is
+	// the visible evidence of a penalty being applied - a path with a
+	// healthy R and a poor Score is being held back for flapping, not for
+	// its measurements.
+	RFactor float64 `json:"r_factor"`
+	Score   float64 `json:"score"`
+
+	// MOS is Score expressed on the 1-to-5 scale, for reading at a glance.
+	MOS float64 `json:"mos"`
+
+	// Flapping means this path has changed state too often to be trusted,
+	// and Transitions is how many times within the flap window.
+	Flapping    bool `json:"flapping,omitempty"`
+	Transitions int  `json:"transitions"`
+
+	// Sending means traffic is currently going out of this path, and
+	// Primary that it is the chosen one. They differ during a handover and
+	// while duplicating.
+	Sending bool `json:"sending"`
+	Primary bool `json:"primary,omitempty"`
 
 	LastSeenSeconds float64 `json:"last_seen_seconds"`
 	Alive           bool    `json:"alive"`
