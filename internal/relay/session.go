@@ -173,6 +173,7 @@ type pathState struct {
 	rtt   uint32 // most recent round trip, microseconds
 	stats pathStats
 	mtu   mtuProbe
+	bw    bwEstimate
 }
 
 // session holds the sequencing and measurement state both ends keep.
@@ -351,9 +352,17 @@ func (s *session) build(typ, pathID uint8, globalSeq uint32, payload, buf []byte
 		}
 	}
 	p.lastSentAt = now
+
+	// Built under the lock so the bandwidth estimate can count what actually
+	// went onto the wire rather than an estimate of it. The header's length
+	// varies with how many echo entries rode along, and a rate derived from
+	// a guess at that would be wrong in exactly the direction that matters:
+	// echoes are largest when the most paths need reporting on.
+	out := append(h.AppendTo(buf[:0]), payload...)
+	p.bw.noteSent(len(out) + ipUDPOverhead)
 	s.mu.Unlock()
 
-	return append(h.AppendTo(buf[:0]), payload...)
+	return out
 }
 
 // collectEchoLocked drains the pending arrivals into echo entries, one per
@@ -447,6 +456,14 @@ func (s *session) buildProbe(pathID uint8, buf []byte) []byte {
 	out := s.build(protocol.TypeProbe, pathID, s.nextGlobalSeq(), nil, buf)
 	if pad := wire - len(out); pad > 0 {
 		out = append(out, zeroPad[:pad]...)
+		// The padding is real traffic on the link and is counted as such.
+		// A 1500 byte probe every fifteen seconds is nothing next to a
+		// download, but on an otherwise idle path it is most of what is
+		// there, and leaving it out would understate the only load the
+		// path has.
+		s.mu.Lock()
+		p.bw.noteSent(pad)
+		s.mu.Unlock()
 	}
 	return out
 }
@@ -580,10 +597,18 @@ func (s *session) metrics(now time.Duration) []pathMetric {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	c := s.cfg.Get()
 	managed := s.role == roleInitiator
 	out := make([]pathMetric, 0, len(s.paths))
 	for id, p := range s.paths {
 		st := &p.stats
+
+		// The bandwidth estimate is advanced here rather than on a loop of
+		// its own. This is already the once-per-evaluation pass over every
+		// path under the lock, it has the round trip and the receive-side
+		// queue delay to hand, and giving the estimate its own goroutine
+		// would only add a second cadence to keep in step with this one.
+		p.bw.observe(now, ms(p.rtt), msi(st.queueDelay), c)
 
 		// A path that has never delivered anything has been silent for as
 		// long as this process has been running. The initiator registers
@@ -611,6 +636,7 @@ func (s *session) metrics(now time.Duration) []pathMetric {
 			burstRatio:     st.recentBurstRatio(),
 			thin:           st.thin(),
 			unusable:       p.mtu.ceiling != 0 && p.mtu.confirmed < minUsablePathMTU,
+			bw:             p.bw.view(now, c),
 		})
 	}
 	return out
@@ -631,11 +657,12 @@ func (s *session) recommendedTunnelMTU() int {
 func (s *session) logStats() {
 	var last time.Duration
 	for range time.Tick(time.Second) {
-		if now := s.elapsed(); now-last < s.cfg.Get().StatsInterval() {
+		now := s.elapsed()
+		if now-last < s.cfg.Get().StatsInterval() {
 			continue
-		} else {
-			last = now
 		}
+		last = now
+
 		d := emptyDecision
 		if s.sched != nil {
 			d = s.sched.current()
@@ -645,12 +672,13 @@ func (s *session) logStats() {
 		for id, p := range s.paths {
 			st := &p.stats
 			log.Printf("path %d: %s | rtt %.1fms p95-spread %.1fms jitter %.1fms queue %.1fms | "+
-				"rx %d lost %d bursts %v | samples %d%s | mtu %d",
+				"rx %d lost %d bursts %v | samples %d%s | mtu %d | tx %.0fkbps %s",
 				id, describe(d, id),
 				ms(p.rtt), msi(st.spread()), st.jitter/1000, msi(st.queueDelay),
 				st.received, st.lost, st.bursts,
 				st.filled, thinNote(st.thin()),
-				p.mtu.confirmed)
+				p.mtu.confirmed,
+				p.bw.sendKbps, describeCeiling(&p.bw, now))
 		}
 		if d.blind {
 			log.Printf("scheduler: %s", d.reason)
@@ -664,6 +692,20 @@ func (s *session) logStats() {
 		}
 		s.mu.Unlock()
 	}
+}
+
+// describeCeiling renders a path's capacity estimate for the log, in the
+// terms it is actually held in: a ceiling that was measured, how long ago
+// anything confirmed it, or the fact that nothing ever has.
+func describeCeiling(b *bwEstimate, now time.Duration) string {
+	switch {
+	case b.haveCeiling:
+		return fmt.Sprintf("ceiling %.0fkbps (confirmed %v ago)",
+			b.ceilingKbps, (now - b.confirmedAt).Round(time.Second))
+	case b.everLoaded:
+		return fmt.Sprintf("ceiling unknown, carried %.0fkbps clean", b.provenKbps)
+	}
+	return "ceiling unknown, never loaded"
 }
 
 // recommendedTunnelMTULocked is recommendedTunnelMTU for callers already
@@ -770,6 +812,23 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 			Usable:            p.mtu.confirmed >= minUsablePathMTU,
 			LastSeenSeconds:   lastSeen,
 			Alive:             alive,
+		}
+
+		// Read, never advanced: the estimate is driven from the evaluation
+		// pass in metrics, and the state file is written on a cadence of its
+		// own. Sampling it here as well would fold the same bytes in twice
+		// and report a rate that moved with how often the interface was
+		// being looked at.
+		bw := p.bw.view(now, snap.Config)
+		path.SendKbps = bw.sendKbps
+		path.PeakKbps = bw.peakKbps
+		path.ProvenKbps = bw.provenKbps
+		path.CeilingKbps = bw.ceilingKbps
+		path.CeilingKnown = bw.haveCeiling
+		path.LimitKbps = bw.limitKbps
+		path.CeilingAgeSeconds = -1
+		if bw.everLoaded {
+			path.CeilingAgeSeconds = (now - bw.confirmedAt).Seconds()
 		}
 		if v, ok := d.views[id]; ok {
 			path.State = v.State

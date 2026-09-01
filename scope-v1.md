@@ -6,9 +6,10 @@
 - Userspace multipath daemon with the header from `protocol.md`
 - Passive measurement from data packets; active probes scaled inversely to path traffic
 - Queue delay inferred from delay above rolling minimum (no clock sync required)
-- Reactive per-path bandwidth ceiling from queue-delay onset during real traffic - no
-  active bandwidth probes; gates duplication targets and primary handovers, never a hard
-  veto (see D-023)
+- Reactive per-path bandwidth ceiling from queueing onset during real traffic - taken
+  from the round trip above its own floor, less the receive-side queue delay, so a
+  saturated downlink is not mistaken for a full uplink. No active bandwidth probes; gates
+  duplication targets and primary handovers, never a hard veto (see D-023)
 - Three-state path machine with asymmetric hysteresis and flap penalty
 - Real-time class: single path, duplication, make-before-break, heavy stickiness
 - Bulk class: **single best path** for v1 (multipath deferred, see below)
@@ -65,10 +66,10 @@ of reasoning up front.
    threshold below was therefore set from reasoning rather than measurement, and all of
    them are adjustable at runtime precisely because they are expected to be wrong.
 6. **State machine.** Thresholds informed by step 5. **Built** (2026-09-01) without them.
-6b. **Bandwidth ceiling.** Reactive, from queue-delay onset under real traffic; no active
+6b. **Bandwidth ceiling.** Reactive, from queueing onset under real traffic; no active
     probes. Feeds duplication-target and handover eligibility ahead of classification, and
     ahead of it being usable to split bulk's path choice from real-time's once step 7
-    lands. See D-023.
+    lands. **Built** (2026-09-01). See D-023.
 7. **Classification.** STUN watching first; it is the highest-value piece.
 8. **Scheduling and real-time handling.** Duplication, make-before-break, stickiness.
 9. **Admission control.** Alongside the scheduler, not after.

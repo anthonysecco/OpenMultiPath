@@ -283,6 +283,19 @@ func (s *scheduler) choose(now time.Duration, c config.Config, eligible []scored
 	}
 
 	if best.score > cur+float64(c.SwitchMarginR) {
+		// A better-scoring path that cannot carry what the current one is
+		// carrying is not a better path, it is a smaller one that has not
+		// been asked to prove it yet. Moving onto it would trade a working
+		// transfer for a nicer set of numbers.
+		//
+		// Only the opportunistic branch is gated. Below the floor, above,
+		// the current path is failing and the load it is "carrying" is
+		// theoretical - there, a small path that works beats a large one
+		// that does not.
+		if !s.canTake(best, s.offeredKbps(eligible), c) {
+			s.challengerFor = 0
+			return
+		}
 		if s.challenger == best.m.id {
 			s.challengerFor++
 		} else {
@@ -294,6 +307,25 @@ func (s *scheduler) choose(now time.Duration, c config.Config, eligible []scored
 		return
 	}
 	s.challengerFor = 0
+}
+
+// offeredKbps is how much the primary is currently being asked to carry,
+// which is what any path taking over from it has to be able to take.
+func (s *scheduler) offeredKbps(eligible []scored) float64 {
+	if !s.havePrimary {
+		return 0
+	}
+	if m, ok := s.metricOf(s.primary, eligible); ok {
+		return m.bw.sendKbps
+	}
+	return 0
+}
+
+// canTake reports whether a path may be offered this much on top of what it
+// is already doing. A path with no capacity estimate always may - the gate
+// refuses on evidence, never on ignorance.
+func (s *scheduler) canTake(sc scored, loadKbps float64, c config.Config) bool {
+	return sc.m.bw.canCarry(loadKbps, c)
 }
 
 // adopt takes a path as primary with no overlap. Used only when there is no
@@ -387,27 +419,49 @@ func (s *scheduler) buildTx(d *decision, c config.Config, eligible []scored, sen
 		return
 	}
 
+	// What a second copy of the stream would cost the path that took it.
+	// The primary's own send rate is the honest figure: a duplicate is, by
+	// definition, exactly as much traffic as the original.
+	load := s.offeredKbps(eligible)
+
 	switch c.DuplicateMode {
 	case config.DuplicateAlways:
+		skipped := 0
 		for _, sc := range eligible {
-			if sc.m.id != s.primary {
-				d.tx = append(d.tx, sc.m.id)
+			if sc.m.id == s.primary {
+				continue
 			}
+			if !s.canTake(sc, load, c) {
+				skipped++
+				continue
+			}
+			d.tx = append(d.tx, sc.m.id)
 		}
 		d.reason = "duplicating on every usable path"
+		if skipped > 0 {
+			d.reason = "duplicating on every path with the capacity for it"
+		}
 
 	case config.DuplicateUnstable:
 		if mach := s.machines[s.primary]; mach != nil && mach.state == stateUnstable {
-			// Only one spare copy. Duplication is insurance, and taking
-			// out three policies on a link that has none to spare is how
-			// the insurance becomes the accident.
+			// Only one spare copy, and it goes to the best path that can
+			// actually take it. Duplication is insurance, and taking out
+			// three policies on a link that has none to spare is how the
+			// insurance becomes the accident - which is precisely what a
+			// 512k standby link does when a download is mirrored onto it
+			// because it looked healthy while carrying nothing.
 			for _, sc := range eligible {
-				if sc.m.id != s.primary {
-					d.tx = append(d.tx, sc.m.id)
-					break
+				if sc.m.id == s.primary || !s.canTake(sc, load, c) {
+					continue
 				}
+				d.tx = append(d.tx, sc.m.id)
+				break
 			}
-			d.reason = "duplicating while the chosen path is degraded"
+			if len(d.tx) > 1 {
+				d.reason = "duplicating while the chosen path is degraded"
+			} else {
+				d.reason = "chosen path degraded, no path has the capacity to duplicate onto"
+			}
 			return
 		}
 		d.reason = "single path"

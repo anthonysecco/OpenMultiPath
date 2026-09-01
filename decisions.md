@@ -344,25 +344,58 @@ duplication is nearly free; on a 512k link, 40 kbps of audio is 8% of capacity a
 
 ## D-023 · Reactive bandwidth ceiling, not active probing
 
-**Decision.** Estimate each path's usable capacity from queue-delay onset during real
-traffic, not from dedicated bandwidth probes. Track a rolling baseline (quiet) delay per
-path; when delay pulls away from baseline while the path is carrying load, record the
-send rate at that moment as the observed ceiling. A path that has never carried enough
-load to trigger an onset has no estimate and falls back to a configured
-`max_bitrate_kbps`, default unset.
+**Decision.** Estimate each path's usable capacity from queueing onset during real
+traffic, not from dedicated bandwidth probes. When a path is carrying real load and the
+link underneath starts to fill, record the send rate at that moment, less a margin, as
+the observed ceiling. A path that has never been seen to queue has no estimate and falls
+back to a configured `bw_fallback_kbps`, default 0, which means unknown and applies no
+limit at all.
 
 **Rationale.** Active bandwidth probing - packet trains, pair dispersion - is unreliable
 on a variable-bandwidth link and directly counterproductive on a metered one: the probe
-itself spends the capacity it is trying to measure. Queue delay is already computed for
-every path from the echo channel for the state machine; reusing it as a capacity signal
-adds no wire format, no probe cadence, and no cost beyond bookkeeping.
+itself spends the capacity it is trying to measure. Delay is already measured on every
+path for the state machine; reusing it as a capacity signal adds no wire format, no probe
+cadence, and no cost beyond bookkeeping.
 
-**Revision.** Downward revision, on an observed onset, is trusted immediately. Upward
-revision only creeps up a little per clean interval carrying real load - additive
-increase, not an instant reset - so one bad reading doesn't permanently cap a path that
-has since recovered. An estimate for a path that has gone back to idle ages in
-confidence, not in value: the number is not discarded, but it is no longer treated as
-current.
+**The signal is the round trip, not the receive-side queue delay.** This was the first
+thing implementation changed. `queue_delay_ms` is built from arrival timestamps and is
+therefore the *receive* direction only, while the scheduler decides where to *send* - so
+it cannot answer the question on its own. What can is the round trip against its own
+floor, less the receive-side queue delay we can already see. One subtraction, and it is
+what keeps a large download arriving on a path from being misread as that path's uplink
+filling up, which is exactly the scenario that prompted this decision.
+
+The round-trip floor is re-armed on a far longer window than the ten seconds `stats.go`
+uses for transit. Ten seconds is right for "is this path degraded now", a question about
+the present. Capacity is a question about the link, and a standing queue lasting a minute
+is precisely the evidence being looked for - absorbing it into the baseline would turn a
+badly congested link into one that reads as clean at whatever rate is being forced into
+it.
+
+**Two numbers, not one.** The second thing implementation changed. Carrying a rate with
+the link still empty proves the path can do *at least* that much; it says nothing about
+the maximum. Recording that as a ceiling would make a path ineligible for traffic merely
+because nothing larger had happened to flow through it yet. So a clean rate is kept as a
+floor (`proven`) and only an observed onset sets a ceiling. Only the ceiling gates
+anything.
+
+**Revision.** The ceiling is taken at the *transition* into queueing, and afterwards may
+only ratchet down. Once a buffer is filling, what is being pushed in is no longer what is
+coming out the far side: a sender that keeps shoving 8 Mbps into a link that has
+collapsed to 2 would otherwise have that 8 recorded as its capacity, which is the
+opposite of the truth. A lower rate that is still queueing is direct evidence the wall
+moved in and is trusted at once.
+
+Upward revision needs a clean reading. A path carrying more than its recorded ceiling
+with the link empty has demonstrated that ceiling wrong, and it is lifted to what has
+actually flowed - never above it, so no headroom is ever invented.
+
+An estimate for a path that has gone back to idle ages in confidence, not in value. The
+number is not discarded and not decayed - an hour of quiet is not evidence that a link
+shrank, and a decaying number would read as a degrading link in the interface while
+nothing at all had been measured. What slides is how much of it the scheduler leans on:
+full weight while fresh, down to a floor of 70% once nothing has confirmed it for a
+quarter of an hour, and no further. A stale estimate still beats no estimate.
 
 **Consequence for D-022.** This is the capacity-awareness that decision's closing note
 asked for. Duplication targets and primary handovers should reject a candidate whose
@@ -381,6 +414,20 @@ it.
 **Deferred.** Using the ceiling to actively pace or shape the daemon's own outbound
 writes - inducing backpressure on the sender's TCP stack rather than only informing path
 choice - is a distinct, larger capability and is not part of this decision.
+
+Also deferred: `bw_fallback_kbps` is global rather than per-path, because path
+configuration is currently a command-line list of interface names and the responder has
+no path configuration at all - it learns its paths from what arrives. A per-path figure
+is what is actually wanted, since the case it exists for is one specific link with a
+known 512k tier, and it belongs with the provisioning file rather than bolted onto a
+flag.
+
+**Built** (2026-09-01), with the estimate visible per path in the state file and web
+interface: what is going onto the path now, the most it has carried clean, the measured
+ceiling if there is one, how long ago that was confirmed, and what the scheduler is
+currently willing to assume. The three cases are shown apart rather than as one number,
+because a measured ceiling can be acted on, a floor only says "at least this", and never
+having loaded a path says nothing at all.
 
 ---
 

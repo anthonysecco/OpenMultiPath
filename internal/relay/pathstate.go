@@ -83,6 +83,12 @@ type pathMetric struct {
 	// unusable means the path has been probed and cannot carry the tunnel
 	// floor. Distinct from "not yet probed", which is not a fault.
 	unusable bool
+
+	// bw is how much this path can carry, as far as anything has been able
+	// to establish. Deliberately not part of the state machine: a small
+	// link is not a degraded link, and a path that can only do 512k is
+	// still perfectly healthy at 512k.
+	bw bwView
 }
 
 // machine is the hysteresis state for one path.

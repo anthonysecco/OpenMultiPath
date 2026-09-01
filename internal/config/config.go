@@ -123,6 +123,26 @@ type Config struct {
 	MBBMinMs int `json:"mbb_min_ms"`
 	MBBMaxMs int `json:"mbb_max_ms"`
 
+	// The reactive bandwidth ceiling of D-023.
+	//
+	// BWOnsetMs is how much queueing in our own send direction counts as the
+	// link having started to fill. BWMinLoadKbps is the rate below which a
+	// path is carrying too little for its behaviour to mean anything, so
+	// nothing is concluded from it either way. BWHeadroomPercent is the
+	// margin a path must have spare before traffic is steered onto it, since
+	// arriving exactly at the estimated ceiling is arriving at the wall.
+	BWOnsetMs         int `json:"bw_onset_ms"`
+	BWMinLoadKbps     int `json:"bw_min_load_kbps"`
+	BWHeadroomPercent int `json:"bw_headroom_percent"`
+
+	// BWFallbackKbps is what a path is assumed to carry before it has ever
+	// been seen to queue. Zero means "unknown", which is the default and
+	// disables the gate rather than guessing: never having watched a path
+	// fill up is not evidence that it is small. Set it where a plan's
+	// ceiling is known in advance - a 512k satellite standby tier is the
+	// case this exists for.
+	BWFallbackKbps int `json:"bw_fallback_kbps"`
+
 	// DuplicateMode decides when a packet goes out more than one path.
 	// See DuplicateModes for the meanings.
 	DuplicateMode string `json:"duplicate_mode"`
@@ -216,6 +236,22 @@ var Bounds = map[string]bound{
 
 	"mbb_min_ms": {Min: 0, Max: 10_000, Default: 200},
 	"mbb_max_ms": {Min: 100, Max: 60_000, Default: 2_000},
+
+	// 20 ms of queueing above the round trip's own floor is well clear of
+	// ordinary scheduling noise on a cellular link and well below the
+	// 100 ms at which the state machine starts calling a path unstable.
+	// The ceiling is meant to be found before the path is called degraded.
+	"bw_onset_ms": {Min: 2, Max: 2_000, Default: 20},
+
+	// 300 kbps is above anything the measurement traffic itself produces
+	// and below a single video call, so an idle path never sets a ceiling
+	// and a real flow always can.
+	"bw_min_load_kbps": {Min: 16, Max: 1_000_000, Default: 300},
+
+	"bw_headroom_percent": {Min: 0, Max: 500, Default: 20},
+
+	// Zero means unknown, and unknown means no gate. See BWFallbackKbps.
+	"bw_fallback_kbps": {Min: 0, Max: 10_000_000, Default: 0},
 }
 
 // Defaults returns a configuration that is correct to run with as-is.
@@ -248,6 +284,11 @@ func Defaults() Config {
 		BaseDelayMs:          Bounds["base_delay_ms"].Default,
 		MBBMinMs:             Bounds["mbb_min_ms"].Default,
 		MBBMaxMs:             Bounds["mbb_max_ms"].Default,
+
+		BWOnsetMs:         Bounds["bw_onset_ms"].Default,
+		BWMinLoadKbps:     Bounds["bw_min_load_kbps"].Default,
+		BWHeadroomPercent: Bounds["bw_headroom_percent"].Default,
+		BWFallbackKbps:    Bounds["bw_fallback_kbps"].Default,
 
 		DuplicateMode: DuplicateSwitching,
 	}
@@ -317,6 +358,11 @@ func (c Config) Sanitised() Config {
 		BaseDelayMs:          clamp(c.BaseDelayMs, Bounds["base_delay_ms"]),
 		MBBMinMs:             clamp(c.MBBMinMs, Bounds["mbb_min_ms"]),
 		MBBMaxMs:             clamp(c.MBBMaxMs, Bounds["mbb_max_ms"]),
+
+		BWOnsetMs:         clamp(c.BWOnsetMs, Bounds["bw_onset_ms"]),
+		BWMinLoadKbps:     clamp(c.BWMinLoadKbps, Bounds["bw_min_load_kbps"]),
+		BWHeadroomPercent: clamp(c.BWHeadroomPercent, Bounds["bw_headroom_percent"]),
+		BWFallbackKbps:    clamp(c.BWFallbackKbps, Bounds["bw_fallback_kbps"]),
 
 		DuplicateMode: duplicateMode(c.DuplicateMode),
 	}

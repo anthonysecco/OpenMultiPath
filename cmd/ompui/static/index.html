@@ -157,6 +157,15 @@ function duration(sec) {
   return h + "h " + Math.floor((sec % 3600) / 60) + "m";
 }
 
+// Bitrates span four orders of magnitude here - a 512k standby tier and a
+// 200 Mbps dish are both normal - so they are scaled rather than printed as
+// a wall of digits nobody can compare at a glance.
+function rate(kbps) {
+  if (kbps === undefined || kbps === null) return "—";
+  if (kbps >= 1000) return fmt(kbps / 1000, kbps >= 10000 ? 0 : 1) + " Mbps";
+  return fmt(kbps, 0) + " kbps";
+}
+
 // A path's own loss rate is what decides whether its numbers are worth
 // believing, so colour it rather than leaving it as one figure among many.
 function lossClass(pct) {
@@ -296,6 +305,26 @@ function renderPaths(s) {
         bursts.map(b => `<td>${b.count}</td>`).join("") + `</tr></table>`
       : "";
 
+    // Capacity. The estimate is honest about how it was arrived at, because
+    // the three cases call for different responses: a measured ceiling can
+    // be acted on, a floor from clean carriage only says "at least this",
+    // and never having loaded the path says nothing at all. Showing one
+    // number for all three would invite trusting the weakest of them.
+    const capacity = p.ceiling_known
+      ? `${rate(p.ceiling_kbps)}`
+      : p.ceiling_age_seconds >= 0 ? `≥ ${rate(p.proven_kbps)}` : "unknown";
+
+    // What ages is the confidence, never the value: an idle hour is not
+    // evidence that a link shrank. The discount the scheduler is currently
+    // applying is shown rather than folded silently into the headline.
+    const capacityNote = p.ceiling_known
+      ? (p.limit_kbps < p.ceiling_kbps * 0.99
+          ? `measured ${duration(p.ceiling_age_seconds)} ago; the scheduler is currently assuming ${rate(p.limit_kbps)} while it goes unconfirmed`
+          : `measured ${duration(p.ceiling_age_seconds)} ago, where queueing set in`)
+      : p.ceiling_age_seconds >= 0
+        ? "the most this path has carried without the link filling; its actual ceiling is unmeasured"
+        : "nothing has ever loaded this path, so nothing is assumed about what it can carry";
+
     const bindRow = owns
       ? `<div class="metric"><div class="k">Link drops</div>
            <div class="v" title="times this link has gone away since the daemon started, address changes included">${p.drops || 0}</div></div>`
@@ -321,6 +350,10 @@ function renderPaths(s) {
         <div class="metric"><div class="k">Loss (lifetime)</div>
           <div class="v" title="${p.lost.toLocaleString()} packets since the daemon started">${fmt(p.loss_percent, 2)}%</div></div>
         <div class="metric"><div class="k">Received</div><div class="v">${p.received.toLocaleString()}</div></div>
+        <div class="metric"><div class="k">Sending</div>
+          <div class="v" title="what is going onto this path right now; peak ${rate(p.peak_kbps)}">${rate(p.send_kbps)}</div></div>
+        <div class="metric"><div class="k">Capacity</div>
+          <div class="v" title="${capacityNote}">${capacity}</div></div>
         <div class="metric"><div class="k">Path MTU</div><div class="v">${p.path_mtu || "—"}</div></div>
         <div class="metric"><div class="k">Samples</div><div class="v">${p.samples}</div></div>
         <div class="metric"><div class="k">Last seen</div>
@@ -421,6 +454,15 @@ const FIELDS = [
    "Shortest time both paths carry traffic during a handover."],
   ["mbb_max_ms", "Handover maximum overlap", "ms",
    "Longest to keep paying for two copies while waiting for the new path to be confirmed."],
+
+  ["bw_onset_ms", "Capacity onset", "ms",
+   "Queueing in the send direction that counts as the link starting to fill. The rate at that moment becomes the path's estimated ceiling."],
+  ["bw_min_load_kbps", "Capacity minimum load", "kbps",
+   "Below this a path is carrying too little for its behaviour to mean anything, and nothing is concluded either way. An idle path never sets a ceiling."],
+  ["bw_headroom_percent", "Capacity headroom", "%",
+   "Margin a path must have spare before traffic is steered onto it. Arriving exactly at the estimated ceiling is arriving at the wall."],
+  ["bw_fallback_kbps", "Capacity if unmeasured", "kbps",
+   "What a path is assumed to carry before it has ever been seen to queue. Zero means unknown, which applies no limit at all - set it only where a plan's ceiling is genuinely known, such as a 512k satellite standby tier."],
 ];
 
 // The one setting that is not a number. Duplication is the difference

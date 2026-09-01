@@ -405,3 +405,121 @@ func TestTiedScoresBreakTowardsTheLowerDelay(t *testing.T) {
 		t.Errorf("ranking leads with path %d, want path 1: %v", d.ranking[0], d.ranking)
 	}
 }
+
+// The scenario that produced D-023. A large transfer is running on the good
+// path, that path degrades, and duplication looks for somewhere to put a
+// second copy. The only other path is the 512k satellite standby link,
+// which has been carrying nothing but probes and therefore scores
+// beautifully - no queue, no loss, nothing to go wrong yet. Sending it a
+// mirror of a multi-megabit transfer is how a 10 MB copy produced eight
+// thousand lost packets.
+func TestDuplicationSkipsAPathTooSmallForTheLoad(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 30))
+	w.c.DuplicateMode = config.DuplicateUnstable
+	w.s.cfg = config.NewHolder(w.c)
+
+	// Path 1 carries the transfer at 6 Mbps. Path 0 is the satellite link,
+	// idle, with a ceiling measured back when something did use it.
+	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 6000, limitKbps: 40000, haveCeiling: true} })
+	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 10, limitKbps: 512, haveCeiling: true} })
+	w.tick(w.c.PromoteIntervals + 5)
+
+	// Path 1 goes bad enough to be called unstable, which is what turns
+	// duplication on.
+	w.set(1, func(p *pathMetric) { p.recentLoss = 3 })
+	d := w.tick(w.c.DemoteIntervals + 2)
+
+	if d.primary != 1 {
+		t.Fatalf("primary is path %d, want the transfer to still be on path 1", d.primary)
+	}
+	if txSet(d)[0] {
+		t.Errorf("duplicated a 6 Mbps stream onto a 512 kbps path: tx %v (%s)", d.tx, d.reason)
+	}
+	if len(d.tx) != 1 {
+		t.Errorf("tx = %v, want the primary alone when nothing can take a copy", d.tx)
+	}
+}
+
+// The same shape, with a path that genuinely has room. The gate must not
+// have simply disabled duplication.
+func TestDuplicationUsesAPathWithTheCapacity(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 30))
+	w.c.DuplicateMode = config.DuplicateUnstable
+	w.s.cfg = config.NewHolder(w.c)
+
+	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 6000, limitKbps: 40000, haveCeiling: true} })
+	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 10, limitKbps: 25000, haveCeiling: true} })
+	w.tick(w.c.PromoteIntervals + 5)
+
+	w.set(1, func(p *pathMetric) { p.recentLoss = 3 })
+	d := w.tick(w.c.DemoteIntervals + 2)
+
+	if !txSet(d)[0] {
+		t.Errorf("did not duplicate onto a path with ample headroom: tx %v (%s)", d.tx, d.reason)
+	}
+}
+
+// A path nothing has ever loaded has no estimate, and no estimate must mean
+// permission. Refusing on ignorance would make a link ineligible for having
+// been quiet, which on a box whose links are quiet most of the time is the
+// same as switching duplication off.
+func TestDuplicationAllowedWhenCapacityIsUnknown(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 30))
+	w.c.DuplicateMode = config.DuplicateUnstable
+	w.s.cfg = config.NewHolder(w.c)
+
+	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 6000, limitKbps: 40000, haveCeiling: true} })
+	// Path 0: never loaded, so limitKbps is zero - no opinion.
+	w.tick(w.c.PromoteIntervals + 5)
+
+	w.set(1, func(p *pathMetric) { p.recentLoss = 3 })
+	d := w.tick(w.c.DemoteIntervals + 2)
+
+	if !txSet(d)[0] {
+		t.Errorf("refused a path with no capacity estimate: tx %v (%s)", d.tx, d.reason)
+	}
+}
+
+// A better-scoring path that cannot carry what the primary is carrying is a
+// smaller path, not a better one. Moving a running transfer onto it would
+// trade the transfer for a nicer set of numbers.
+func TestHandoverBlockedByCapacityWhenMerelyOpportunistic(t *testing.T) {
+	w := newWorld(t, path(0, 20), path(1, 60))
+	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 6000, limitKbps: 40000, haveCeiling: true} })
+	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 10, limitKbps: 512, haveCeiling: true} })
+
+	// Start with path 1 as primary by making path 0 briefly unavailable.
+	w.set(0, func(p *pathMetric) { p.bound = false })
+	w.tick(w.c.PromoteIntervals + 5)
+	if d := w.s.current(); d.primary != 1 {
+		t.Fatalf("primary is path %d, want path 1 to start", d.primary)
+	}
+	w.set(0, func(p *pathMetric) { p.bound = true })
+
+	d := w.tick(w.c.PromoteIntervals + w.c.SwitchHoldIntervals + 10)
+	if d.primary != 1 {
+		t.Errorf("handed a 6 Mbps transfer to path %d, which is estimated at 512 kbps", d.primary)
+	}
+}
+
+// The gate is soft. When the current path has fallen below the floor it is
+// failing, and a small path that works beats a large one that does not -
+// principle 5, fail to a working state.
+func TestHandoverToASmallPathStillHappensBelowTheFloor(t *testing.T) {
+	w := newWorld(t, path(0, 20), path(1, 60))
+	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 6000, limitKbps: 40000, haveCeiling: true} })
+	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 10, limitKbps: 512, haveCeiling: true} })
+
+	w.set(0, func(p *pathMetric) { p.bound = false })
+	w.tick(w.c.PromoteIntervals + 5)
+	w.set(0, func(p *pathMetric) { p.bound = true })
+	w.tick(w.c.PromoteIntervals + 2)
+
+	// Path 1 collapses: heavy, clustered loss drives it under min_acceptable_r.
+	w.set(1, func(p *pathMetric) { p.recentLoss = 25; p.burstRatio = 6; p.jitterMs = 120 })
+	d := w.tick(w.c.SwitchHoldIntervals + 20)
+
+	if d.primary != 0 {
+		t.Errorf("primary is path %d; a failing path must be left even for a small one (%s)", d.primary, d.reason)
+	}
+}
