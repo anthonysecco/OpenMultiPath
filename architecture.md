@@ -80,11 +80,20 @@ measured performance.
 
 ## Home-side networking
 
-Routed subnet, **not** NAT. Give the RV LAN its own prefix (e.g. 10.20.0.0/24) and route
-it at home. NAT once, at the home internet edge.
+Routed subnet, **not double-NAT**. Give the RV LAN its own prefix (e.g. 10.20.0.0/24) and
+route it at home, so home can always reach an RV device directly by its LAN address —
+that reachability is never NATed away in either direction.
 
-Double NAT breaks reaching RV devices from home, breaks peer-to-peer, and makes packet
-captures much harder to read. Keep the NAT boundary configurable but default it off.
+For the RV LAN's own traffic to the wider internet, NAT **once**, at the home internet
+edge, by default. This is what makes "no split tunneling" (see `CLAUDE.md`) actually mean
+something: an RV LAN client's default route goes into the tunnel, home forwards and
+masquerades it out its own connection, and the client never touches its local WAN links
+directly for anything but the tunnel itself.
+
+Double NAT (i.e. NATing again at the RV before the tunnel) breaks reaching RV devices
+from home, breaks peer-to-peer, and makes packet captures much harder to read — that stays
+disallowed regardless of the internet-egress NAT setting above. Keep the internet-egress
+NAT boundary configurable; it defaults to **on**. See D-013 for how to turn it off.
 
 ## Traffic classes
 

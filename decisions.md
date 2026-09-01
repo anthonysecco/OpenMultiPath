@@ -172,12 +172,35 @@ which is what diagnosis requires.
 
 ---
 
-## D-013 · Routed subnet at home, no double NAT
+## D-013 · Routed subnet at home, no double NAT, internet-egress NAT on by default
 
-**Decision.** RV LAN gets its own prefix, routed at home. NAT once at the home edge.
+**Decision.** RV LAN gets its own prefix, routed at home — never double-NATed, so home can
+always reach an RV device directly. Separately, the RV LAN's traffic to the wider internet
+is NATed once, at the home edge, and this is **on by default**, not off. It is what "no
+split tunneling" actually requires in practice: without it, an RV LAN client's own default
+route has nowhere useful to send general internet traffic except back out its own local
+WAN link, defeating the tunnel for exactly the traffic that most needs steering.
 
-**Rationale.** Double NAT breaks reaching RV devices from home, breaks peer-to-peer, and
-makes packet captures much harder to read. Configurable, defaulted off.
+**Rationale.** Double NAT (NATing again at the RV) breaks reaching RV devices from home,
+breaks peer-to-peer, and makes packet captures much harder to read — that stays disallowed
+regardless of the internet-egress setting. The internet-egress NAT default was flipped
+from off to on (2026-09-01) once it was clear that "off" left the RV's own LAN traffic
+silently split-tunneling by default, which is the one thing this project must never do.
+
+**Current implementation** (until D-014's provisioning system exists to manage this
+properly): on the RV, the WireGuard peer's `AllowedIPs` is `0.0.0.0/0` and a default route
+via `wg0` (low metric) sends general traffic into the tunnel. On the home end, an nftables
+`masquerade` rule NATs `{RV LAN prefix, tunnel prefix}` out the home uplink. Watch for
+DHCP-injected host routes on a WAN link overriding specific destinations back out that
+link directly (seen with `1.1.1.1`/`8.8.8.8` on a real network) — override with an explicit
+`ip route` via `wg0` at a lower metric, in the tunnel interface's own `PostUp`, not by
+disabling DHCP-provided routes wholesale (that would also remove the WAN interface's own
+default gateway, which the daemon's per-path sockets need).
+
+**To turn it off:** remove `0.0.0.0/0` from the RV's peer `AllowedIPs` (narrow it back to
+the tunnel and home-LAN prefixes only) and remove the low-metric default route via `wg0`
+on the RV. The home-side masquerade rule can stay; it does nothing without matching
+traffic reaching it.
 
 ---
 
