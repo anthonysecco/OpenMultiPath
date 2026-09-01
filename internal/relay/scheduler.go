@@ -269,7 +269,11 @@ func (s *scheduler) choose(now time.Duration, c config.Config, eligible []scored
 		return
 	}
 	if best.m.id == s.primary {
-		s.challengerFor = 0
+		// Being top-ranked is not the same as being the right path. With
+		// scores tied, the primary won that ranking on a couple of
+		// milliseconds of delay, which decides nothing - so a path with
+		// materially more room still deserves asking about.
+		s.considerRoomier(now, cur, c, eligible)
 		return
 	}
 
@@ -278,7 +282,14 @@ func (s *scheduler) choose(now time.Duration, c config.Config, eligible []scored
 	// something else looks marginally nicer - so a challenger with a
 	// better score is not on its own a reason to move.
 	if cur < float64(c.MinAcceptableR) && best.score > cur {
-		s.beginSwitch(now, best.m.id, "current path below the floor")
+		// Where several paths could take the flow, prefer the one with the
+		// most room rather than whichever scored a fraction higher. Scores
+		// bunch at the top of the scale - every healthy path reads 93.2,
+		// because the E-model measures impairment and an unimpaired path
+		// has none - so the ranking here is often decided by a couple of
+		// milliseconds that no call can perceive, while the capacity
+		// difference between the candidates can be two orders of magnitude.
+		s.beginSwitch(now, s.escapeTo(cur, eligible), "current path below the floor")
 		return
 	}
 
@@ -306,7 +317,86 @@ func (s *scheduler) choose(now time.Duration, c config.Config, eligible []scored
 		}
 		return
 	}
-	s.challengerFor = 0
+
+	// Nothing is materially better on quality. That is not the same as
+	// nothing being better: two paths that both read 93.2 are
+	// indistinguishable to the model and can still differ by a factor of
+	// four in what they can carry, and the tie is currently settled by a
+	// few milliseconds of delay that decide nothing.
+	//
+	// Worse, a tie is unbreakable. A challenger has to beat the incumbent
+	// by SwitchMarginR to displace it, which equal scores can never do, so
+	// whichever path happened to be primary when the scores converged stays
+	// primary indefinitely - on the road that has meant a flow pinned to a
+	// 512 kbps standby link with a multi-megabit one sitting idle beside
+	// it. Capacity is the honest discriminator when quality has none.
+	s.considerRoomier(now, cur, c, eligible)
+}
+
+// considerRoomier moves the flow onto an equally-good path with materially
+// more capacity, under the same stickiness as any other handover.
+func (s *scheduler) considerRoomier(now time.Duration, cur float64, c config.Config, eligible []scored) {
+	id, ok := s.roomier(cur, eligible, c)
+	if !ok {
+		s.challengerFor = 0
+		return
+	}
+	if s.challenger == id {
+		s.challengerFor++
+	} else {
+		s.challenger, s.challengerFor = id, 1
+	}
+	if s.challengerFor >= c.SwitchHoldIntervals {
+		s.beginSwitch(now, id, "equal quality, materially more capacity")
+	}
+}
+
+// escapeTo picks where a failing path should hand off to: the best-scoring
+// candidate that can actually carry the load, falling back to the
+// best-scoring one outright when none can.
+//
+// The fallback is the point. Principle 5 - a small path that works beats a
+// large one that does not, and a link-starved RV must still be able to move
+// onto its only remaining option however capacity-poor it is.
+func (s *scheduler) escapeTo(cur float64, eligible []scored) uint8 {
+	load := s.offeredKbps(eligible)
+	c := s.cfg.Get()
+	for _, sc := range eligible {
+		if sc.m.id == s.primary || sc.score <= cur {
+			continue
+		}
+		if s.canTake(sc, load, c) {
+			return sc.m.id
+		}
+	}
+	return eligible[0].m.id
+}
+
+// roomier finds a path that is no worse on quality than the primary and has
+// materially more measured capacity, or reports that none does.
+//
+// Both figures have to be measured. An unknown capacity is not evidence of
+// a large path any more than it is of a small one, so a path nothing has
+// ever loaded never displaces a working primary on this rule.
+func (s *scheduler) roomier(cur float64, eligible []scored, c config.Config) (uint8, bool) {
+	curM, ok := s.metricOf(s.primary, eligible)
+	if !ok || curM.bw.limitKbps <= 0 {
+		return 0, false
+	}
+	for _, sc := range eligible {
+		if sc.m.id == s.primary || sc.m.bw.limitKbps <= 0 {
+			continue
+		}
+		// Within the switch margin counts as tied. Outside it the branch
+		// above has already had its say.
+		if sc.score < cur-float64(c.SwitchMarginR) {
+			continue
+		}
+		if sc.m.bw.limitKbps >= curM.bw.limitKbps*bwPreferFactor {
+			return sc.m.id, true
+		}
+	}
+	return 0, false
 }
 
 // offeredKbps is how much the primary is currently being asked to carry,

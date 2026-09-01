@@ -286,3 +286,12 @@ func (v bwView) canCarry(loadKbps float64, c config.Config) bool {
 	needed := (v.sendKbps + loadKbps) * (1 + float64(c.BWHeadroomPercent)/100)
 	return needed <= v.limitKbps
 }
+
+// bwPreferFactor is how much more capacity a path needs before it displaces
+// an equally-scoring primary. A factor rather than a margin, because these
+// links differ by orders of magnitude rather than by percentages: the case
+// this exists for is 512 kbps against tens of megabits, not 8 Mbps against
+// 9. Set high enough that ordinary variation in the estimate never triggers
+// a handover, since the estimate tracks demand as much as capacity and a
+// tighter rule would chase it.
+const bwPreferFactor = 2.0

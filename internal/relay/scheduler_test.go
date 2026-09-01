@@ -523,3 +523,68 @@ func TestHandoverToASmallPathStillHappensBelowTheFloor(t *testing.T) {
 		t.Errorf("primary is path %d; a failing path must be left even for a small one (%s)", d.primary, d.reason)
 	}
 }
+
+// Observed on the road, 2026-09-01. Both paths healthy and scoring 93.2 -
+// identical, because the E-model measures impairment and neither is
+// impaired. Path 0 is the 512 kbps satellite standby link and happens to be
+// primary; path 1 is cellular with four times the measured capacity and is
+// idle. Nothing could ever move the flow, because a challenger must beat
+// the incumbent by SwitchMarginR and a tie never will, so upload sat at
+// 0.45 Mbps with a multi-megabit link beside it.
+func TestTiedQualityBreaksTowardsCapacity(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 35))
+	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 3, limitKbps: 506, haveCeiling: true} })
+	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 5, limitKbps: 2071, haveCeiling: true} })
+
+	// Establish path 0 as primary the way the field case did.
+	w.set(1, func(p *pathMetric) { p.bound = false })
+	w.tick(w.c.PromoteIntervals + 5)
+	if d := w.s.current(); d.primary != 0 {
+		t.Fatalf("primary is path %d, want path 0 to start", d.primary)
+	}
+	w.set(1, func(p *pathMetric) { p.bound = true })
+
+	d := w.tick(w.c.PromoteIntervals + w.c.SwitchHoldIntervals + 10)
+
+	if a, b := d.views[0].Score, d.views[1].Score; a != b {
+		t.Fatalf("paths did not tie (%.1f vs %.1f); this test is about the tie", a, b)
+	}
+	if d.primary != 1 {
+		t.Errorf("primary stayed on path %d (506 kbps) with 2071 kbps available (%s)", d.primary, d.reason)
+	}
+}
+
+// The same rule must not run the other way. A primary with plenty of room
+// is not displaced by a smaller path, however good it looks.
+func TestCapacityNeverMovesOntoASmallerPath(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 35))
+	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 3, limitKbps: 506, haveCeiling: true} })
+	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 5, limitKbps: 2071, haveCeiling: true} })
+
+	w.set(0, func(p *pathMetric) { p.bound = false })
+	w.tick(w.c.PromoteIntervals + 5)
+	w.set(0, func(p *pathMetric) { p.bound = true })
+
+	d := w.tick(w.c.PromoteIntervals + w.c.SwitchHoldIntervals + 10)
+	if d.primary != 1 {
+		t.Errorf("primary moved from the 2071 kbps path to path %d (%s)", d.primary, d.reason)
+	}
+}
+
+// Capacity only speaks when it has been measured. An unmeasured path is not
+// evidence of a large link any more than of a small one, and must not
+// displace a working primary on a number nobody has.
+func TestUnmeasuredCapacityDoesNotMovePrimary(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 35))
+	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 3, limitKbps: 506, haveCeiling: true} })
+	// Path 1 has no estimate at all.
+
+	w.set(1, func(p *pathMetric) { p.bound = false })
+	w.tick(w.c.PromoteIntervals + 5)
+	w.set(1, func(p *pathMetric) { p.bound = true })
+
+	d := w.tick(w.c.PromoteIntervals + w.c.SwitchHoldIntervals + 10)
+	if d.primary != 0 {
+		t.Errorf("primary moved to path %d on an unmeasured capacity (%s)", d.primary, d.reason)
+	}
+}
