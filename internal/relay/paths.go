@@ -25,10 +25,29 @@ import (
 // keeps running with none of its links present, because the alternative -
 // exiting - is the one state from which nothing can recover.
 
-// rebindInterval is how often the configured links are re-examined for
-// appearance, disappearance and address changes. Fast enough that a modem
-// finishing registration is picked up promptly, slow enough to be free.
+// rebindInterval is the backstop sweep, not the primary mechanism. Link and
+// address changes arrive as netlink events and are acted on immediately;
+// see linkwatch.go and D-029. This exists for what events cannot cover: a
+// kernel without netlink, a subscription that failed at startup, a lost
+// multicast message, and any change that alters nothing about the
+// interface itself - a route withdrawn while the address stays put.
+//
+// It is deliberately no slower than it used to be. Making it lazier on the
+// strength of events arriving would trade away the one path that still
+// works when the fast one does not.
 const rebindInterval = 2 * time.Second
+
+// settleInterval is how soon to look again while something is still
+// converging - an interface that exists but is not up, is up but has no
+// address yet, or refused a bind a moment ago.
+//
+// All three are ordinary and transient. A modem finishing registration
+// walks through every one of them, and the events announcing each step can
+// land while a reconcile is already running, so the reconcile that follows
+// sees a half-built interface and the one that would have seen it finished
+// never gets asked for. Waiting out the full sweep for that is the same
+// latency D-029 is about, arriving by a different route.
+const settleInterval = 100 * time.Millisecond
 
 // pathSpec is one configured WAN link. The address is deliberately not
 // part of it unless pinned: the address is the thing that changes.
@@ -60,6 +79,12 @@ type pathSet struct {
 	onData  func(id uint8, buf []byte)
 	dialing *net.UDPAddr // where every path sends
 
+	// wake asks for an immediate reconcile. Netlink events feed it, and so
+	// does a write failure: a path whose route has gone while its address
+	// remains produces no link event at all, and waiting out the backstop
+	// sweep to notice is the latency D-029 is about.
+	wake chan struct{}
+
 	mu    sync.RWMutex
 	bound map[uint8]*boundPath
 }
@@ -70,23 +95,76 @@ func newPathSet(specs []pathSpec, sess *session, remote *net.UDPAddr, onData fun
 		sess:    sess,
 		onData:  onData,
 		dialing: remote,
+		wake:    make(chan struct{}, 1),
 		bound:   make(map[uint8]*boundPath),
 	}
 }
 
 // run reconciles the sockets against reality forever. It returns only if
 // the reconcile loop itself is stopped, which it never is.
+//
+// Three things drive a reconcile: a netlink event, which is how a link
+// appearing or vanishing is normally noticed and is what makes that
+// prompt; a poke from the data path when a write fails; and a periodic
+// sweep that catches whatever the first two miss.
 func (ps *pathSet) run() {
 	ps.reconcile() // once immediately, so a link already present is not waited on
-	for range time.Tick(rebindInterval) {
-		ps.reconcile()
+
+	var events <-chan struct{}
+	if w, err := watchLinks(); err != nil {
+		// Not fatal. The daemon reacts on the sweep instead, which is
+		// how it behaved before events existed - slower, and working.
+		log.Printf("paths: link events unavailable (%v); reconciling every %s instead", err, rebindInterval)
+	} else {
+		defer w.Stop()
+		events = w.C()
+	}
+
+	// A timer rather than a ticker, because the delay is not constant: a
+	// settled set of paths is swept lazily, while anything mid-transition
+	// is looked at again almost immediately.
+	timer := time.NewTimer(rebindInterval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-events: // nil when unavailable, which blocks forever and is correct
+		case <-ps.wake:
+		case <-timer.C:
+		}
+
+		delay := rebindInterval
+		if ps.reconcile() {
+			delay = settleInterval
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(delay)
+	}
+}
+
+// poke asks for a reconcile without waiting for the next sweep. It never
+// blocks: a pending wakeup already covers whatever this caller noticed.
+func (ps *pathSet) poke() {
+	select {
+	case ps.wake <- struct{}{}:
+	default:
 	}
 }
 
 // reconcile brings every configured path into line with the address its
 // interface currently has, binding what appeared, dropping what vanished
 // and rebinding what moved.
-func (ps *pathSet) reconcile() {
+//
+// It reports whether anything is still converging: a path left unbound
+// while its interface exists is expected to become bindable shortly, and
+// the caller looks again sooner rather than waiting out the sweep. A path
+// whose interface is simply absent is not pending - that is a link in a
+// dead zone, and polling harder does not bring it back.
+func (ps *pathSet) reconcile() (pending bool) {
 	for _, spec := range ps.specs {
 		want, err := spec.localIP()
 
@@ -102,8 +180,17 @@ func (ps *pathSet) reconcile() {
 			if have != nil {
 				ps.drop(spec, fmt.Sprintf("%v", err))
 			}
+			if _, e := net.InterfaceByName(spec.name); e == nil {
+				pending = true // present but not ready yet
+			}
 		case have == nil:
 			ps.bind(spec, want)
+			ps.mu.RLock()
+			bound := ps.bound[spec.id] != nil
+			ps.mu.RUnlock()
+			if !bound {
+				pending = true // the bind was refused; try again shortly
+			}
 		case have.local != want:
 			// The lease moved under us. The old socket is bound to an
 			// address that no longer exists and will never deliver
@@ -113,6 +200,7 @@ func (ps *pathSet) reconcile() {
 			ps.bind(spec, want)
 		}
 	}
+	return pending
 }
 
 // localIP reports the address this path should currently bind to, or an
@@ -255,6 +343,9 @@ func (ps *pathSet) send(id uint8, pkt []byte) {
 		// delivering nothing. Nothing here can do better than say so once.
 		if bp.failing.CompareAndSwap(false, true) {
 			log.Printf("path %d: write failed, suppressing until it recovers: %v", id, err)
+			// Only on the transition, so a path failing every write asks
+			// once rather than continuously.
+			ps.poke()
 		}
 	}
 }

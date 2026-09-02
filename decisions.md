@@ -435,12 +435,53 @@ losing power. Gradual degradation, which is the canyon case and the more common 
 caught by quality scoring within a couple of evaluation intervals and is not affected.
 So this is one failure mode arriving late, not all of them.
 
-**Fix direction.** Link state is an event, not a thing to poll: netlink reports
-`RTM_NEWLINK`/`RTM_DELLINK` as it happens. D-020 already owes "recovering the bind/rebind
-visibility by reading interface state", and this is the same work seen from the other side
-- doing it properly makes both the visibility and the detection latency fall out. A
-cheaper partial step is to let a write failure mark a path suspect immediately rather than
-leaving it to the next reconcile.
+**Fixed** (2026-09-02) in `internal/relay/linkwatch.go`, with measurements below.
+
+Link state is an event, not a thing to poll. A netlink socket subscribed to `RTMGRP_LINK`
+and `RTMGRP_IPV4_IFADDR` wakes the existing reconcile as interfaces and addresses change.
+Addresses matter as much as links: a lease renewal under CGNAT moves a path's source
+address without the interface ever going down.
+
+Three things now drive a reconcile - a netlink event, a poke from the data path when a
+write fails, and the old periodic sweep. The sweep is kept at two seconds rather than
+relaxed, because it is what still works when events do not, and making it lazier on the
+strength of the fast path would trade away the fallback. This is deliberately a
+notification only: it carries no detail and the message body is not parsed, so reconcile
+remains the single place that decides what a path should do rather than there being two
+interpretations of link state to keep in agreement.
+
+The write-failure poke covers what events cannot see at all - a route withdrawn while the
+address stays put, which is an attached modem with no PDP context and an ordinary dead-zone
+state. It fires only on the transition into failure, so a path failing every write asks
+once rather than continuously.
+
+**A second latency, found while testing the first.** Events made link *removal* prompt
+immediately, but a link *appearing* still took a full sweep about one run in five. An
+interface is built in steps - created, then addressed, then brought up - and each step is
+its own event. A reconcile woken by the first sees a half-built interface, finds nothing
+bindable, and the wakeup that would have caught it finished has already been coalesced
+away. The same shape covers a bind refused a moment too early, and a modem sitting up
+with no address while DHCP finishes.
+
+So reconcile now reports whether anything is still converging, and the loop looks again in
+100 ms when it is. The distinction that matters is "not ready yet" against "not there":
+an interface that exists but cannot be bound is worth retrying hard, while one that is
+simply absent is a link in a dead zone, where polling at 100 ms for hours would cost power
+on a box running off a battery to discover nothing. Only the first is pending.
+
+**Measured after the fix**, against a 2 s sweep, over eight consecutive runs: a link
+disappearing is acted on in **5.5-6 ms**, and a link appearing in **11-14 ms**. Both were
+previously bounded by the sweep, and the interface-down case cost roughly 3 s in the
+field. That is now comfortably inside protocol.md's 100-200 ms target with two orders of
+magnitude to spare.
+
+If the netlink subscription fails at startup the daemon logs it and carries on with the
+sweep alone, which is exactly how it behaved before events existed. Principle 5: slower,
+and working.
+
+Verified on the RV itself as well as in the sandbox - `6.12.107+deb13-cloud-amd64`, the
+kernel flavour that ships without most physical-NIC drivers - at 11.96 ms to bind and
+15.40 ms to drop.
 
 **Still owed by the code:** recovering the bind/rebind visibility D-020 costs by reading
 interface state, and making the TUN MTU track the daemon's own recommendation rather than
