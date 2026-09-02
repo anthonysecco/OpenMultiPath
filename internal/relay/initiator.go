@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"sync/atomic"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
@@ -38,6 +37,11 @@ type InitiatorConfig struct {
 	// AuthKey authenticates the wire header. Empty runs unauthenticated,
 	// which is the current default; see relay.LoadAuthKey.
 	AuthKey []byte
+
+	// Tun runs D-020's data path - above WireGuard, reading plaintext
+	// inner packets - when its Name is set. Empty keeps the loopback
+	// relay, which is the default and the way back.
+	Tun TunConfig
 }
 
 // RunInitiator relays between a local WireGuard interface and the home
@@ -53,24 +57,17 @@ func RunInitiator(cfg InitiatorConfig) error {
 		return fmt.Errorf("relay: initiator needs at least one path")
 	}
 
-	wgAddr, err := net.ResolveUDPAddr("udp", cfg.LoopbackAddr)
+	local, err := newInitiatorEndpoint(cfg)
 	if err != nil {
-		return fmt.Errorf("relay: resolve loopback addr: %w", err)
+		return err
 	}
-	wgConn, err := net.ListenUDP("udp", wgAddr)
-	if err != nil {
-		return fmt.Errorf("relay: listen on loopback: %w", err)
-	}
-	defer wgConn.Close()
+	defer local.Close()
+	log.Printf("initiator: local endpoint is %s", local.describe())
 
 	remoteAddr, err := net.ResolveUDPAddr("udp", cfg.RemoteAddr)
 	if err != nil {
 		return fmt.Errorf("relay: resolve remote addr: %w", err)
 	}
-
-	// The address the local WireGuard peer sends from, learned from its
-	// first outbound packet, and where inbound replies get delivered.
-	var wgPeer atomic.Pointer[net.UDPAddr]
 
 	sess := newSession(cfg.Settings, cfg.Node, roleInitiator)
 	sess.setAuthKey(cfg.AuthKey)
@@ -119,12 +116,8 @@ func RunInitiator(cfg InitiatorConfig) error {
 		if h.Type != protocol.TypeData {
 			return
 		}
-		peer := wgPeer.Load()
-		if peer == nil {
-			return // haven't heard from local WireGuard yet
-		}
-		if _, err := wgConn.WriteToUDP(payload, peer); err != nil {
-			log.Printf("initiator: write to wireguard failed: %v", err)
+		if err := local.write(payload); err != nil {
+			log.Printf("initiator: write to local endpoint failed: %v", err)
 		}
 	})
 	go paths.run()
@@ -139,15 +132,14 @@ func RunInitiator(cfg InitiatorConfig) error {
 	sess.sched = sched
 	go sched.run()
 
-	// WireGuard -> whichever paths the scheduler has chosen. The global
+	// Local endpoint -> whichever paths the scheduler has chosen. The global
 	// sequence is allocated once here, before any copies are made, so
 	// every copy of a packet is recognisable as the same packet at the far
 	// end. readLoop calls this from a single goroutine, so one scratch
 	// buffer serves every copy: each is written out before the next is
 	// built.
 	scratch := make([]byte, 0, bufSize+maxHeaderLen)
-	go readLoop(wgConn, "initiator-wg", func(payload []byte, from *net.UDPAddr) {
-		wgPeer.Store(from)
+	go local.readPayloads("initiator-local", func(payload []byte) {
 		globalSeq := sess.nextGlobalSeq()
 
 		// Before the first evaluation the scheduler has no opinion, so

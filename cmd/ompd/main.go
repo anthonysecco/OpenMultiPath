@@ -1,7 +1,13 @@
 // Command ompd is the OpenMultiPath transport daemon. It carries traffic
 // over every WAN link that is currently up, measures each one
-// continuously, and records what it sees. Path selection is the next step
-// and is not written yet: duplication is still unconditional.
+// continuously, and records what it sees.
+//
+// It runs in one of two shapes. By default it sits below WireGuard,
+// relaying already-encrypted packets from a loopback socket - the shape it
+// was built with. Given -tun it sits above WireGuard instead, reading
+// plaintext inner packets from a TUN device, which is what D-020 requires
+// for classification to be possible at all. Both are kept so the move is
+// reversible by restarting without the flag.
 package main
 
 import (
@@ -37,6 +43,20 @@ func main() {
 	wgInterface := flag.String("wg-interface", "wg0", "tunnel interface, read for its current MTU")
 	node := flag.String("node", hostname(), "this box's name, shown in the web interface")
 	authKeyPath := flag.String("auth-key", "/etc/openmultipath/auth.key", "file holding the shared secret that authenticates the wire header; absent means unauthenticated")
+
+	// D-020's data path, off by default. Naming a device moves the daemon
+	// above WireGuard: it reads plaintext inner packets from the TUN
+	// instead of ciphertext from WireGuard's loopback, which is what makes
+	// classification possible at all. Leaving it empty keeps the loopback
+	// relay the daemon was built with.
+	//
+	// Both shapes are kept deliberately. This is a flag day on a vehicle
+	// that may be 800 miles away, and principle 5 wants the way back to be
+	// one flag rather than a recovery trip - so the switch is a restart
+	// with an argument removed, not a rollback to an older build.
+	tunName := flag.String("tun", "", "D-020: run above WireGuard on this TUN device, e.g. omp0; empty keeps the loopback relay")
+	tunAddr := flag.String("tun-addr", "", "tunnel address for -tun, in CIDR form, e.g. 10.30.0.2/24")
+	tunMTU := flag.Int("tun-mtu", 1300, "MTU for -tun; must leave room for the wire header, UDP, IP and WireGuard inside the path MTU")
 	flag.Parse()
 
 	// A missing settings file is the normal case: every value has a
@@ -74,6 +94,7 @@ func main() {
 			WGInterface:  *wgInterface,
 			Settings:     holder,
 			AuthKey:      authKey,
+			Tun:          relay.TunConfig{Name: *tunName, Addr: *tunAddr, MTU: *tunMTU},
 		}
 		if err := relay.RunInitiator(cfg); err != nil {
 			log.Fatal(err)
@@ -88,6 +109,7 @@ func main() {
 			WGInterface:    *wgInterface,
 			Settings:       holder,
 			AuthKey:        authKey,
+			Tun:            relay.TunConfig{Name: *tunName, Addr: *tunAddr, MTU: *tunMTU},
 		}
 		if err := relay.RunResponder(cfg); err != nil {
 			log.Fatal(err)

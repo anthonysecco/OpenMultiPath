@@ -306,12 +306,31 @@ report for 224.0.0.22 arrives on a freshly created device before any routed traf
 Nothing to fix there, but a consumer that assumed every packet was routed user traffic
 would be wrong from the first read.
 
-**Still to build:** the data path itself - reading the TUN in place of the WireGuard
-loopback, one WireGuard interface per link with its own keypair and fwmark, one peer per
-link at home, and recovering the bind/rebind visibility this costs by reading interface
-state. That is the flag day, and principle 5 says it wants to land alongside the existing
-relay rather than replacing it outright, so a bad update from 800 miles away is one flag
-back rather than an unreachable vehicle.
+**Data path built** (2026-09-02), behind `-tun`, alongside the loopback relay rather than
+replacing it. Naming a device runs above WireGuard; omitting the flag runs the original
+shape. Same binary either way, so the way back from a bad update 800 miles away is a
+restart with an argument removed rather than a recovery trip - principle 5.
+
+The rewrite turned out to be much smaller than "data-path rewrite" suggested, because
+`pathSet` was already generic. It binds a UDP socket to an interface's IPv4 address with
+`SO_BINDTODEVICE` and sends to one shared remote; nothing in it assumes a *physical* NIC.
+So pointing `-paths` at `wg1,wg2` and `-remote` at home's tunnel address makes the whole
+path layer work unchanged, with WireGuard's own fwmark doing the per-link pinning. The
+only real change was the local endpoint - a seam named `localEndpoint` with two
+implementations, loopback and TUN - and everything between them (header, sequencing,
+measurement, scoring, scheduling) is untouched and does not know which is in use.
+
+**Proven end to end** in two network namespaces joined by a veth pair: a packet routed
+into the RV's TUN crossed the tunnel and came out of home's TUN 103 us later with its
+source intact, and home's reply came back the other way 57 us after that. Both daemons
+logged no errors.
+
+**Not yet proven, and the honest gap:** the veth stood in for the WAN, so this has not run
+over real per-link WireGuard interfaces. What remains is provisioning - `wg1`/`wg2` on the
+RV with their own keypairs and fwmarks, one peer per link at home - plus two things the
+code still owes: recovering the bind/rebind visibility this costs by reading interface
+state, and making the TUN MTU track the daemon's own recommendation instead of a flag
+default.
 
 ---
 
