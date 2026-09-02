@@ -572,6 +572,35 @@ v6 at the home end plus a change to the provisioning bundle. Revisit when either
 provisioning flow is being touched anyway or something the RV needs turns out to be
 v6-only.
 
+**Implemented** (2026-09-02) on the RV, in `/etc/netplan/60-wan-i226.yaml`, as two
+settings on each WAN interface:
+
+```yaml
+      accept-ra: false
+      link-local: []
+```
+
+which netplan renders as `IPv6AcceptRA=no` and `LinkLocalAddressing=no`. After this the
+WAN interfaces carry no IPv6 at all - no global address, no link-local, no default route
+- so a v6 connect fails with `ENETUNREACH` in about a millisecond and Happy Eyeballs
+falls back to v4 with nothing perceptible. `eth0` is untouched and keeps its link-local;
+`net.ipv6.conf.all.forwarding` is 0, so the LAN has no v6 path through the box either.
+
+**The trap, for whoever checks this next.** `net.ipv6.conf.enp1s0.accept_ra` was *already*
+0 before the fix, and the leak was wide open anyway. That sysctl is not the control here:
+systemd-networkd sets it to 0 precisely because it does RA processing itself, in
+userspace, and then installs what it learns - which is why the leaked routes read
+`proto ra` and the addresses read `noprefixroute mngtmpaddr`. Reading the sysctl and
+concluding IPv6 was already handled is the obvious wrong turn, and setting it by hand in
+`/etc/sysctl.d` would change nothing at all. The control is networkd's configuration.
+
+Two related things worth knowing. The leaked addresses were `valid_lft forever`, so they
+would never have aged out on their own; `netplan apply` removed them, no manual flush was
+needed. And the symptom that started this was measured again on the way in: before the
+fix, `curl -6` egressed from `2600:380:8769:9ad9::...` straight out `enp2s0`, while after
+it, google.com, cloudflare.com and netflix.com all resolve dual-stack and all leave from
+`10.20.0.2` - through the tunnel, where they can be measured.
+
 **Note.** IPv6 appeared nowhere in these documents before this entry. It was not a
 decision that went wrong; it was one nobody had made.
 
@@ -617,3 +646,47 @@ download. Both together is what protocol.md claims separates RTP from QUIC "almo
 perfectly", and a replay of real captured traffic agrees: of 21.3 MB captured off the
 tunnel interface, 0.27% came out real-time, and that 0.27% was the metronomic test
 stream.
+
+---
+
+## D-028 · The multi-stream tunnel throughput ceiling is deferred, not accepted
+
+**Decision.** Bulk throughput through the tunnel degrades as concurrent flows rise. It is
+recorded here with its measurements and left alone for now.
+
+**Measured** (2026-09-02, RV to Cloudflare, `enp2s0` carrying the tunnel, home uplink
+measured separately at 364 Mbps so it is not the constraint):
+
+| Concurrency | Tunnel | Direct | Cost |
+|---|---|---|---|
+| 1 stream | 104.4 Mbps | 108.1 Mbps | 3% |
+| 6 streams | 81 Mbps | 122 Mbps | 34% |
+| Ookla speedtest | 44 Mbps | 128 Mbps | 65% |
+
+Upload is much cheaper than download: 72.8 against 82.4 Mbps, 12%. Idle latency costs
+about 5 ms. `ompd` used 7% of one core while carrying 104 Mbps, so this is not crypto and
+not raw compute.
+
+**What it is not.** Not the home uplink, not CPU, and not the IPv6 leak of D-026, which
+was fixed first and separately. Single-stream cost of 3% says the data path is sound; the
+penalty appears only with concurrency, which points at a per-packet or serialisation
+ceiling - the initiator reads the WireGuard loopback from one goroutine and allocates the
+global sequence there. That is a hypothesis. It has not been profiled and should not be
+repeated as fact.
+
+**Why defer.** Two reasons. The first is that the same comparison shows the tunnel is
+*better* where this project says it cares: 92 ms of loaded latency with 19 ms jitter
+against 318 ms and 69 ms jitter going direct, about 3.5x. Bulk peak throughput is
+explicitly sacrificial (`scope-v1.md`), conferencing quality is not, and some of the
+missing throughput is the tunnel declining to fill the modem's queue - which is the
+behaviour admission control is being built to produce deliberately.
+
+The second is sequencing. D-020 rewrites this exact data path: the daemon moves above
+WireGuard onto a TUN device and the loopback relay goroutine that is the leading suspect
+stops existing in its current form. Profiling a component scheduled for replacement, to
+fix a symptom that partly overlaps with what step 9 will address on purpose, is work
+done twice.
+
+**Revisit** after D-020 lands and step 9 is in, by re-running the table above. If the
+concurrency penalty survives both, it is real and structural rather than incidental, and
+that is the point to profile it properly.
