@@ -288,8 +288,30 @@ the daemon's own bind/rebind visibility (it currently distinguishes "bound but s
 "not bound", which wants recovering by reading interface state).
 
 **Note.** Supersedes the single-tunnel relay shape the daemon was built with, and restores
-what `CLAUDE.md` and `architecture.md` always described. Not yet implemented: step 6 was
-built first, and is independent of this.
+what `CLAUDE.md` and `architecture.md` always described.
+
+**In progress** (2026-09-02). The RV already carries the routing half of this: `ip rule`
+sends fwmark `0x2001` to table 2001 and `0x2002` to table 2002, whose default routes are
+`enp2s0` and `enp1s0` respectively, which is exactly the per-link pinning above. What was
+missing entirely was any way to read a plaintext packet, so `internal/tun` was built
+first: it opens the device, addresses and sizes it, brings it up, and hands back one raw
+IP packet per read. Verified on the RV itself, not only in a build sandbox.
+
+Two things surfaced there that the rewrite has to account for, and both are now handled or
+recorded. The kernel autoconfigures an IPv6 link-local address on any device the moment it
+comes up and starts emitting router solicitations, which the daemon would have read back
+out of its own tunnel as inner packets to classify - so the device disables IPv6 before
+going up, per D-026. And the kernel emits IPv4 housekeeping regardless: an IGMP membership
+report for 224.0.0.22 arrives on a freshly created device before any routed traffic does.
+Nothing to fix there, but a consumer that assumed every packet was routed user traffic
+would be wrong from the first read.
+
+**Still to build:** the data path itself - reading the TUN in place of the WireGuard
+loopback, one WireGuard interface per link with its own keypair and fwmark, one peer per
+link at home, and recovering the bind/rebind visibility this costs by reading interface
+state. That is the flag day, and principle 5 says it wants to land alongside the existing
+relay rather than replacing it outright, so a bad update from 800 miles away is one flag
+back rather than an unreachable vehicle.
 
 ---
 
