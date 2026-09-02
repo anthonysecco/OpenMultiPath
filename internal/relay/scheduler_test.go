@@ -588,3 +588,97 @@ func TestUnmeasuredCapacityDoesNotMovePrimary(t *testing.T) {
 		t.Errorf("primary moved to path %d on an unmeasured capacity (%s)", d.primary, d.reason)
 	}
 }
+
+// The failure that motivated step 6c, reproduced.
+//
+// A download saturates path 1's DOWNLINK. Every statistic this node can
+// gather locally is measured on arriving packets, so all of them show path 1
+// collapsing: the round trip balloons, inbound spread and queue delay go
+// with it. Path 1's UPLINK is untouched and idle throughout.
+//
+// Scored on inbound evidence the flow gets evacuated onto path 0 - which on
+// the vehicle is a 512 kbps standby link - and upload falls to 0.45 Mbps.
+// Scored on what the peer reports about our send direction, nothing has
+// happened and the flow stays put.
+func TestInboundCongestionDoesNotMoveTheOutboundFlow(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 30))
+
+	// Both ends are reporting, and both send directions are clean.
+	clean := func(p *pathMetric) {
+		p.haveTx, p.rttFloorMs = true, 30
+		p.txSpreadMs, p.txQueueMs, p.txLoss, p.txBurstRatio = 2, 1, 0, 1
+	}
+	w.set(0, clean)
+	w.set(1, clean)
+	w.tick(w.c.PromoteIntervals + 5)
+
+	if d := w.s.current(); d.primary != 0 && d.primary != 1 {
+		t.Fatalf("no primary settled: %+v", d)
+	}
+	started := w.s.current().primary
+
+	// The download lands. Path 1's inbound numbers fall apart - 756 ms of
+	// loaded latency was what the field measured - while its send direction,
+	// which the peer is still reporting on, stays clean.
+	w.set(1, func(p *pathMetric) {
+		p.rttMs = 760
+		p.p95SpreadMs = 700
+		p.queueDelayMs = 700
+		p.recentLoss = 12
+		p.burstRatio = 4
+	})
+	d := w.tick(w.c.SwitchHoldIntervals + 20)
+
+	if d.primary != started {
+		t.Errorf("inbound congestion moved the outbound flow from path %d to path %d (%s)",
+			started, d.primary, d.reason)
+	}
+}
+
+// The converse, which is the whole point of measuring the right direction:
+// when the peer says our SEND direction on the primary has fallen apart,
+// the flow does move - even though everything measured locally looks fine.
+func TestOutboundDegradationMovesTheFlow(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 30))
+	clean := func(p *pathMetric) {
+		p.haveTx, p.rttFloorMs = true, 30
+		p.txSpreadMs, p.txQueueMs, p.txLoss, p.txBurstRatio = 2, 1, 0, 1
+	}
+	w.set(0, clean)
+	w.set(1, clean)
+
+	w.set(1, func(p *pathMetric) { p.bound = false })
+	w.tick(w.c.PromoteIntervals + 5)
+	w.set(1, func(p *pathMetric) { p.bound = true })
+	w.tick(w.c.PromoteIntervals + 2)
+	if d := w.s.current(); d.primary != 0 {
+		t.Fatalf("primary is path %d, want path 0 to start", d.primary)
+	}
+
+	// Locally path 0 still looks perfect. The peer says otherwise.
+	w.set(0, func(p *pathMetric) {
+		p.txSpreadMs, p.txQueueMs = 400, 380
+		p.txLoss, p.txBurstRatio = 20, 5
+	})
+	d := w.tick(w.c.SwitchHoldIntervals + 20)
+
+	if d.primary != 1 {
+		t.Errorf("primary stayed on path %d despite the peer reporting it unusable outbound (%s)",
+			d.primary, d.reason)
+	}
+}
+
+// Without a report there is nothing to score on but the round trip, which
+// is what every build before this did. It has to keep working: an old peer,
+// or a path the far end has not heard from, must not become unschedulable.
+func TestFallsBackToRoundTripWithoutAReport(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 90))
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	if !d.havePrimary {
+		t.Fatal("no primary chosen with no path reports available")
+	}
+	if d.primary != 0 {
+		t.Errorf("primary is path %d, want the lower-latency path 0 on round-trip scoring", d.primary)
+	}
+}

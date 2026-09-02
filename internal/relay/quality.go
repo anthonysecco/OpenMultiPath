@@ -1,6 +1,10 @@
 package relay
 
-import "math"
+import (
+	"math"
+
+	"github.com/anthonysecco/OpenMultiPath/internal/config"
+)
 
 // Path scoring, as a composite rather than a weighted sum of raw metrics.
 //
@@ -113,6 +117,31 @@ func effectiveDelayMs(rttMs, p95SpreadMs, baseMs float64) float64 {
 	return baseMs + rttMs/2 + p95SpreadMs
 }
 
+// outboundDelayMs estimates the one-way delay in the direction we send,
+// which is the direction the scheduler is actually deciding about.
+//
+// Absolute one-way delay cannot be measured without synchronised clocks,
+// and this project deliberately has none. So the delay is split in two:
+//
+//	outbound  ~=  rttFloor/2  +  what the peer says it is queueing
+//	              ^^^^^^^^^^     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//	              symmetric      measured, in the right direction,
+//	              assumption     against the peer's own floor so the
+//	                             clock offset cancels
+//
+// The floor is used rather than the live round trip on purpose. An
+// instantaneous round trip contains queueing from *both* directions, and
+// letting inbound congestion into an outbound decision is exactly the bug
+// this replaces: a download saturating a path's downlink drove the flow off
+// that path's healthy uplink and onto a 512 kbps standby link.
+//
+// The symmetric half remains an assumption, and a wrong one on some links -
+// but it is the *stable* half. Base delay does not move much, while the
+// queueing does, and the queueing is now measured on the correct side.
+func outboundDelayMs(rttFloorMs, txSpreadMs, baseMs float64) float64 {
+	return baseMs + rttFloorMs/2 + txSpreadMs
+}
+
 func clampFloat(v, lo, hi float64) float64 {
 	switch {
 	case v < lo:
@@ -121,4 +150,31 @@ func clampFloat(v, lo, hi float64) float64 {
 		return hi
 	}
 	return v
+}
+
+// scoreInputs picks which direction's measurements a path is judged on.
+//
+// The scheduler decides where to *send*, so it wants the send direction.
+// Every statistic a node gathers locally describes packets arriving, which
+// is the other one - hence the path reports of D-024, where each end tells
+// the other what it observed. When a report is in hand it wins outright.
+//
+// Without one, this falls back to exactly the old behaviour: half a round
+// trip and the inbound statistics. That is the wrong direction and known to
+// be, but it is what a lone node can see, and an old peer or a path nobody
+// has been heard from still has to be scored somehow. Principle 5.
+func scoreInputs(p pathMetric, c config.Config) (delayMs, lossPercent, burstRatio float64) {
+	if p.haveTx {
+		return outboundDelayMs(p.rttFloorMs, p.txSpreadMs, float64(c.BaseDelayMs)),
+			p.txLoss, p.txBurstRatio
+	}
+	return effectiveDelayMs(p.rttMs, p.p95SpreadMs, float64(c.BaseDelayMs)),
+		p.recentLoss, p.burstRatio
+}
+
+// scoringDelayMs is the delay half of scoreInputs, for the ranking
+// tie-break and for display.
+func scoringDelayMs(p pathMetric, c config.Config) float64 {
+	d, _, _ := scoreInputs(p, c)
+	return d
 }

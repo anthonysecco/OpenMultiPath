@@ -195,7 +195,7 @@ func (s *scheduler) evaluate(now time.Duration, c config.Config) {
 			m:       p,
 			mach:    mach,
 			score:   mach.score(now, p, c),
-			delayMs: effectiveDelayMs(p.rttMs, p.p95SpreadMs, float64(c.BaseDelayMs)),
+			delayMs: scoringDelayMs(p, c),
 		})
 	}
 
@@ -226,7 +226,7 @@ func (s *scheduler) evaluate(now time.Duration, c config.Config) {
 			State:       sc.mach.state.String(),
 			Reason:      sc.mach.reason,
 			Score:       sc.score,
-			RFactor:     rFactor(effectiveDelayMs(sc.m.rttMs, sc.m.p95SpreadMs, float64(c.BaseDelayMs)), sc.m.recentLoss, sc.m.burstRatio),
+			RFactor:     rFactor(scoreInputs(sc.m, c)),
 			MOS:         mosFrom(sc.score),
 			Flapping:    sc.mach.flapping(now, c),
 			Transitions: len(sc.mach.transitions),

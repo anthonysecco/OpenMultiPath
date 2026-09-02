@@ -101,6 +101,48 @@ uplink with a clean downlink is common on cellular.
 - **One report covers all paths at once**, so the sender gets a consistent snapshot
   rather than measurements from slightly different moments.
 
+### Path reports: telling the peer about its own send direction
+
+The echo channel above yields a round trip, and a round trip cannot say which direction
+the delay was in. Everything else a node measures — spread, jitter, queue delay, loss,
+burst distribution — is taken from packets *arriving*. So a node choosing which path to
+**transmit** on has only inbound evidence to choose from, which is the wrong direction
+and, on 2026-09-01, sent a live upload onto a 512 kbps standby link because a download
+had congested the chosen path's downlink.
+
+The measurement already exists; it is simply on the other box. Each end therefore reports
+back, once a second per path, what it observed on the peer's transmissions:
+
+    p95 spread, queue delay, jitter — tenths of a millisecond, above that path's own floor
+    recent loss — parts per thousand
+    burst ratio — tenths
+
+Ten bytes per path. These ride only on standalone reports, never on data, so a data
+packet's header does not have to be budgeted for them.
+
+**No clock sync is needed, and none would help.** Every figure is a difference against
+the reporting path's own floor, so the unknown offset between the two clocks cancels
+exactly as it does for queue delay. Absolute one-way delay would need synchronisation and
+is not what the decision turns on; the delay used for scoring is instead
+
+    outbound ≈ rttFloor/2 + reported queue delay
+
+— the round-trip **floor**, not the live round trip, because the live figure contains
+queueing from both directions and that is precisely the contamination being removed. The
+symmetric half is an assumption and a wrong one on some links, but it is the stable half.
+The part that moves is measured on the correct side.
+
+A node with no report in hand falls back to half a round trip and its inbound statistics,
+which is what every build before wire version 2 did. See D-024.
+
+### Header authentication
+
+Once path reports feed path selection, an injected packet can steer the vehicle's
+traffic. Version 2 headers carry an 8-byte truncated HMAC-SHA256 over the header when a
+shared key is configured, read from a file rather than the settings the web interface
+serves. It does not protect the payload — WireGuard does that — only the metadata. See
+D-025.
+
 ## Path state machine
 
 Three states with hysteresis. Without hysteresis this flaps constantly.

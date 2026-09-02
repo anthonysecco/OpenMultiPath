@@ -23,7 +23,7 @@ func TestProbeIsPaddedToTheSizeUnderTest(t *testing.T) {
 		t.Errorf("probe is %d bytes on the wire, want %d", len(pkt), want)
 	}
 
-	h, _, err := protocol.Parse(pkt)
+	h, _, _, err := protocol.Parse(pkt, nil)
 	if err != nil {
 		t.Fatalf("probe does not parse: %v", err)
 	}
@@ -114,10 +114,10 @@ func TestRecommendedMTUTakesTheSmallestPath(t *testing.T) {
 
 	s.mu.Lock()
 	s.paths[0].mtu.confirmed = 1500
-	s.paths[1].mtu.confirmed = 1400
+	s.paths[1].mtu.confirmed = 1440
 	s.mu.Unlock()
 
-	want := 1400 - ipUDPOverhead - protocol.MaxHeaderLen - wireGuardOverhead
+	want := 1440 - ipUDPOverhead - protocol.MaxDataHeaderLen - wireGuardOverhead
 	if got := s.recommendedTunnelMTU(); got != want {
 		t.Errorf("recommended mtu = %d, want %d from the smaller path", got, want)
 	}
@@ -137,7 +137,7 @@ func TestUnusablePathIsExcludedNotClamped(t *testing.T) {
 	s.paths[1].mtu.ceiling = minUsablePathMTU
 	s.mu.Unlock()
 
-	want := 1500 - ipUDPOverhead - protocol.MaxHeaderLen - wireGuardOverhead
+	want := 1500 - ipUDPOverhead - protocol.MaxDataHeaderLen - wireGuardOverhead
 	if got := s.recommendedTunnelMTU(); got != want {
 		t.Errorf("recommended mtu = %d, want %d from the one usable path", got, want)
 	}
@@ -175,7 +175,7 @@ func TestLadderStartsAtAUsableSize(t *testing.T) {
 		t.Errorf("ladder starts at %d, below the %d needed to carry the floor",
 			mtuLadder[0], minUsablePathMTU)
 	}
-	inner := mtuLadder[0] - ipUDPOverhead - protocol.MaxHeaderLen - wireGuardOverhead
+	inner := mtuLadder[0] - ipUDPOverhead - protocol.MaxDataHeaderLen - wireGuardOverhead
 	if inner < minTunnelMTU {
 		t.Errorf("smallest rung yields a %d byte tunnel, below the %d floor", inner, minTunnelMTU)
 	}
@@ -210,7 +210,7 @@ func TestStandaloneReportsOnlyWhenIdle(t *testing.T) {
 	}
 
 	report := s.buildReport(0, nil)
-	h, payload, err := protocol.Parse(report)
+	h, payload, _, err := protocol.Parse(report, nil)
 	if err != nil {
 		t.Fatalf("report does not parse: %v", err)
 	}

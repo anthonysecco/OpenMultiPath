@@ -6,10 +6,12 @@
 - Userspace multipath daemon with the header from `protocol.md`
 - Passive measurement from data packets; active probes scaled inversely to path traffic
 - Queue delay inferred from delay above rolling minimum (no clock sync required)
-- Reactive per-path bandwidth ceiling from queueing onset during real traffic - taken
-  from the round trip above its own floor, less the receive-side queue delay, so a
-  saturated downlink is not mistaken for a full uplink. No active bandwidth probes; gates
-  duplication targets and primary handovers, never a hard veto (see D-023)
+- Reactive per-path bandwidth ceiling from queueing onset during real traffic, taken from
+  the peer's reported queue delay in our send direction. No active bandwidth probes; gates
+  duplication targets and primary handovers, never a hard veto (see D-023, D-024)
+- Per-path reports in both directions, so each end scores its own *send* direction from
+  what the peer measured rather than from half a round trip (see D-024)
+- Authenticated wire header, keyed from a file, once a shared secret is provisioned (D-025)
 - Three-state path machine with asymmetric hysteresis and flap penalty
 - Real-time class: single path, duplication, make-before-break, heavy stickiness
 - Bulk class: **single best path** for v1 (multipath deferred, see below)
@@ -39,6 +41,7 @@ traffic only when the fast one is saturated or down.
 
 ## Explicitly out of scope
 
+- IPv6 (D-026) - dropped on the WAN rather than carried in the tunnel, for now
 - FEC (D-007)
 - Off-the-shelf link bonding: MPTCP, glorytun, OpenMPTCProuter (D-008)
 - Split tunneling (D-004)
@@ -70,6 +73,9 @@ of reasoning up front.
     probes. Feeds duplication-target and handover eligibility ahead of classification, and
     ahead of it being usable to split bulk's path choice from real-time's once step 7
     lands. **Built** (2026-09-01). See D-023.
+6c. **Outbound measurement.** Path reports each way, so a send decision stops being made
+    from inbound evidence. Wire version 2, rolling upgrade, header authentication
+    alongside it. **Built** (2026-09-02). See D-024 and D-025.
 7. **Classification.** STUN watching first; it is the highest-value piece.
 8. **Scheduling and real-time handling.** Duplication, make-before-break, stickiness.
 9. **Admission control.** Alongside the scheduler, not after.

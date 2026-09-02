@@ -36,6 +36,7 @@ func main() {
 	configPath := flag.String("config", "/etc/openmultipath/config.json", "adjustable settings, reloaded when the file changes")
 	wgInterface := flag.String("wg-interface", "wg0", "tunnel interface, read for its current MTU")
 	node := flag.String("node", hostname(), "this box's name, shown in the web interface")
+	authKeyPath := flag.String("auth-key", "/etc/openmultipath/auth.key", "file holding the shared secret that authenticates the wire header; absent means unauthenticated")
 	flag.Parse()
 
 	// A missing settings file is the normal case: every value has a
@@ -48,6 +49,19 @@ func main() {
 	holder := config.NewHolder(settings)
 	go holder.Watch(*configPath)
 
+	// The shared secret lives in a file of its own, never in the settings
+	// the web interface serves over HTTP. A missing file is not an error:
+	// running unauthenticated is the current default, and a node that
+	// refused to start without a key would make enabling authentication a
+	// flag day rather than a rolling change.
+	authKey, err := relay.LoadAuthKey(*authKeyPath)
+	if err != nil {
+		log.Fatalf("ompd: %v", err)
+	}
+	if len(authKey) > 0 {
+		log.Printf("ompd: authenticating wire headers with the key in %s", *authKeyPath)
+	}
+
 	switch *role {
 	case "initiator":
 		cfg := relay.InitiatorConfig{
@@ -59,6 +73,7 @@ func main() {
 			RecordPath:   *recordPath,
 			WGInterface:  *wgInterface,
 			Settings:     holder,
+			AuthKey:      authKey,
 		}
 		if err := relay.RunInitiator(cfg); err != nil {
 			log.Fatal(err)
@@ -72,6 +87,7 @@ func main() {
 			RecordPath:     *recordPath,
 			WGInterface:    *wgInterface,
 			Settings:       holder,
+			AuthKey:        authKey,
 		}
 		if err := relay.RunResponder(cfg); err != nil {
 			log.Fatal(err)

@@ -28,7 +28,7 @@ func (d *bwDriver) run(dur time.Duration, kbps, rttMs, downQueueMs float64) {
 	for end := d.now + dur; d.now < end; {
 		d.b.noteSent(int(kbps * 1000 / 8 * tick.Seconds()))
 		d.now += tick
-		d.b.observe(d.now, rttMs, downQueueMs, d.c)
+		d.b.observe(d.now, rttMs, downQueueMs, peerView{}, d.c)
 	}
 }
 

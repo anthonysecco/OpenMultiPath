@@ -34,6 +34,10 @@ type InitiatorConfig struct {
 	RecordPath  string         // where to append the history log; empty disables it
 	WGInterface string         // tunnel interface, read for its current MTU
 	Settings    *config.Holder // adjustable settings, reloaded while running
+
+	// AuthKey authenticates the wire header. Empty runs unauthenticated,
+	// which is the current default; see relay.LoadAuthKey.
+	AuthKey []byte
 }
 
 // RunInitiator relays between a local WireGuard interface and the home
@@ -69,6 +73,7 @@ func RunInitiator(cfg InitiatorConfig) error {
 	var wgPeer atomic.Pointer[net.UDPAddr]
 
 	sess := newSession(cfg.Settings, cfg.Node, roleInitiator)
+	sess.setAuthKey(cfg.AuthKey)
 
 	// Path ids are indices into the configured list, so a path keeps its
 	// identity across every unbind and rebind. A link that vanishes for
@@ -101,11 +106,12 @@ func RunInitiator(cfg InitiatorConfig) error {
 	// Each physical path -> local WireGuard. Duplicates land here too;
 	// WireGuard's replay protection drops the redundant copy.
 	paths := newPathSet(specs, sess, remoteAddr, func(id uint8, buf []byte) {
-		h, payload, err := protocol.Parse(buf)
+		h, payload, ver, err := protocol.Parse(buf, sess.authKey)
 		if err != nil {
 			log.Printf("initiator: bad packet on path %d: %v", id, err)
 			return
 		}
+		sess.notePeerVersion(ver)
 		sess.observe(&h, len(buf))
 
 		// Reports and probes carry no tunnel traffic; they exist only to

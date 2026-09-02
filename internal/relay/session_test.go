@@ -27,7 +27,7 @@ func TestEchoMeasuresRoundTripExcludingPeerHoldTime(t *testing.T) {
 	time.Sleep(2 * testEchoInterval)
 
 	out := initiator.stamp(0, initiator.nextGlobalSeq(), []byte("payload"), nil)
-	h, _, err := protocol.Parse(out)
+	h, _, _, err := protocol.Parse(out, nil)
 	if err != nil {
 		t.Fatalf("parse outbound: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestEchoMeasuresRoundTripExcludingPeerHoldTime(t *testing.T) {
 	time.Sleep(hold)
 
 	reply := responder.stamp(0, responder.nextGlobalSeq(), []byte("reply"), nil)
-	rh, _, err := protocol.Parse(reply)
+	rh, _, _, err := protocol.Parse(reply, nil)
 	if err != nil {
 		t.Fatalf("parse reply: %v", err)
 	}
@@ -106,11 +106,11 @@ func TestDuplicatedCopiesShareGlobalSequence(t *testing.T) {
 	payload := []byte("packet")
 
 	seq := s.nextGlobalSeq()
-	first, _, err := protocol.Parse(s.stamp(0, seq, payload, nil))
+	first, _, _, err := protocol.Parse(s.stamp(0, seq, payload, nil), nil)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	second, _, err := protocol.Parse(s.stamp(1, seq, payload, nil))
+	second, _, _, err := protocol.Parse(s.stamp(1, seq, payload, nil), nil)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestDuplicatedCopiesShareGlobalSequence(t *testing.T) {
 	}
 
 	// A second packet on path 0 advances that path's own sequence.
-	third, _, err := protocol.Parse(s.stamp(0, s.nextGlobalSeq(), payload, nil))
+	third, _, _, err := protocol.Parse(s.stamp(0, s.nextGlobalSeq(), payload, nil), nil)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}

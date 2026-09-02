@@ -135,6 +135,13 @@ type Config struct {
 	BWMinLoadKbps     int `json:"bw_min_load_kbps"`
 	BWHeadroomPercent int `json:"bw_headroom_percent"`
 
+	// ReportIntervalMs is how often each end tells the other what it has
+	// measured on the other's transmissions - the far end's only source of
+	// truth about its own send direction. Slower than the echo cadence on
+	// purpose: these are smoothed statistics that do not move packet to
+	// packet, and on a 512 kbps standby link every header byte is counted.
+	ReportIntervalMs int `json:"report_interval_ms"`
+
 	// BWFallbackKbps is what a path is assumed to carry before it has ever
 	// been seen to queue. Zero means "unknown", which is the default and
 	// disables the gate rather than guessing: never having watched a path
@@ -250,6 +257,10 @@ var Bounds = map[string]bound{
 
 	"bw_headroom_percent": {Min: 0, Max: 500, Default: 20},
 
+	// One a second: fast enough that a path going bad outbound is noticed
+	// within a couple of scheduler intervals, slow enough to be free.
+	"report_interval_ms": {Min: 100, Max: 60_000, Default: 1_000},
+
 	// Zero means unknown, and unknown means no gate. See BWFallbackKbps.
 	"bw_fallback_kbps": {Min: 0, Max: 10_000_000, Default: 0},
 }
@@ -289,6 +300,7 @@ func Defaults() Config {
 		BWMinLoadKbps:     Bounds["bw_min_load_kbps"].Default,
 		BWHeadroomPercent: Bounds["bw_headroom_percent"].Default,
 		BWFallbackKbps:    Bounds["bw_fallback_kbps"].Default,
+		ReportIntervalMs:  Bounds["report_interval_ms"].Default,
 
 		DuplicateMode: DuplicateSwitching,
 	}
@@ -363,6 +375,7 @@ func (c Config) Sanitised() Config {
 		BWMinLoadKbps:     clamp(c.BWMinLoadKbps, Bounds["bw_min_load_kbps"]),
 		BWHeadroomPercent: clamp(c.BWHeadroomPercent, Bounds["bw_headroom_percent"]),
 		BWFallbackKbps:    clamp(c.BWFallbackKbps, Bounds["bw_fallback_kbps"]),
+		ReportIntervalMs:  clamp(c.ReportIntervalMs, Bounds["report_interval_ms"]),
 
 		DuplicateMode: duplicateMode(c.DuplicateMode),
 	}
@@ -391,6 +404,10 @@ func (c Config) RecordInterval() time.Duration {
 // RecordMaxBytes is the rotation threshold in bytes.
 func (c Config) RecordMaxBytes() int64 {
 	return int64(c.RecordMaxMegabytes) << 20
+}
+
+func (c Config) ReportInterval() time.Duration {
+	return time.Duration(c.ReportIntervalMs) * time.Millisecond
 }
 
 func (c Config) EvalInterval() time.Duration {

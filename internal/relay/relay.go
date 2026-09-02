@@ -16,9 +16,13 @@
 package relay
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"io/fs"
 	"log"
 	"net"
+	"os"
 	"syscall"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
@@ -66,3 +70,47 @@ func readLoop(conn *net.UDPConn, name string, handle func(buf []byte, from *net.
 		handle(buf[:n], from)
 	}
 }
+
+// LoadAuthKey reads the shared secret that authenticates the wire header.
+//
+// A missing file yields no key and no error. That is deliberate: the daemon
+// has to be able to run before anyone has provisioned a secret, and every
+// node in the field today is running without one.
+//
+// Note what this does *not* buy. Installing the key is still a flag day:
+// once one end has it, that end rejects the other's untagged version 2
+// packets, so both have to be restarted together. The code upgrade rolls
+// out safely one end at a time - see protocol.Version - but turning
+// authentication on does not. It is a parked-in-the-driveway change, and
+// the provisioning bundle is where it belongs, so that a unit is built with
+// its key rather than having one added later.
+//
+// Whitespace is trimmed so a key file written by a shell redirect, which
+// leaves a trailing newline, produces the same key at both ends. That has
+// bitten enough projects to be worth the two lines.
+func LoadAuthKey(path string) ([]byte, error) {
+	if path == "" {
+		return nil, nil
+	}
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("relay: read auth key %s: %w", path, err)
+	}
+	key := bytes.TrimSpace(b)
+	if len(key) == 0 {
+		return nil, nil
+	}
+	if len(key) < minAuthKeyLen {
+		return nil, fmt.Errorf("relay: auth key in %s is %d bytes, want at least %d",
+			path, len(key), minAuthKeyLen)
+	}
+	return key, nil
+}
+
+// minAuthKeyLen rejects a key short enough to be guessed. The provisioning
+// flow generates a long random one; this only catches a hand-typed
+// placeholder that would give the appearance of authentication without any.
+const minAuthKeyLen = 16

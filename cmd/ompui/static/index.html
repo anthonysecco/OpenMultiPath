@@ -56,6 +56,8 @@
   .path-name { font-weight: 650; font-size: 16px; }
   .metrics { display: grid; gap: 10px 16px; grid-template-columns: repeat(auto-fit, minmax(105px, 1fr)); }
   .metric .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  .dir { display: inline-block; padding: 0 4px; border-radius: 3px; background: rgba(127,127,127,.18);
+         font-size: 9px; letter-spacing: .04em; vertical-align: 1px; }
   .metric .v { font-size: 17px; font-variant-numeric: tabular-nums; margin-top: 1px; }
 
   .tag {
@@ -287,6 +289,7 @@ function renderPaths(s) {
                 : p.sending ? `<span class="tag">sending</span>` : "",
       p.flapping ? `<span class="tag bad">flapping</span>` : "",
       p.thin ? `<span class="tag warn">thin statistics</span>` : "",
+      p.tx_reported ? "" : `<span class="tag warn" title="the far end is not reporting on this path, so it is being scored on half a round trip and on inbound measurements - the wrong direction for a send decision">no outbound report</span>`,
       (p.path_mtu && !p.usable) ? `<span class="tag bad">below tunnel floor</span>` : "",
       (owns && p.local) ? `<span class="tag">via ${p.local}</span>` : "",
       p.remote ? `<span class="tag">${p.remote}</span>` : "",
@@ -325,6 +328,22 @@ function renderPaths(s) {
         ? "the most this path has carried without the link filling; its actual ceiling is unmeasured"
         : "nothing has ever loaded this path, so nothing is assumed about what it can carry";
 
+    // Inbound and outbound are labelled apart because they are measured in
+    // different places and routinely disagree. Everything unlabelled is
+    // measured here, on packets arriving; the outbound figures are what the
+    // far end reports about our transmissions, and are the ones the
+    // scheduler ranks on. A path can be fine one way and unusable the other,
+    // and until these were shown separately that was invisible.
+    const inLabel = p.tx_reported ? `<span class="dir">in</span>` : "";
+    const outRows = p.tx_reported ? `
+        <div class="metric"><div class="k">Delay <span class="dir">out</span></div>
+          <div class="v" title="what the scheduler ranks on: half the ${fmt(p.rtt_floor_ms)} ms round-trip floor, plus what the peer reports queueing">${fmt(p.tx_delay_ms)} ms</div></div>
+        <div class="metric"><div class="k">p95 spread <span class="dir">out</span></div><div class="v">${fmt(p.tx_spread_ms)} ms</div></div>
+        <div class="metric"><div class="k">Jitter <span class="dir">out</span></div><div class="v">${fmt(p.tx_jitter_ms)} ms</div></div>
+        <div class="metric"><div class="k">Queue delay <span class="dir">out</span></div><div class="v">${fmt(p.tx_queue_delay_ms)} ms</div></div>
+        <div class="metric"><div class="k">Loss <span class="dir">out</span></div>
+          <div class="v" style="color:var(--${lossClass(p.tx_loss_percent)})">${fmt(p.tx_loss_percent, 2)}%</div></div>` : "";
+
     const bindRow = owns
       ? `<div class="metric"><div class="k">Link drops</div>
            <div class="v" title="times this link has gone away since the daemon started, address changes included">${p.drops || 0}</div></div>`
@@ -341,12 +360,14 @@ function renderPaths(s) {
           <div class="v" style="color:var(--${mosClass(p.mos)})" title="${penalty}">${fmt(p.mos, 2)} MOS</div></div>
         <div class="metric"><div class="k">Score</div>
           <div class="v" title="E-model R factor after penalties; the scheduler ranks on this">${fmt(p.score, 0)} R</div></div>
-        <div class="metric"><div class="k">RTT</div><div class="v">${fmt(p.rtt_ms)} ms</div></div>
-        <div class="metric"><div class="k">p95 spread</div><div class="v">${fmt(p.p95_spread_ms)} ms</div></div>
-        <div class="metric"><div class="k">Jitter</div><div class="v">${fmt(p.jitter_ms)} ms</div></div>
-        <div class="metric"><div class="k">Queue delay</div><div class="v">${fmt(p.queue_delay_ms)} ms</div></div>
-        <div class="metric"><div class="k">Loss (recent)</div>
+        <div class="metric"><div class="k">RTT</div>
+          <div class="v" title="round trip; floor ${fmt(p.rtt_floor_ms)} ms with nothing queued on it">${fmt(p.rtt_ms)} ms</div></div>
+        <div class="metric"><div class="k">p95 spread ${inLabel}</div><div class="v">${fmt(p.p95_spread_ms)} ms</div></div>
+        <div class="metric"><div class="k">Jitter ${inLabel}</div><div class="v">${fmt(p.jitter_ms)} ms</div></div>
+        <div class="metric"><div class="k">Queue delay ${inLabel}</div><div class="v">${fmt(p.queue_delay_ms)} ms</div></div>
+        <div class="metric"><div class="k">Loss ${inLabel}</div>
           <div class="v" style="color:var(--${lossClass(p.recent_loss_percent)})">${fmt(p.recent_loss_percent, 2)}%</div></div>
+        ${outRows}
         <div class="metric"><div class="k">Loss (lifetime)</div>
           <div class="v" title="${p.lost.toLocaleString()} packets since the daemon started">${fmt(p.loss_percent, 2)}%</div></div>
         <div class="metric"><div class="k">Received</div><div class="v">${p.received.toLocaleString()}</div></div>
@@ -455,6 +476,8 @@ const FIELDS = [
   ["mbb_max_ms", "Handover maximum overlap", "ms",
    "Longest to keep paying for two copies while waiting for the new path to be confirmed."],
 
+  ["report_interval_ms", "Path report interval", "ms",
+   "How often each end tells the other what it measured on the other's transmissions. This is the far end's only way to see its own send direction."],
   ["bw_onset_ms", "Capacity onset", "ms",
    "Queueing in the send direction that counts as the link starting to fill. The rate at that moment becomes the path's estimated ceiling."],
   ["bw_min_load_kbps", "Capacity minimum load", "kbps",

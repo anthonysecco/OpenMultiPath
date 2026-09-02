@@ -115,6 +115,27 @@ type Path struct {
 	PathMTU int  `json:"path_mtu"`
 	Usable  bool `json:"usable"`
 
+	// What the far end reports about our SEND direction on this path
+	// (D-024). Everything above is measured locally and therefore describes
+	// packets arriving - the other direction from the one a send decision is
+	// about. TxReported says whether a report is in hand and recent; when it
+	// is false the scheduler is scoring on half a round trip and the inbound
+	// figures, and these are meaningless.
+	TxReported     bool    `json:"tx_reported"`
+	TxSpreadMs     float64 `json:"tx_spread_ms"`
+	TxQueueDelayMs float64 `json:"tx_queue_delay_ms"`
+	TxJitterMs     float64 `json:"tx_jitter_ms"`
+	TxLossPercent  float64 `json:"tx_loss_percent"`
+
+	// TxDelayMs is the one-way delay estimate the scheduler actually ranks
+	// on: half the round-trip floor, plus what the peer says it is queueing.
+	// The first half is a symmetry assumption and the second is measured;
+	// see outboundDelayMs for why that split is the honest one.
+	TxDelayMs float64 `json:"tx_delay_ms"`
+
+	// RTTFloorMs is the round trip with nothing queued on it.
+	RTTFloorMs float64 `json:"rtt_floor_ms"`
+
 	// The reactive bandwidth ceiling of D-023, all in kbps in the send
 	// direction.
 	//

@@ -21,6 +21,10 @@ type ResponderConfig struct {
 	RecordPath  string         // where to append the history log; empty disables it
 	WGInterface string         // tunnel interface, read for its current MTU
 	Settings    *config.Holder // adjustable settings, reloaded while running
+
+	// AuthKey authenticates the wire header. Empty runs unauthenticated,
+	// which is the current default; see relay.LoadAuthKey.
+	AuthKey []byte
 }
 
 // RunResponder relays between the public endpoint, reachable from any of
@@ -59,6 +63,7 @@ func RunResponder(cfg ResponderConfig) error {
 	defer wgConn.Close()
 
 	sess := newSession(cfg.Settings, cfg.Node, roleResponder)
+	sess.setAuthKey(cfg.AuthKey)
 	go sess.logStats()
 	if cfg.StatePath != "" {
 		go sess.writeState(cfg.StatePath, cfg.WGInterface)
@@ -105,11 +110,12 @@ func RunResponder(cfg ResponderConfig) error {
 	// moving under CGNAT: the address is merely recorded against the path
 	// the header names.
 	go readLoop(pubConn, "responder-public", func(buf []byte, from *net.UDPAddr) {
-		h, payload, err := protocol.Parse(buf)
+		h, payload, ver, err := protocol.Parse(buf, sess.authKey)
 		if err != nil {
 			log.Printf("responder: bad packet from %s: %v", from, err)
 			return
 		}
+		sess.notePeerVersion(ver)
 		sess.observe(&h, len(buf))
 		sess.setRemote(h.PathID, from)
 

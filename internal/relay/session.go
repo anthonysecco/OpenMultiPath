@@ -48,7 +48,7 @@ const (
 	// the tunnel floor once every layer below it has taken its cut. A path
 	// under this cannot carry a conforming tunnel at all, however healthy
 	// it looks otherwise, and is excluded rather than accommodated.
-	minUsablePathMTU = minTunnelMTU + ipUDPOverhead + protocol.MaxHeaderLen + wireGuardOverhead
+	minUsablePathMTU = minTunnelMTU + ipUDPOverhead + protocol.MaxDataHeaderLen + wireGuardOverhead
 )
 
 // mtuLadder is the set of physical MTUs probed for, smallest first. A
@@ -174,6 +174,79 @@ type pathState struct {
 	stats pathStats
 	mtu   mtuProbe
 	bw    bwEstimate
+
+	// rttFloor is the smallest round trip seen on this path, re-armed on a
+	// long window. It is the part of the delay that belongs to the path
+	// itself rather than to anything queued on it, and it is what the
+	// outbound delay estimate is anchored to - the instantaneous round trip
+	// includes queueing in *both* directions, which is precisely the
+	// contamination step 6c exists to remove.
+	rttFloor rttFloor
+
+	// peer is what the far end last told us about our own transmissions on
+	// this path. Zero value means it has never said, which is not the same
+	// as it having said the path is bad.
+	peer peerView
+}
+
+// peerView is the far end's measurement of our send direction on one path.
+//
+// Everything here is a difference against that path's own floor at the
+// receiving end, so none of it depends on the two clocks agreeing. There is
+// no absolute one-way delay because none can be measured without
+// synchronised clocks; see outboundDelayMs for how the absolute part is
+// approximated and why that is defensible.
+type peerView struct {
+	spreadMs float64
+	queueMs  float64
+	jitterMs float64
+	loss     float64
+	burst    float64
+
+	at    time.Duration
+	valid bool
+}
+
+// peerViewStale is how long a report is believed. Reports arrive about once
+// a second, so this tolerates a handful going missing before the scheduler
+// stops trusting the picture and falls back to round-trip scoring.
+const peerViewStale = 10 * time.Second
+
+func (v peerView) fresh(now time.Duration) bool {
+	return v.valid && now-v.at < peerViewStale
+}
+
+// rttFloor tracks the smallest round trip on a path, re-armed on a two
+// window scheme so a path whose base delay genuinely moves is not measured
+// forever against a floor that no longer exists.
+type rttFloor struct {
+	cur, next uint32
+	have      bool
+	started   time.Duration
+}
+
+// rttFloorWindow matches the bandwidth estimator's: long enough that a
+// standing queue is not absorbed into the baseline, which is the whole
+// reason the floor is being kept.
+const rttFloorWindow = 5 * time.Minute
+
+func (f *rttFloor) observe(now time.Duration, rtt uint32) {
+	if rtt == 0 {
+		return
+	}
+	if !f.have {
+		f.have, f.cur, f.next, f.started = true, rtt, rtt, now
+		return
+	}
+	if rtt < f.cur {
+		f.cur = rtt
+	}
+	if rtt < f.next {
+		f.next = rtt
+	}
+	if now-f.started >= rttFloorWindow {
+		f.cur, f.next, f.started = f.next, rtt, now
+	}
 }
 
 // session holds the sequencing and measurement state both ends keep.
@@ -198,23 +271,59 @@ type session struct {
 	// is tested on its own without a scheduler attached.
 	sched *scheduler
 
-	mu       sync.Mutex
-	paths    map[uint8]*pathState
-	names    map[uint8]string
-	lastEcho time.Duration
+	// authKey authenticates the wire header when set. It is loaded from a
+	// file rather than the hot-reload configuration on purpose: the web
+	// interface serves that configuration over HTTP, and a shared secret
+	// has no business in a response any browser on the LAN can fetch.
+	authKey []byte
+
+	// peerVersion is the highest wire version the far end has been heard
+	// speaking. It only ever rises: once a peer has demonstrated it can
+	// read version 2, a forged or corrupt version 1 packet must not be able
+	// to talk us back down into sending unauthenticated headers.
+	peerVersion atomic.Uint32
+
+	mu         sync.Mutex
+	paths      map[uint8]*pathState
+	names      map[uint8]string
+	lastEcho   time.Duration
+	lastReport time.Duration
 }
 
 func newSession(cfg *config.Holder, node, role string) *session {
 	if cfg == nil {
 		cfg = config.NewHolder(config.Defaults())
 	}
-	return &session{
+	s := &session{
 		start: time.Now(),
 		cfg:   cfg,
 		node:  node,
 		role:  role,
 		paths: make(map[uint8]*pathState),
 		names: make(map[uint8]string),
+	}
+	s.peerVersion.Store(protocol.MinVersion)
+	return s
+}
+
+// setAuthKey installs the shared secret that authenticates the header.
+func (s *session) setAuthKey(key []byte) { s.authKey = key }
+
+// emitVersion is the wire version to speak: the newest both ends can read.
+func (s *session) emitVersion() uint8 { return uint8(s.peerVersion.Load()) }
+
+// notePeerVersion records that the peer spoke this version, never
+// downwards. See the field comment for why the ratchet matters.
+func (s *session) notePeerVersion(v uint8) {
+	for {
+		cur := s.peerVersion.Load()
+		if uint32(v) <= cur {
+			return
+		}
+		if s.peerVersion.CompareAndSwap(cur, uint32(v)) {
+			log.Printf("peer speaks wire version %d", v)
+			return
+		}
 	}
 }
 
@@ -328,6 +437,10 @@ func (s *session) stamp(pathID uint8, globalSeq uint32, payload, buf []byte) []b
 }
 
 func (s *session) build(typ, pathID uint8, globalSeq uint32, payload, buf []byte) []byte {
+	return s.buildWith(typ, pathID, globalSeq, payload, buf, nil)
+}
+
+func (s *session) buildWith(typ, pathID uint8, globalSeq uint32, payload, buf []byte, reports []protocol.ReportEntry) []byte {
 	now := s.elapsed()
 
 	s.mu.Lock()
@@ -341,6 +454,7 @@ func (s *session) build(typ, pathID uint8, globalSeq uint32, payload, buf []byte
 		GlobalSeq: globalSeq,
 		PathSeq:   p.nextSeq,
 		SendTS:    uint32(now.Microseconds()),
+		Reports:   reports,
 	}
 	p.nextSeq++
 	p.sentSince++
@@ -358,7 +472,7 @@ func (s *session) build(typ, pathID uint8, globalSeq uint32, payload, buf []byte
 	// varies with how many echo entries rode along, and a rate derived from
 	// a guess at that would be wrong in exactly the direction that matters:
 	// echoes are largest when the most paths need reporting on.
-	out := append(h.AppendTo(buf[:0]), payload...)
+	out := append(h.AppendTo(buf[:0], s.emitVersion(), s.authKey), payload...)
 	p.bw.noteSent(len(out) + ipUDPOverhead)
 	s.mu.Unlock()
 
@@ -404,10 +518,94 @@ func (s *session) dueForReport(id uint8) bool {
 	return s.elapsed()-s.pathLocked(id).lastSentAt >= s.cfg.Get().EchoInterval()
 }
 
-// buildReport produces a standalone feedback packet for a path, carrying
-// no payload of its own.
+// buildReport produces a standalone feedback packet for a path, carrying no
+// payload of its own.
+//
+// This is where path reports ride. They go only on these packets and never
+// on data, so a data packet's header stays small enough that the tunnel MTU
+// does not have to budget for a block sent once a second.
 func (s *session) buildReport(pathID uint8, buf []byte) []byte {
-	return s.build(protocol.TypeReport, pathID, s.nextGlobalSeq(), nil, buf)
+	now := s.elapsed()
+
+	var reports []protocol.ReportEntry
+	if s.emitVersion() >= 2 {
+		s.mu.Lock()
+		if now-s.lastReport >= s.cfg.Get().ReportInterval() {
+			reports = s.collectReportsLocked()
+			if len(reports) > 0 {
+				s.lastReport = now
+			}
+		}
+		s.mu.Unlock()
+	}
+
+	return s.buildWith(protocol.TypeReport, pathID, s.nextGlobalSeq(), nil, buf, reports)
+}
+
+// collectReportsLocked describes what we have measured on the peer's
+// transmissions, one entry per path we have heard anything on.
+//
+// It reports on paths rather than on recent arrivals, unlike the echo
+// block: a path that has gone quiet is exactly the one the peer most needs
+// told about, because silence at this end is how its send direction failing
+// looks from here.
+func (s *session) collectReportsLocked() []protocol.ReportEntry {
+	out := make([]protocol.ReportEntry, 0, len(s.paths))
+	for id, p := range s.paths {
+		if p.stats.received == 0 {
+			continue // nothing measured, so nothing honest to say
+		}
+		if len(out) == protocol.MaxReportEntries {
+			break // the rest ride the next report
+		}
+		st := &p.stats
+		out = append(out, protocol.ReportEntry{
+			PathID:        id,
+			SpreadTenthMs: tenthMs(msi(st.spread())),
+			QueueTenthMs:  tenthMs(msi(st.queueDelay)),
+			JitterTenthMs: tenthMs(st.jitter / 1000),
+			LossPerMille:  perMille(st.recentLossPercent()),
+			BurstTenths:   tenths(st.recentBurstRatio()),
+		})
+	}
+	return out
+}
+
+// tenthMs converts milliseconds to the wire's tenths, saturating rather
+// than wrapping. Saturation is the right failure: the values that overflow
+// are ones where the path is already far past any threshold that matters,
+// and a wrapped small number would read as healthy.
+func tenthMs(ms float64) uint16 {
+	v := ms * 10
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint16 {
+		return math.MaxUint16
+	}
+	return uint16(v)
+}
+
+func perMille(percent float64) uint16 {
+	v := percent * 10
+	if v < 0 {
+		return 0
+	}
+	if v > 1000 {
+		return 1000
+	}
+	return uint16(v)
+}
+
+func tenths(ratio float64) uint8 {
+	v := ratio * 10
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint8 {
+		return math.MaxUint8
+	}
+	return uint8(v)
 }
 
 // buildProbe produces an MTU probe for a path, padded so the whole packet
@@ -575,6 +773,7 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 		if round >= e.Delay {
 			ep.rtt = round - e.Delay
 		}
+		ep.rttFloor.observe(now, ep.rtt)
 		// The peer is reporting a packet it received on this path, so our
 		// transmit direction is working as of now.
 		ep.confirmedAt = now
@@ -585,6 +784,23 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 			ep.mtu.confirmed = ep.mtu.probing
 			ep.mtu.probing = 0
 			ep.mtu.misses = 0
+		}
+	}
+
+	// The peer's view of our own send direction. This is the measurement
+	// that cannot be taken locally at all: a round trip cannot say which
+	// direction the delay was in, and every other statistic here describes
+	// packets arriving, not packets leaving.
+	for _, r := range h.Reports {
+		rp := s.pathLocked(r.PathID)
+		rp.peer = peerView{
+			spreadMs: float64(r.SpreadTenthMs) / 10,
+			queueMs:  float64(r.QueueTenthMs) / 10,
+			jitterMs: float64(r.JitterTenthMs) / 10,
+			loss:     float64(r.LossPerMille) / 10,
+			burst:    float64(r.BurstTenths) / 10,
+			at:       now,
+			valid:    true,
 		}
 	}
 }
@@ -608,7 +824,7 @@ func (s *session) metrics(now time.Duration) []pathMetric {
 		// path under the lock, it has the round trip and the receive-side
 		// queue delay to hand, and giving the estimate its own goroutine
 		// would only add a second cadence to keep in step with this one.
-		p.bw.observe(now, ms(p.rtt), msi(st.queueDelay), c)
+		p.bw.observe(now, ms(p.rtt), msi(st.queueDelay), p.peer, c)
 
 		// A path that has never delivered anything has been silent for as
 		// long as this process has been running. The initiator registers
@@ -637,6 +853,14 @@ func (s *session) metrics(now time.Duration) []pathMetric {
 			thin:           st.thin(),
 			unusable:       p.mtu.ceiling != 0 && p.mtu.confirmed < minUsablePathMTU,
 			bw:             p.bw.view(now, c),
+
+			haveTx:       p.peer.fresh(now),
+			txSpreadMs:   p.peer.spreadMs,
+			txQueueMs:    p.peer.queueMs,
+			txJitterMs:   p.peer.jitterMs,
+			txLoss:       p.peer.loss,
+			txBurstRatio: p.peer.burst,
+			rttFloorMs:   ms(p.rttFloor.cur),
 		})
 	}
 	return out
@@ -729,7 +953,7 @@ func (s *session) recommendedTunnelMTULocked() int {
 	if smallest == 0 {
 		return 0
 	}
-	return smallest - ipUDPOverhead - protocol.MaxHeaderLen - wireGuardOverhead
+	return smallest - ipUDPOverhead - protocol.MaxDataHeaderLen - wireGuardOverhead
 }
 
 // unusablePathsLocked names the paths that have been probed and cannot
@@ -819,6 +1043,17 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 		// own. Sampling it here as well would fold the same bytes in twice
 		// and report a rate that moved with how often the interface was
 		// being looked at.
+		if p.peer.fresh(now) {
+			path.TxReported = true
+			path.TxSpreadMs = p.peer.spreadMs
+			path.TxQueueDelayMs = p.peer.queueMs
+			path.TxJitterMs = p.peer.jitterMs
+			path.TxLossPercent = p.peer.loss
+			path.TxDelayMs = outboundDelayMs(ms(p.rttFloor.cur), p.peer.spreadMs,
+				float64(snap.Config.BaseDelayMs))
+		}
+		path.RTTFloorMs = ms(p.rttFloor.cur)
+
 		bw := p.bw.view(now, snap.Config)
 		path.SendKbps = bw.sendKbps
 		path.PeakKbps = bw.peakKbps

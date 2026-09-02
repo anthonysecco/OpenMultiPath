@@ -120,7 +120,7 @@ func (b *bwEstimate) noteSent(wireBytes int) {
 // rttMs is the path's most recent round trip and downQueueMs the queue
 // delay already measured in the receive direction; the difference between
 // the round trip's rise and that is what this end is doing to the link.
-func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, c config.Config) {
+func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx peerView, c config.Config) {
 	if !b.started {
 		// Start the windows here rather than at zero. A path registered at
 		// boot and first sampled a minute later would otherwise divide a
@@ -155,10 +155,7 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, c co
 	b.everLoaded = true
 	b.confirmedAt = now
 
-	up := (rttMs - b.minRTTMs) - downQueueMs
-	if up < 0 {
-		up = 0
-	}
+	up := b.outboundQueueMs(now, rttMs, downQueueMs, tx)
 
 	if up >= float64(c.BWOnsetMs) {
 		// The rate that matters is the one at the *moment* queueing began,
@@ -196,6 +193,29 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, c co
 	if b.haveCeiling && b.sendKbps > b.ceilingKbps {
 		b.ceilingKbps = b.sendKbps
 	}
+}
+
+// outboundQueueMs is how much the link is queueing in our send direction.
+//
+// When the peer is reporting, this is simply what it measured - it is
+// watching our packets arrive, so it can see our send direction directly
+// and there is nothing to infer. That is the whole point of D-024.
+//
+// Without a report it falls back to the inference this estimator was built
+// on: the round trip above its own floor, less the part of the rise we can
+// already see belongs to the return direction. That works, and it is why
+// the ceiling was measurable before path reports existed, but it is a
+// difference of two noisy numbers and it degrades badly when both
+// directions are busy at once.
+func (b *bwEstimate) outboundQueueMs(now time.Duration, rttMs, downQueueMs float64, tx peerView) float64 {
+	if tx.fresh(now) {
+		return tx.queueMs
+	}
+	up := (rttMs - b.minRTTMs) - downQueueMs
+	if up < 0 {
+		return 0
+	}
+	return up
 }
 
 // trackFloor keeps the rolling minimum round trip, re-armed on the same

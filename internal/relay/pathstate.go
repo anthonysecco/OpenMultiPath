@@ -89,6 +89,27 @@ type pathMetric struct {
 	// link is not a degraded link, and a path that can only do 512k is
 	// still perfectly healthy at 512k.
 	bw bwView
+
+	// The far end's measurement of our send direction on this path, and
+	// whether it is recent enough to act on. haveTx false means nobody has
+	// told us - an old peer, or a path it has not heard from - and the
+	// scheduler falls back to round-trip scoring rather than assuming
+	// anything.
+	//
+	// These exist because every other field above is measured on arriving
+	// packets and therefore describes the wrong direction for a decision
+	// about where to send. See D-024.
+	haveTx       bool
+	txSpreadMs   float64
+	txQueueMs    float64
+	txJitterMs   float64
+	txLoss       float64
+	txBurstRatio float64
+
+	// rttFloorMs is the round trip with nothing queued on it, which is the
+	// only part of the delay that can be split symmetrically with a clear
+	// conscience.
+	rttFloorMs float64
 }
 
 // machine is the hysteresis state for one path.
@@ -250,11 +271,7 @@ func (m *machine) score(now time.Duration, p pathMetric, c config.Config) float6
 	if m.state == stateDown {
 		return 0
 	}
-	r := rFactor(
-		effectiveDelayMs(p.rttMs, p.p95SpreadMs, float64(c.BaseDelayMs)),
-		p.recentLoss,
-		p.burstRatio,
-	)
+	r := rFactor(scoreInputs(p, c))
 	if m.state == stateUnstable {
 		r -= float64(c.UnstablePenaltyR)
 	}

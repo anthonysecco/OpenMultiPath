@@ -365,6 +365,15 @@ floor, less the receive-side queue delay we can already see. One subtraction, an
 what keeps a large download arriving on a path from being misread as that path's uplink
 filling up, which is exactly the scenario that prompted this decision.
 
+**Superseded in part by D-024** (2026-09-02). That subtraction was always an inference,
+and a difference of two noisy numbers degrades badly when both directions are busy at
+once. Path reports now carry the peer's own measurement of our send direction, so when a
+report is in hand the outbound queue delay is simply read rather than derived. The
+subtraction survives as the fallback for a peer that is not reporting - an older build,
+or a path it has not heard from - which is also why it was worth building first: the
+ceiling was measurable before the wire could carry a report, and a node that loses its
+peer's reports degrades to a working estimate rather than to none.
+
 The round-trip floor is re-armed on a far longer window than the ten seconds `stats.go`
 uses for transit. Ten seconds is right for "is this path degraded now", a question about
 the present. Capacity is a question about the link, and a standing queue lasting a minute
@@ -428,6 +437,143 @@ ceiling if there is one, how long ago that was confirmed, and what the scheduler
 currently willing to assume. The three cases are shown apart rather than as one number,
 because a measured ceiling can be acted on, a floor only says "at least this", and never
 having loaded a path says nothing at all.
+
+**Field result** (2026-09-01). On the vehicle it measured the Starlink standby path at
+506 kbps, against a documented 512k tier - within one percent, from ordinary traffic,
+with no probe. It also found the limit of the "clean carriage proves a floor" rule the
+same evening: the cellular path sat at a stale 1023 kbps estimate while actually
+carrying 84 Mbps, because nothing had ever pushed it hard enough to queue. The estimate
+tracks demand as much as capacity, and reads low until something real loads the link.
+That is the safe direction to be wrong in, and worth remembering before trusting the
+number as a capacity figure rather than as a floor.
+
+---
+
+## D-024 · Score the send direction, from what the peer reports
+
+**Decision.** Each end tells the other, once a second per path, what it measured on the
+other's transmissions: p95 spread, queue delay, jitter, recent loss, burst ratio. A
+sender scores a path for transmission on those figures rather than on its own inbound
+statistics. Wire version 2, a new block on standalone reports only.
+
+**The bug this fixes.** Every measurement a node can take locally describes packets
+*arriving*. Round trip cannot say which direction the delay was in. So a sender choosing
+where to transmit was making an outbound decision entirely from inbound evidence, and on
+2026-09-01 that did exactly what it sounds like: a 107 Mbps download saturated the
+cellular path's downlink, the resulting bufferbloat drove that path's R below the floor,
+and the scheduler evacuated the flow onto the 512 kbps Starlink standby link. The
+cellular *uplink* was carrying 19 kbps and was perfectly healthy throughout. Upload fell
+to 0.45 Mbps and stayed there.
+
+**Clocks.** Absolute one-way delay needs synchronised clocks and this project
+deliberately has none. It is also not what the decision turns on, so the delay is split:
+
+    outbound  ~=  rttFloor/2  +  what the peer reports queueing
+
+The floor rather than the live round trip, because an instantaneous round trip contains
+queueing from both directions - which is the contamination being removed. Everything the
+peer reports is a difference against its own floor, so the unknown offset cancels and no
+synchronisation is required. The symmetric half is still an assumption, and wrong on some
+links; it is the *stable* half. The part that moves is now measured on the correct side.
+
+**Rejected: shared NTP.** Suggested, and it does tighten the offset, but not to the
+precision that matters: a few milliseconds of residual error is the same size as the
+differences being resolved. It would add a dependency and a failure mode to buy an
+accuracy the design does not need, since ranking paths and detecting change are both
+differences, and differences cancel the offset exactly.
+
+**Fallback.** No report, or one older than ten seconds, and the path is scored exactly as
+before - half a round trip and the inbound figures. That is the wrong direction and known
+to be, but it is what a lone node can see, and an old peer or a path the far end has not
+heard from still has to be scored somehow. Principle 5.
+
+**Rolling upgrade.** Version 1 is still accepted, and version 2 is emitted only once the
+peer has been heard to speak it, so either end can be upgraded first with no outage.
+Negotiation deadlocked on the first attempt - both ends start at version 1, so neither
+ever sends a version 2 packet and neither ever learns the other could read one. The fix
+is a capability bit in a flags field that version 1 already ignores, advertised on every
+packet whatever version it is encoded as. Tested one end at a time on the vehicle.
+
+**Cost.** Ten bytes per path per second, on packets that carry no payload. Reports ride
+only on standalone reports, never on data, so a data packet's header stays small and the
+tunnel MTU does not have to budget for them; that is why `MaxDataHeaderLen` is split from
+`MaxHeaderLen`.
+
+**Field result** (2026-09-02). Asymmetry that was previously invisible showed up
+immediately - one path reading 69 ms of inbound spread against 5.6 ms outbound. The
+regression test passed on the vehicle: a 93 Mbps download drove the primary's inbound
+queue delay to 47 ms and 0.49% loss while its outbound stayed at 4.7 ms and 0%, and the
+flow did not move. Zero handovers.
+
+---
+
+## D-025 · Authenticate the wire header
+
+**Decision.** An 8-byte truncated HMAC-SHA256 over the header, keyed by a shared secret,
+carried on version 2 packets when a key is configured. The key lives in a file of its
+own, never in the settings file.
+
+**Why now.** It was parked deliberately while the header carried only sequence numbers
+and timestamps. D-024 changes the stakes: path reports are an input to path selection, so
+anyone able to inject a packet could steer the vehicle's traffic onto a link of their
+choosing. It also shares D-024's version bump, and shipping two flag days to a vehicle
+rather than one is a bad trade.
+
+**Scope, deliberately narrow.** This does not protect the payload - WireGuard already
+does, and protocol.md is firm about not writing crypto here. It raises the cost of
+injecting *metadata* from one packet to 2^64 of them. Eight bytes is short for a MAC and
+is the right length for that job; against an attacker who can already read the traffic it
+is the wrong defence anyway, and the bytes come out of every packet.
+
+**The key is not in config.json.** The web interface serves that file over HTTP to
+anything on the LAN. A shared secret has no business in a response a browser can fetch,
+so it is read from `/etc/openmultipath/auth.key` at startup instead. Absent means
+unauthenticated, which is what every unit in the field is running today.
+
+**Enabling it is a flag day, unlike the upgrade.** Once one end has the key it rejects
+the other's untagged version 2 packets, so both ends must be restarted together. The
+code upgrade rolls safely one end at a time; turning authentication on does not. It is a
+parked-in-the-driveway change, and it belongs in the provisioning bundle so a unit is
+built with its key rather than having one added later.
+
+**Rejected: accepting untagged packets during a grace period.** It would make enabling
+authentication rolling, at the cost of leaving the door open for exactly as long as
+nobody noticed the grace period had never ended. A window that closes when someone
+remembers is not a security control.
+
+---
+
+## D-026 · No IPv6, for now
+
+**Decision.** The RV does not carry IPv6. Drop it on the WAN interfaces rather than carry
+it inside the tunnel.
+
+**Why this came up.** A speedtest on the RV read far better than the same test from a LAN
+client behind it, and the reason was that the RV's own IPv6 was leaving straight out the
+cellular modem - `wg0` has no IPv6 address at all, and two router advertisements were
+installing IPv6 default routes on the WAN interfaces. Anything resolving to a AAAA record
+bypassed WireGuard, the daemon, and every measurement in it. The LAN client has no IPv6
+and so was using the tunnel correctly; it was never slow, it was simply the only one
+being measured.
+
+**Rationale.** This is a split tunnel, which D-004 rules out in plain terms. IPv6 traffic
+was getting no multipath, no make-before-break, no measurement and no failover - pinned to
+whichever interface won the RA metric race, with the source address changing when that
+link dropped, which is the exact property the tunnel exists to provide. It also meant the
+field telemetry understated what the vehicle actually carries, by however much of the
+traffic was AAAA.
+
+Dropping it is the simpler of the two fixes and matches principle 2. The cost is real but
+small: a handful of v6-only services become unreachable from the RV.
+
+**Not rejected, deferred:** carrying IPv6 inside the tunnel - a v6 prefix on `wg0`, `::/0`
+routed into it, egress at home. That is the right long-term answer and it needs working
+v6 at the home end plus a change to the provisioning bundle. Revisit when either the
+provisioning flow is being touched anyway or something the RV needs turns out to be
+v6-only.
+
+**Note.** IPv6 appeared nowhere in these documents before this entry. It was not a
+decision that went wrong; it was one nobody had made.
 
 ---
 
