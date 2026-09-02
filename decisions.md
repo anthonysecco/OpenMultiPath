@@ -353,14 +353,29 @@ A staged cutover needs a second port forwarded to the home box - the configs are
 for 51822 - or it has to take 48219 at the moment production releases it, which is not a
 staged cutover at all.
 
-**Blocker 2, and the more serious one: the RV is only reachable through the tunnel it
-would be cutting over.** Home routes `10.0.0.0/24` down `wg0`, so administrative access to
-the vehicle traverses production. Stopping the production responder to free 48219 would
-strand the RV and the person doing it in the same instant, with no way back in. This is
-the failure `scope-v1.md` names under field upgrades - "a bad update that breaks the tunnel
-from 800 miles away is unrecoverable without fallback working" - and it is currently true
-of the *cutover itself*, not merely of a bad build. Out-of-band access to the RV is a
-prerequisite for the flag day, ahead of anything else in this entry.
+**Blocker 2 - RESOLVED (2026-09-02).** The RV was only reachable *through the tunnel it
+would be cutting over*: home routes `10.0.0.0/24` down `wg0`, so stopping the production
+responder to free 48219 would have stranded the vehicle and the person doing it in the
+same instant. That is the failure `scope-v1.md` names under field upgrades - "unrecoverable
+without fallback working" - and it was true of the *cutover itself*, not merely of a bad
+build.
+
+There is now an out-of-band path. The dev box's Wi-Fi adapter is associated to the RV's
+LAN at a static `10.0.0.237/24`, which puts an on-link route to `10.0.0.0/24` in front of
+the tunnel path on longest prefix, so `ssh omp-remote1` takes it automatically. It is
+independent by construction - the RV answers on `eth0`, nothing in the path touches `ompd`
+or `wg0` - and that was verified rather than assumed: `ompd` was stopped on the RV for 30
+seconds behind a self-restarting unit, and the box stayed reachable 3 times out of 3 with
+the tunnel down.
+
+The link is marginal and should be treated as an emergency console rather than a working
+link: 2.4 GHz only, -65 dBm, negotiating MCS 0-2, roughly 17% packet loss, SSH connect
+times between 0.4 and 12 seconds. It is enough to restart a service or remove a flag,
+which is exactly what a rollback needs, and not enough for anything else.
+
+**So blocker 1 is now the only thing in front of the flag day**, and it is a router
+change: forward 51822/udp to the home box, or accept that the cutover takes 48219 at the
+moment production releases it - which the Wi-Fi path now makes survivable.
 
 **Still owed by the code:** recovering the bind/rebind visibility D-020 costs by reading
 interface state, and making the TUN MTU track the daemon's own recommendation rather than
