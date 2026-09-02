@@ -483,6 +483,24 @@ Verified on the RV itself as well as in the sandbox - `6.12.107+deb13-cloud-amd6
 kernel flavour that ships without most physical-NIC drivers - at 11.96 ms to bind and
 15.40 ms to drop.
 
+**A latent bug found by the test that would not stop flaking** (2026-09-02). The read loop
+treated every error but `EINTR` as fatal and returned, which silently ended event-driven
+detection for the life of the process. `ENOBUFS` on a netlink multicast socket does not
+mean that: it means the kernel dropped messages because the socket was not drained fast
+enough, which is a burst rather than a fault - and several links registering at once on a
+cold boot, the case `scope-v1.md` opens with, is exactly such a burst. The watcher now
+treats it as "something changed and I no longer know what", asks for a reconcile, and
+keeps reading; the reconcile reads interface state directly, so it does not depend on
+having seen the message that was lost. The receive buffer was raised to a megabyte to make
+the drop rarer in the first place.
+
+The test that surfaced it was also wrong, in an instructive way. It required *every* trial
+to beat the sweep, which asserts that a notification is never lost - a stronger guarantee
+than this design makes, since the backstop sweep exists precisely because one can be. It
+now runs several trials and requires most to be event-fast, which still fails loudly if
+events stop working altogether and does not fail for the reason the design already
+accounts for.
+
 **Still owed by the code:** recovering the bind/rebind visibility D-020 costs by reading
 interface state, and making the TUN MTU track the daemon's own recommendation rather than
 the flag default.

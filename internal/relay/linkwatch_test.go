@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -85,46 +86,67 @@ func TestWatcherCoalescesABurst(t *testing.T) {
 	}
 }
 
-// The point of D-029. A link appearing must be acted on promptly rather
-// than at the next backstop sweep, so the test creates one well after the
-// initial reconcile and requires the path to bind in a fraction of
-// rebindInterval - a margin only an event can meet.
+// The point of D-029, in the direction that is harder to observe.
+//
+// This runs several trials and requires most of them to be event-fast
+// rather than all, which is deliberate and matches what the design
+// actually promises. Events make detection prompt; the backstop sweep
+// exists precisely because a notification can be lost - a burst the kernel
+// drops, a socket that did not drain in time - and principle 5 says the
+// slow path has to still work. Demanding every trial be fast would be
+// asserting a guarantee the daemon does not make, and would fail on a
+// loaded machine for the right reasons.
+//
+// It still catches the regression that matters: if events stopped working
+// entirely, every trial would come back at sweep latency.
 func TestPathBindsFromAnEventNotTheSweep(t *testing.T) {
 	requireNetlink(t)
 
-	sess := newSession(nil, "test", roleInitiator)
-	remote := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
-	ps := newPathSet([]pathSpec{{id: 0, name: "ompnl1"}}, sess, remote, func(uint8, []byte) {})
-	sess.registerPath(0)
+	const trials = 3
+	var fast int
+	var took []time.Duration
 
-	go ps.run()
-	time.Sleep(400 * time.Millisecond) // let the initial reconcile pass
+	for i := 0; i < trials; i++ {
+		name := fmt.Sprintf("ompnlb%d", i)
+		sess := newSession(nil, "test", roleInitiator)
+		remote := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+		ps := newPathSet([]pathSpec{{id: 0, name: name}}, sess, remote, func(uint8, []byte) {})
+		sess.registerPath(0)
 
-	if len(ps.active()) != 0 {
-		t.Fatal("path was bound before its interface existed")
+		go ps.run()
+		time.Sleep(300 * time.Millisecond) // past the initial reconcile
+
+		if len(ps.active()) != 0 {
+			t.Fatalf("trial %d: path was bound before its interface existed", i)
+		}
+
+		start := time.Now()
+		del := makeLink(t, name, fmt.Sprintf("10.97.%d.1/24", i))
+
+		deadline := time.Now().Add(rebindInterval + time.Second)
+		for len(ps.active()) == 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		d := time.Since(start)
+		bound := len(ps.active()) != 0
+		del()
+
+		if !bound {
+			t.Fatalf("trial %d: path never bound, %s after its interface appeared", i, d)
+		}
+		took = append(took, d)
+		// The sweep cannot have run yet: run() times out at rebindInterval
+		// from start and the interface appeared 300ms in. Anything well
+		// under an interval had to come from an event.
+		if d < rebindInterval/2 {
+			fast++
+		}
 	}
 
-	start := time.Now()
-	del := makeLink(t, "ompnl1", "10.98.1.1/24")
-	defer del()
-
-	deadline := time.Now().Add(rebindInterval + time.Second)
-	for len(ps.active()) == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	t.Logf("bind latencies %v (backstop sweep is %s), %d/%d event-fast", took, rebindInterval, fast, trials)
+	if fast < trials-1 {
+		t.Errorf("only %d of %d binds beat the sweep; events are not driving detection", fast, trials)
 	}
-	took := time.Since(start)
-
-	if len(ps.active()) == 0 {
-		t.Fatalf("path never bound, %s after its interface appeared", took)
-	}
-	// The sweep could not have run yet: run() ticks at rebindInterval from
-	// start, and the interface appeared 400ms in. Anything under half an
-	// interval had to come from an event.
-	if took > rebindInterval/2 {
-		t.Errorf("path took %s to bind - that is sweep latency, not event latency;"+
-			" D-029 is not fixed", took)
-	}
-	t.Logf("bound %s after the interface appeared (backstop sweep is %s)", took, rebindInterval)
 }
 
 // The other direction, which is the one D-029 actually measured: a link

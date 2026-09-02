@@ -1,7 +1,9 @@
 package relay
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"sync/atomic"
 	"syscall"
 )
@@ -66,6 +68,13 @@ func watchLinks() (*linkWatcher, error) {
 		return nil, fmt.Errorf("netlink bind: %w", err)
 	}
 
+	// A generous receive buffer, because the cost of a full one is a
+	// dropped notification and the events arrive in bursts by nature: an
+	// interface is created, addressed and brought up in quick succession,
+	// and a box coming out of a dead zone does that for every link at
+	// once. Failure to raise it is not worth refusing to start over.
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 1<<20)
+
 	w := &linkWatcher{events: make(chan struct{}, 1), fd: fd}
 	go w.read()
 	return w, nil
@@ -88,10 +97,27 @@ func (w *linkWatcher) read() {
 	// wrong until the next periodic reconcile - exactly the latency this
 	// exists to remove.
 	buf := make([]byte, 65536)
+	var dropped int
 	for {
 		n, _, err := syscall.Recvfrom(w.fd, buf, 0)
 		if err != nil {
-			if err == syscall.EINTR {
+			switch {
+			case errors.Is(err, syscall.EINTR):
+				continue
+			case errors.Is(err, syscall.ENOBUFS):
+				// The kernel dropped multicast messages because this
+				// socket did not drain fast enough. That is a burst, not
+				// a fault - several modems registering at once on a cold
+				// boot is the case scope-v1.md calls out - and the one
+				// thing not to do is stop watching. Something changed and
+				// we no longer know what, so ask for a reconcile, which
+				// reads interface state directly and does not depend on
+				// having seen the message that was lost.
+				dropped++
+				if dropped == 1 || dropped%100 == 0 {
+					log.Printf("paths: netlink messages dropped (%d); reconciling from scratch", dropped)
+				}
+				w.notify()
 				continue
 			}
 			return // socket closed, or unreadable; the periodic reconcile carries on
