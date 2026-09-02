@@ -572,6 +572,35 @@ v6 at the home end plus a change to the provisioning bundle. Revisit when either
 provisioning flow is being touched anyway or something the RV needs turns out to be
 v6-only.
 
+**Implemented** (2026-09-02) on the RV, in `/etc/netplan/60-wan-i226.yaml`, as two
+settings on each WAN interface:
+
+```yaml
+      accept-ra: false
+      link-local: []
+```
+
+which netplan renders as `IPv6AcceptRA=no` and `LinkLocalAddressing=no`. After this the
+WAN interfaces carry no IPv6 at all - no global address, no link-local, no default route
+- so a v6 connect fails with `ENETUNREACH` in about a millisecond and Happy Eyeballs
+falls back to v4 with nothing perceptible. `eth0` is untouched and keeps its link-local;
+`net.ipv6.conf.all.forwarding` is 0, so the LAN has no v6 path through the box either.
+
+**The trap, for whoever checks this next.** `net.ipv6.conf.enp1s0.accept_ra` was *already*
+0 before the fix, and the leak was wide open anyway. That sysctl is not the control here:
+systemd-networkd sets it to 0 precisely because it does RA processing itself, in
+userspace, and then installs what it learns - which is why the leaked routes read
+`proto ra` and the addresses read `noprefixroute mngtmpaddr`. Reading the sysctl and
+concluding IPv6 was already handled is the obvious wrong turn, and setting it by hand in
+`/etc/sysctl.d` would change nothing at all. The control is networkd's configuration.
+
+Two related things worth knowing. The leaked addresses were `valid_lft forever`, so they
+would never have aged out on their own; `netplan apply` removed them, no manual flush was
+needed. And the symptom that started this was measured again on the way in: before the
+fix, `curl -6` egressed from `2600:380:8769:9ad9::...` straight out `enp2s0`, while after
+it, google.com, cloudflare.com and netflix.com all resolve dual-stack and all leave from
+`10.20.0.2` - through the tunnel, where they can be measured.
+
 **Note.** IPv6 appeared nowhere in these documents before this entry. It was not a
 decision that went wrong; it was one nobody had made.
 
