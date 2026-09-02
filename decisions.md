@@ -613,3 +613,47 @@ decision that went wrong; it was one nobody had made.
 **Rationale.** Protocol-based rather than vendor-based. Works for apps never configured,
 survives vendor IP range changes, needs no feed. Vendor prefix lists become a hint rather
 than a foundation, which is a much better role for them given how fast they rot.
+
+---
+
+## D-028 · The multi-stream tunnel throughput ceiling is deferred, not accepted
+
+**Decision.** Bulk throughput through the tunnel degrades as concurrent flows rise. It is
+recorded here with its measurements and left alone for now.
+
+**Measured** (2026-09-02, RV to Cloudflare, `enp2s0` carrying the tunnel, home uplink
+measured separately at 364 Mbps so it is not the constraint):
+
+| Concurrency | Tunnel | Direct | Cost |
+|---|---|---|---|
+| 1 stream | 104.4 Mbps | 108.1 Mbps | 3% |
+| 6 streams | 81 Mbps | 122 Mbps | 34% |
+| Ookla speedtest | 44 Mbps | 128 Mbps | 65% |
+
+Upload is much cheaper than download: 72.8 against 82.4 Mbps, 12%. Idle latency costs
+about 5 ms. `ompd` used 7% of one core while carrying 104 Mbps, so this is not crypto and
+not raw compute.
+
+**What it is not.** Not the home uplink, not CPU, and not the IPv6 leak of D-026, which
+was fixed first and separately. Single-stream cost of 3% says the data path is sound; the
+penalty appears only with concurrency, which points at a per-packet or serialisation
+ceiling - the initiator reads the WireGuard loopback from one goroutine and allocates the
+global sequence there. That is a hypothesis. It has not been profiled and should not be
+repeated as fact.
+
+**Why defer.** Two reasons. The first is that the same comparison shows the tunnel is
+*better* where this project says it cares: 92 ms of loaded latency with 19 ms jitter
+against 318 ms and 69 ms jitter going direct, about 3.5x. Bulk peak throughput is
+explicitly sacrificial (`scope-v1.md`), conferencing quality is not, and some of the
+missing throughput is the tunnel declining to fill the modem's queue - which is the
+behaviour admission control is being built to produce deliberately.
+
+The second is sequencing. D-020 rewrites this exact data path: the daemon moves above
+WireGuard onto a TUN device and the loopback relay goroutine that is the leading suspect
+stops existing in its current form. Profiling a component scheduled for replacement, to
+fix a symptom that partly overlaps with what step 9 will address on purpose, is work
+done twice.
+
+**Revisit** after D-020 lands and step 9 is in, by re-running the table above. If the
+concurrency penalty survives both, it is real and structural rather than incidental, and
+that is the point to profile it properly.
