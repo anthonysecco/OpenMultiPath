@@ -241,8 +241,14 @@ Needed to identify conferencing traffic. Run in precedence order, first match wi
    **before the first media packet arrives.** This is a flow-birth announcement. It is
    protocol-based rather than vendor-based, so it works for apps never configured,
    survives IP range changes, and needs no vendor feed.
-2. **Vendor prefix matching**, for non-WebRTC paths such as Zoom's native client.
-3. **Behavioral heuristic**, as catch-all.
+2. **RTP header detection.** Media saying what it is. Confirmed after three packets
+   agreeing on a 32-bit SSRC, which takes 60 ms of audio and less than one video frame.
+   This is what identifies **video**, which the behavioural test below cannot — see the
+   warning under that table. It also covers the case STUN cannot: a daemon that started
+   mid-call never saw the ICE exchange. Works on SRTP, where the payload is encrypted but
+   the header is not. See D-030.
+3. **Vendor prefix matching**, for non-WebRTC paths such as Zoom's native client.
+4. **Behavioral heuristic**, as catch-all.
 
 Cache classification per 5-tuple in a flow cache so subsequent packets are not
 re-inspected.
@@ -274,7 +280,7 @@ exclusion.
 
 Within UDP, discriminate on behavior rather than port:
 
-| Signal | RTP media | QUIC bulk |
+| Signal | RTP **audio** | QUIC bulk |
 |---|---|---|
 | Packet size | 60–250 B, tight distribution | MTU-sized, 1200–1400 B |
 | Inter-packet gap | ~20 ms, very low variance | bursty |
@@ -283,6 +289,17 @@ Within UDP, discriminate on behavior rather than port:
 
 Inter-packet-gap variance plus mean packet size separates these almost perfectly. A
 conferencing audio flow is metronomic and small; nothing else looks like that.
+
+> **This table describes audio only, and reading it as "media" is a mistake this project
+> already made.** Video RTP is MTU-sized, because a frame is fragmented across as many
+> packets as it takes, and frame-bursty, because those go out together and then nothing
+> happens until the next frame. It therefore fails *both* columns and a classifier built
+> on this table alone calls a 1080p stream bulk — the wrong answer to the one question
+> that matters, given the primary use case is a video call. Video is identified from the
+> RTP header instead (signal 2 above, D-030). What remains for this table is media
+> carrying no RTP framing at all, which is rare, so its thresholds are set conservatively:
+> a missed flow gets bulk treatment, while a false positive duplicates a download over a
+> metered link.
 
 ## Admission control
 

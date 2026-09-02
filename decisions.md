@@ -906,3 +906,56 @@ done twice.
 **Revisit** after D-020 lands and step 9 is in, by re-running the table above. If the
 concurrency penalty survives both, it is real and structural rather than incidental, and
 that is the point to profile it properly.
+
+---
+
+## D-030 · Identify media from the RTP header, not from its shape
+
+**Decision.** Detect RTP directly, confirmed by three packets agreeing on a 32-bit SSRC,
+and place it second in the classification order - after STUN, ahead of vendor prefixes.
+
+**Why this came up.** The classifier was validated against the traffic the project exists
+to protect, and failed it. Audio classified real-time; 720p video, 1080p video and screen
+share all classified **bulk**. The primary use case in `CLAUDE.md` is a teleworker on a
+video call, and the behavioural test called every video stream a download.
+
+The cause is in `protocol.md`, which tabulates "RTP media" as 60-250 bytes at a metronomic
+20 ms. That is Opus, and only Opus. Video RTP is MTU-sized, because a frame is fragmented
+across as many packets as it takes, and frame-bursty, because those packets go out
+together and then nothing happens until the next frame - so it fails the size test and the
+gap-variance test both. The table was right about audio and was read as being about media.
+
+**Rationale.** The RTP header identifies media directly instead of inferring it from
+shape, so packet size stops mattering and video is caught like anything else. It is
+protocol-based rather than vendor-based, which is D-019's argument applied again. And it
+works on SRTP: the payload is encrypted, the header is not, because the receiver's jitter
+buffer and any middlebox in between have to read it.
+
+It also closes a gap STUN cannot. STUN is better when it fires, because ICE announces the
+5-tuple before media exists - but it only fires at the start of a call. **A daemon that
+starts in the middle of an existing call never sees the ICE exchange**, and a restart
+during a canyon transit is exactly that. RTP evidence arrives on every packet, so it
+recovers a call already in progress.
+
+**Why it is safe ahead of the behavioural test.** The version bits separate RTP from
+everything that shares these ports without ambiguity: RTP begins `10`, QUIC's long header
+`11`, QUIC's short header `01`, and STUN and DTLS both `00`. Payload types 72-76 are
+excluded because RFC 3551 reserves them so RTCP can share a port. One packet matching
+would still be weak - a quarter of random payloads have the right two bits - so three
+consecutive packets must agree on the SSRC, which a 32-bit random value does not do by
+chance. Confirmed on real captured traffic: no Cloudflare QUIC flow was mistaken for
+media.
+
+**Ordered ahead of vendor prefixes**, which `protocol.md` had at position two. A vendor
+prefix is a guess that an address range carries media; an RTP header is the media saying
+so. Strictly better evidence belongs strictly earlier.
+
+**Latency, which is the point.** Media now settles at packet 3 rather than packet 24 - 60
+ms at audio cadence, less than one frame of video, against roughly half a second before.
+On real captured traffic the same stream that took 24 packets to identify now takes 3.
+
+**Consequence for D-027.** The behavioural test is no longer how media is found; it is a
+last resort for media carrying no RTP framing, which is rare. So its gap-variance
+threshold was tightened from 10 ms to 5 ms. At 10 ms a stream of small QUIC
+acknowledgements passed as real-time, which is D-027's expensive mistake - a duplicated
+download on a metered link - and genuine audio sits nowhere near either bound.

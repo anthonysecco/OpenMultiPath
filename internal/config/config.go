@@ -295,10 +295,20 @@ var Bounds = map[string]bound{
 	// and this threshold does not need to be precise.
 	"classify_rtp_max_bytes": {Min: 64, Max: 1_400, Default: 250},
 
-	// Half the 20 ms cadence, as a standard deviation. Generous enough to
-	// survive scheduling noise on a loaded box and a cellular link's own
-	// jitter, tight enough that nothing bursty gets through it.
-	"classify_gap_variance_ms": {Min: 1, Max: 200, Default: 10},
+	// A quarter of the 20 ms cadence, as a standard deviation, and
+	// deliberately strict.
+	//
+	// This was 10 ms while the behavioural test was the only thing that
+	// could identify media at all. RTP detection now does that job
+	// directly and far better - it catches video, which no size-and-gap
+	// test ever will - so what is left here is a last resort for media
+	// that carries no RTP framing, which is rare. Its errors are not
+	// symmetric: missing such a flow gives it bulk treatment, while a
+	// false positive duplicates a download over a metered link, which is
+	// the expensive mistake D-027 exists to avoid. At 10 ms a stream of
+	// small QUIC acknowledgements passed as real-time; at 5 ms it does
+	// not, and genuine audio is nowhere near either bound.
+	"classify_gap_variance_ms": {Min: 1, Max: 200, Default: 5},
 
 	// Eight thousand conversations is far more than a household behind
 	// one RV generates, and costs a few megabytes if it ever fills.

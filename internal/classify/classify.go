@@ -65,6 +65,12 @@ type flow struct {
 
 	lastSeen time.Time
 
+	// RTP evidence: the SSRC and sequence of the last packet that looked
+	// like media, and how many in a row have agreed. See rtp.go.
+	rtpSSRC uint32
+	rtpSeq  uint16
+	rtpRun  int
+
 	// The behavioural sample. Mean packet size and the spread of the
 	// inter-packet gap are the two signals protocol.md says separate RTP
 	// from QUIC "almost perfectly", so they are the two collected.
@@ -163,7 +169,17 @@ func (c *Classifier) Classify(pkt []byte) uint8 {
 		return f.class
 	}
 
-	// 2. Vendor prefixes. Matched against both endpoints: a vendor range
+	// 2. RTP. Direct evidence that this flow is carrying media, and the
+	// only signal that identifies video - which is MTU-sized and bursty,
+	// so the behavioural test below calls it bulk. Ordered ahead of vendor
+	// prefixes deliberately: a prefix is a guess that an address range
+	// carries media, while an RTP header is the media saying so.
+	if f.noteRTP(p.payload) {
+		f.class, f.decided = protocol.ClassRealtime, true
+		return f.class
+	}
+
+	// 3. Vendor prefixes. Matched against both endpoints: a vendor range
 	// will not collide with the RV's own LAN, so there is no need to work
 	// out which end is remote.
 	if c.vendorMatch(p.flow) {
@@ -171,7 +187,7 @@ func (c *Classifier) Classify(pkt []byte) uint8 {
 		return f.class
 	}
 
-	// 3. Behavioural catch-all.
+	// 4. Behavioural catch-all.
 	c.observe(f, p, now)
 	if f.samples >= cfg.ClassifySamplePackets {
 		f.class, f.decided = c.behavioural(f, cfg), true
