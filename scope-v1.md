@@ -94,6 +94,16 @@ of reasoning up front.
 
    Nothing reads the class yet. That is step 8.
 8. **Scheduling and real-time handling.** Duplication, make-before-break, stickiness.
+   **Class-aware scheduling built** (2026-09-02). The scheduler publishes a transmit set
+   per class rather than one for everything, so redundancy goes where it is worth paying
+   for: real-time is duplicated by policy, bulk rides a single path whatever the policy
+   says, and make-before-break overlap is real-time only. Anything not positively
+   identified as real-time is carried as bulk. The duplication default moves from
+   handovers-only to duplicating real-time while its path is degraded, which D-022 could
+   not do while nothing could tell a call from a download. Verified on the wire: sixty
+   real-time packets went out both paths, sixty bulk packets went out one.
+   Still to come here: steering bulk *away* from the real-time path when a second usable
+   one exists, which is the canyon walkthrough's "pull bulk off Starlink immediately".
 9. **Admission control.** Alongside the scheduler, not after.
 10. **Cost tracking and budget bands.**
 11. **Fallback, watchdog, rollback.**

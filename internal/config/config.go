@@ -180,18 +180,25 @@ const (
 	DuplicateOff = "off"
 
 	// DuplicateSwitching duplicates only during a make-before-break
-	// handover. Still the default, though the reason has narrowed. Packets
-	// now carry a class when the daemon runs above WireGuard (step 7), so
-	// a per-class policy is finally expressible - but nothing reads the
-	// class yet, that being step 8, and below WireGuard every packet is
-	// still ClassUnknown. Until a broader mode can tell audio from bulk it
-	// would duplicate them alike, which is what saturated the 512k
-	// Starlink standby link in the first place.
+	// handover. No longer the default - see DuplicateUnstable - but kept
+	// as the setting for a link where every byte is counted and even
+	// insurance is too expensive.
 	DuplicateSwitching = "switching"
 
 	// DuplicateUnstable additionally duplicates while the chosen path is
-	// degraded. Correct for real-time once there is a real-time class to
-	// apply it to; costly before then.
+	// degraded, and is the default.
+	//
+	// It became the right default when step 8 made duplication a per-class
+	// decision. D-022 chose handovers-only because nothing could tell a
+	// call from a download, so any broader policy mirrored bulk onto the
+	// 512k standby link and collapsed it. Bulk now rides one path whatever
+	// this is set to, so the cost of this setting is a second copy of the
+	// real-time flow, taken only while the path carrying it is degraded,
+	// and only onto a path with the measured capacity to hold it.
+	//
+	// Which is insurance bought exactly when the risk appears and not
+	// before - the canyon approach in scope-v1.md, where the dish starts
+	// to fail and audio wants a second route before the first one stops.
 	DuplicateUnstable = "unstable"
 
 	// DuplicateAlways is the old unconditional behaviour, kept as an
@@ -362,7 +369,7 @@ func Defaults() Config {
 		ClassifyMaxFlows:        Bounds["classify_max_flows"].Default,
 		ClassifyFlowIdleSeconds: Bounds["classify_flow_idle_seconds"].Default,
 
-		DuplicateMode: DuplicateSwitching,
+		DuplicateMode: DuplicateUnstable,
 	}
 }
 

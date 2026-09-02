@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
+	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 )
 
 // The scheduler decides which path or paths each packet goes out of.
@@ -40,8 +41,18 @@ type pathView struct {
 // decision is one complete scheduling verdict, published as a unit so that
 // no reader can ever see a half-updated view.
 type decision struct {
-	// tx is the paths a data packet is sent on, in order.
-	tx []uint8
+	// tx is the paths a real-time packet is sent on, in order, and txBulk
+	// the paths a bulk one takes. Step 8: they are allowed to differ,
+	// which is the entire point of having spent step 7 working out which
+	// is which.
+	//
+	// Only real-time is ever duplicated. scope-v1.md is explicit that bulk
+	// is sacrificial and that redundancy is for the call, and D-022 warned
+	// that a policy which could not tell them apart would mirror a
+	// download onto a 512k standby link because it looked healthy while
+	// carrying nothing. It can tell them apart now.
+	tx     []uint8
+	txBulk []uint8
 
 	primary     uint8
 	havePrimary bool
@@ -142,7 +153,19 @@ func (s *scheduler) current() *decision { return s.cur.Load() }
 
 // txPaths is the data path's entire interface to the scheduler: the paths
 // this packet should go out of.
-func (s *scheduler) txPaths() []uint8 { return s.cur.Load().tx }
+// txPaths is the set of paths one packet of the given class goes out of.
+//
+// Anything not positively identified as real-time is carried as bulk. That
+// is D-027's asymmetry applied at the point it costs something: treating a
+// download as a call duplicates it over a metered link, while treating a
+// call as bulk costs it the duplication it might not have needed.
+func (s *scheduler) txPaths(class uint8) []uint8 {
+	d := s.cur.Load()
+	if class == protocol.ClassRealtime {
+		return d.tx
+	}
+	return d.txBulk
+}
 
 // run evaluates forever on the configured cadence.
 //
@@ -498,14 +521,30 @@ func (s *scheduler) buildTx(d *decision, c config.Config, eligible []scored, sen
 		sort.Slice(d.tx, func(i, j int) bool { return d.tx[i] < d.tx[j] })
 		d.blind = len(d.tx) > 0
 		d.reason = "no usable path, sending on everything bound"
+
+		// Blind mode sprays both classes alike. There is no measurement
+		// left to tell them apart with, so withholding bulk would be
+		// acting on a distinction nothing can currently support.
+		d.txBulk = append(d.txBulk, d.tx...)
 		return
 	}
 
 	d.tx = append(d.tx, s.primary)
 
+	// Bulk rides the primary and stops there, whatever follows. Every
+	// branch below adds paths for redundancy, and redundancy is for the
+	// call.
+	d.txBulk = []uint8{s.primary}
+
 	if s.switching && sendable[s.switchingTo] {
+		// Make-before-break, which scope-v1.md scopes to real-time
+		// explicitly. Bulk stays where it is until the switch commits:
+		// a download does not need both copies to survive a handover,
+		// TCP will sort out what it misses, and paying double for it
+		// during exactly the window the call needs the capacity is the
+		// wrong trade.
 		d.tx = append(d.tx, s.switchingTo)
-		d.reason = "make-before-break handover"
+		d.reason = "make-before-break handover (real-time only)"
 		return
 	}
 
@@ -527,9 +566,9 @@ func (s *scheduler) buildTx(d *decision, c config.Config, eligible []scored, sen
 			}
 			d.tx = append(d.tx, sc.m.id)
 		}
-		d.reason = "duplicating on every usable path"
+		d.reason = "duplicating real-time on every usable path"
 		if skipped > 0 {
-			d.reason = "duplicating on every path with the capacity for it"
+			d.reason = "duplicating real-time on every path with the capacity for it"
 		}
 
 	case config.DuplicateUnstable:
@@ -548,7 +587,7 @@ func (s *scheduler) buildTx(d *decision, c config.Config, eligible []scored, sen
 				break
 			}
 			if len(d.tx) > 1 {
-				d.reason = "duplicating while the chosen path is degraded"
+				d.reason = "duplicating real-time while the chosen path is degraded"
 			} else {
 				d.reason = "chosen path degraded, no path has the capacity to duplicate onto"
 			}

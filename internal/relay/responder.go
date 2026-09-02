@@ -156,7 +156,7 @@ func RunResponder(cfg ResponderConfig) error {
 		sess.noteClass(class)
 		globalSeq := sess.nextGlobalSeq()
 
-		tx := sched.txPaths()
+		tx := sched.txPaths(class)
 		if len(tx) == 0 {
 			tx = known()
 		}

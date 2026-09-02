@@ -545,9 +545,16 @@ the negligible cost `protocol.md` assumes when it reasons about 40 kbps of audio
 Duplicating during a handover is where the redundancy actually buys something - it is what
 makes the switch gapless - and it is time-bounded.
 
-**Revisit when classification lands.** Step 7 landed on 2026-09-02 and packets now carry
-a class above WireGuard, so this is unblocked and waiting on step 8 to read it. The right
-policy is per class and per budget band:
+**Revisited and changed** (2026-09-02). Step 7 landed and step 8 made the transmit set a
+per-class decision, so the reasoning that forced handovers-only no longer holds: bulk now
+rides a single path whatever this is set to, and duplication can only ever cost a second
+copy of the real-time flow. The default moves to `unstable` - duplicating real-time while
+the path carrying it is degraded, onto a path measured to have room for it. Insurance
+bought when the risk appears rather than continuously, which is the canyon approach in
+`scope-v1.md`. `switching` remains available for a link where even that is too expensive.
+
+The original note follows, and its shape still stands. The right policy is per class and
+per budget band:
 audio duplicated whenever a second path exists and budget is green, video only when a link
 is unstable or an unmetered path is available. That cannot be expressed until packets
 carry a class, so **unstable** and **always** exist as manual escape hatches until then.

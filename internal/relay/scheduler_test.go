@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
+	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 )
 
 // A synthetic world of paths the scheduler can be driven through. The
@@ -680,5 +681,134 @@ func TestFallsBackToRoundTripWithoutAReport(t *testing.T) {
 	}
 	if d.primary != 0 {
 		t.Errorf("primary is path %d, want the lower-latency path 0 on round-trip scoring", d.primary)
+	}
+}
+
+// bulkSet is txSet for the other class.
+func bulkSet(d *decision) map[uint8]bool {
+	out := map[uint8]bool{}
+	for _, id := range d.txBulk {
+		out[id] = true
+	}
+	return out
+}
+
+// Step 8, and the reason step 7 was worth doing. Duplication is insurance
+// for the call; buying it for a download is how the 512k standby link got
+// saturated in the first place (D-022). Even told to duplicate on
+// everything, bulk must ride one path.
+func TestBulkIsNeverDuplicatedEvenWhenToldTo(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.c.DuplicateMode = config.DuplicateAlways
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	if len(d.tx) < 2 {
+		t.Fatalf("real-time is on %d paths (%v) under duplicate-always, want more than one", len(d.tx), d.tx)
+	}
+	if len(d.txBulk) != 1 {
+		t.Errorf("bulk is on %d paths (%v) under duplicate-always, want exactly one", len(d.txBulk), d.txBulk)
+	}
+	if d.txBulk[0] != d.primary {
+		t.Errorf("bulk is on path %d, want the primary %d", d.txBulk[0], d.primary)
+	}
+}
+
+// The same policy applied to the class it was written for.
+func TestRealtimeDuplicatesWhileTheChosenPathIsDegraded(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.c.DuplicateMode = config.DuplicateUnstable
+	w.tick(w.c.PromoteIntervals + 5)
+
+	// Both links degrade together, which is what a canyon does - degrading
+	// only one would simply hand the flow to the other, and then the
+	// primary is not degraded and there is nothing to insure against.
+	for _, id := range []uint8{0, 1} {
+		w.set(id, func(p *pathMetric) { p.recentLoss = float64(w.c.UnstableLossPercent) + 2 })
+	}
+	d := w.tick(w.c.DemoteIntervals + 3)
+	if d.blind {
+		t.Skip("world went blind; that path is covered by its own test")
+	}
+
+	if len(d.tx) < 2 {
+		t.Errorf("real-time is on %d paths (%v) with a degraded primary, want a second copy", len(d.tx), d.tx)
+	}
+	if len(d.txBulk) != 1 {
+		t.Errorf("bulk followed real-time onto %d paths (%v), want one", len(d.txBulk), d.txBulk)
+	}
+}
+
+// Make-before-break is scoped to real-time in scope-v1.md. Paying double
+// for a download during exactly the window the call needs the capacity is
+// the wrong trade, and TCP will sort out what a switch costs it.
+func TestMakeBeforeBreakCarriesRealtimeOnBothAndBulkOnOne(t *testing.T) {
+	w := newWorld(t, path(0, 20), path(1, 30))
+	w.tick(w.c.PromoteIntervals + 5)
+	if d := w.s.current(); d.primary != 0 {
+		t.Fatalf("primary is %d, want path 0 to start", d.primary)
+	}
+
+	// Push the primary below the floor so a handover starts.
+	w.set(0, func(p *pathMetric) { p.rttMs = 900; p.recentLoss = 20 })
+
+	var seen bool
+	for i := 0; i < 40; i++ {
+		d := w.tick(1)
+		if !d.switching {
+			continue
+		}
+		seen = true
+		if len(d.tx) < 2 {
+			t.Errorf("mid-handover real-time is on %d paths (%v), want both", len(d.tx), d.tx)
+		}
+		if len(d.txBulk) != 1 {
+			t.Errorf("mid-handover bulk is on %d paths (%v), want one", len(d.txBulk), d.txBulk)
+		}
+		break
+	}
+	if !seen {
+		t.Skip("no handover window observed; covered by the handover tests above")
+	}
+}
+
+// Principle 5. With nothing usable there is no measurement left to tell the
+// classes apart with, so withholding bulk would be acting on a distinction
+// nothing can currently support.
+func TestBlindModeSpraysBothClasses(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.tick(w.c.PromoteIntervals + 5)
+	for _, id := range []uint8{0, 1} {
+		w.set(id, func(p *pathMetric) { p.silentFor = w.c.DownSilence() * 2; p.sentSinceHeard = 100 })
+	}
+	d := w.tick(w.c.DemoteIntervals + 5)
+
+	if !d.blind {
+		t.Skip("world did not reach blind mode")
+	}
+	if len(d.tx) == 0 || len(d.txBulk) == 0 {
+		t.Errorf("blind mode carries real-time on %v and bulk on %v; both must be sent somewhere", d.tx, d.txBulk)
+	}
+	if len(d.tx) != len(d.txBulk) {
+		t.Errorf("blind mode split the classes, real-time %v against bulk %v", d.tx, d.txBulk)
+	}
+}
+
+// Anything not positively identified as real-time is carried as bulk -
+// D-027's asymmetry applied where it costs something.
+func TestUnknownClassIsCarriedAsBulk(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.c.DuplicateMode = config.DuplicateAlways
+	w.tick(w.c.PromoteIntervals + 5)
+
+	unknown := w.s.txPaths(protocol.ClassUnknown)
+	bulk := w.s.txPaths(protocol.ClassBulk)
+	realtime := w.s.txPaths(protocol.ClassRealtime)
+
+	if len(unknown) != len(bulk) {
+		t.Errorf("unclassified traffic took %v, bulk took %v; they must match", unknown, bulk)
+	}
+	if len(unknown) >= len(realtime) {
+		t.Errorf("unclassified traffic took %v, as many paths as real-time's %v;"+
+			" an unidentified download must not be duplicated", unknown, realtime)
 	}
 }
