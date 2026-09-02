@@ -288,8 +288,204 @@ the daemon's own bind/rebind visibility (it currently distinguishes "bound but s
 "not bound", which wants recovering by reading interface state).
 
 **Note.** Supersedes the single-tunnel relay shape the daemon was built with, and restores
-what `CLAUDE.md` and `architecture.md` always described. Not yet implemented: step 6 was
-built first, and is independent of this.
+what `CLAUDE.md` and `architecture.md` always described.
+
+**In progress** (2026-09-02). The RV already carries the routing half of this: `ip rule`
+sends fwmark `0x2001` to table 2001 and `0x2002` to table 2002, whose default routes are
+`enp2s0` and `enp1s0` respectively, which is exactly the per-link pinning above. What was
+missing entirely was any way to read a plaintext packet, so `internal/tun` was built
+first: it opens the device, addresses and sizes it, brings it up, and hands back one raw
+IP packet per read. Verified on the RV itself, not only in a build sandbox.
+
+Two things surfaced there that the rewrite has to account for, and both are now handled or
+recorded. The kernel autoconfigures an IPv6 link-local address on any device the moment it
+comes up and starts emitting router solicitations, which the daemon would have read back
+out of its own tunnel as inner packets to classify - so the device disables IPv6 before
+going up, per D-026. And the kernel emits IPv4 housekeeping regardless: an IGMP membership
+report for 224.0.0.22 arrives on a freshly created device before any routed traffic does.
+Nothing to fix there, but a consumer that assumed every packet was routed user traffic
+would be wrong from the first read.
+
+**Data path built** (2026-09-02), behind `-tun`, alongside the loopback relay rather than
+replacing it. Naming a device runs above WireGuard; omitting the flag runs the original
+shape. Same binary either way, so the way back from a bad update 800 miles away is a
+restart with an argument removed rather than a recovery trip - principle 5.
+
+The rewrite turned out to be much smaller than "data-path rewrite" suggested, because
+`pathSet` was already generic. It binds a UDP socket to an interface's IPv4 address with
+`SO_BINDTODEVICE` and sends to one shared remote; nothing in it assumes a *physical* NIC.
+So pointing `-paths` at `wg1,wg2` and `-remote` at home's tunnel address makes the whole
+path layer work unchanged, with WireGuard's own fwmark doing the per-link pinning. The
+only real change was the local endpoint - a seam named `localEndpoint` with two
+implementations, loopback and TUN - and everything between them (header, sequencing,
+measurement, scoring, scheduling) is untouched and does not know which is in use.
+
+**Proven end to end** in two network namespaces joined by a veth pair: a packet routed
+into the RV's TUN crossed the tunnel and came out of home's TUN 103 us later with its
+source intact, and home's reply came back the other way 57 us after that. Both daemons
+logged no errors.
+
+**Provisioned and proven on the real boxes** (2026-09-02), with production left running
+throughout. `wg1` and `wg2` exist at `/etc/wireguard/` on the RV with their own keypairs,
+addresses and fwmarks; `wgm` exists at home with one peer per link. None are enabled - see
+the blockers below.
+
+Two things were demonstrated on the hardware rather than in a sandbox:
+
+*Per-link pinning works.* With `wg1` marked `0x2001` and `wg2` marked `0x2002`, their
+handshake initiations left `enp2s0` (from `192.168.225.3`) and `enp1s0` (from
+`100.110.247.30`) respectively, and `wg0` carried none of it. That last part matters: the
+RV's default route is `dev wg0`, so without the fwmark this traffic would have recursed
+into the production tunnel. The staged `ip rule` plumbing does exactly what it was put
+there for.
+
+*The data path carries real load.* Running both daemons with `-tun` over a real WireGuard
+interface between the two boxes: ping across the tunnel addresses returned 5 of 5 at
+28-38 ms, and a 20 MB transfer ran at 40.7 Mbps with the daemon reporting `mos 4.4
+PRIMARY, rtt 25.4 ms, jitter 1.6 ms, lost 0`. That figure is not a throughput result worth
+quoting - the test had to nest inside the production tunnel, so it was triple-encapsulated
+- but it establishes that the path carries sustained traffic and measures it correctly.
+
+**Blocker 1: only one port reaches home.** Probing 51821, 51900, 48220 and 51822 from the
+RV, none arrived; a control probe to 48219 did, alongside 321 packets of live production
+traffic. So the only forwarded UDP port is the one the production responder already owns.
+A staged cutover needs a second port forwarded to the home box - the configs are written
+for 51822 - or it has to take 48219 at the moment production releases it, which is not a
+staged cutover at all.
+
+**Blocker 2 - RESOLVED (2026-09-02).** The RV was only reachable *through the tunnel it
+would be cutting over*: home routes `10.0.0.0/24` down `wg0`, so stopping the production
+responder to free 48219 would have stranded the vehicle and the person doing it in the
+same instant. That is the failure `scope-v1.md` names under field upgrades - "unrecoverable
+without fallback working" - and it was true of the *cutover itself*, not merely of a bad
+build.
+
+There is now an out-of-band path. The dev box's Wi-Fi adapter is associated to the RV's
+LAN at a static `10.0.0.237/24`, which puts an on-link route to `10.0.0.0/24` in front of
+the tunnel path on longest prefix, so `ssh omp-remote1` takes it automatically. It is
+independent by construction - the RV answers on `eth0`, nothing in the path touches `ompd`
+or `wg0` - and that was verified rather than assumed: `ompd` was stopped on the RV for 30
+seconds behind a self-restarting unit, and the box stayed reachable 3 times out of 3 with
+the tunnel down.
+
+The link is marginal and should be treated as an emergency console rather than a working
+link: 2.4 GHz only, -65 dBm, negotiating MCS 0-2, roughly 17% packet loss, SSH connect
+times between 0.4 and 12 seconds. It is enough to restart a service or remove a flag,
+which is exactly what a rollback needs, and not enough for anything else.
+
+**Cutover rehearsed on the real boxes** (2026-09-02), taking 48219 in place rather than
+forwarding a second port, with the Wi-Fi path as the way back. It worked, and the whole
+sequence is now a known quantity.
+
+Two things made it safe enough to attempt. A `/usr/local/sbin/omp-restore` script on each
+box returns it to the production shape unconditionally, and a `systemd-run` dead-man
+timer runs that script after fifteen minutes unless cancelled - so losing the Wi-Fi
+mid-cutover costs a wait, not a vehicle. Both are worth keeping.
+
+One trick removed most of the need for the second port. Bringing `wg1` and `wg2` up while
+the *production* responder still held 48219 makes home log their handshakes as `bad packet
+from ...` - which proved both links reach home, on the real WAN, from the two expected
+public addresses, before anything was stopped. Reachability was the part worth rehearsing
+and it can be rehearsed for free.
+
+What ran, for the first time: `wgm` at home with one peer per link on 48219, `wg1` and
+`wg2` handshaking to it over their own physical links, and the daemon above them on a TUN
+device with **two** paths. Both were scored independently - path 0 at 31.8 ms picked
+PRIMARY over path 1 at 38.4 ms - and traffic crossed at 0% loss. Path selection had never
+run over two real links before.
+
+A config correction came out of it. Both per-link configs originally carried
+`AllowedIPs = 10.20.1.0/24`, and `wg-quick` would have failed installing the same route
+twice on the second interface up. Because the daemon carries one remote for every path,
+both links must dial the *same* home address, so the fix is `Table = off` plus an explicit
+per-interface route at differing metrics, with `SO_BINDTODEVICE` constraining the lookup.
+
+**Still blocking a real cutover:** nothing structural. What remains is moving the RV's
+default route onto the TUN and giving home egress for it, which is the part that changes
+what LAN clients experience and wants its own window.
+
+---
+
+## D-029 · Link-down detection bounds failover, not the scheduler
+
+**Decision.** Recorded, not yet fixed. The scheduler is not the slow part of a failover
+and tuning it will not help.
+
+**Measured** (2026-09-02, on the RV, two real WAN links under D-020). With traffic running
+at 250 ms intervals, the primary link's interface was taken down. 13 packets were lost,
+roughly 3.25 seconds. The log says where they went:
+
+```
+18:52:46 path 0: write failed ...
+18:52:46 path 0 (wg1): down (interface wg1 is down)
+18:52:46 scheduler: primary -> path 1 (no usable primary)
+```
+
+The scheduler moved the flow in the *same second* it was told. Every one of those three
+seconds was spent before that - discovering the link was gone. `paths.go` reconciles on a
+`rebindInterval` of two seconds, so a link that disappears cleanly stays "up" for up to
+one full poll, and `EvalIntervalMs` at 200 ms never gets a chance to matter.
+
+**Why it matters.** `protocol.md` sets a 100-200 ms reaction target. Three seconds of dead
+audio ends a call, and no amount of adjusting the state machine's thresholds will recover
+it, because the state machine is not the thing that is late.
+
+**Scope, honestly.** This is the clean interface-down case - a modem unplugged, a dish
+losing power. Gradual degradation, which is the canyon case and the more common one, is
+caught by quality scoring within a couple of evaluation intervals and is not affected.
+So this is one failure mode arriving late, not all of them.
+
+**Fixed** (2026-09-02) in `internal/relay/linkwatch.go`, with measurements below.
+
+Link state is an event, not a thing to poll. A netlink socket subscribed to `RTMGRP_LINK`
+and `RTMGRP_IPV4_IFADDR` wakes the existing reconcile as interfaces and addresses change.
+Addresses matter as much as links: a lease renewal under CGNAT moves a path's source
+address without the interface ever going down.
+
+Three things now drive a reconcile - a netlink event, a poke from the data path when a
+write fails, and the old periodic sweep. The sweep is kept at two seconds rather than
+relaxed, because it is what still works when events do not, and making it lazier on the
+strength of the fast path would trade away the fallback. This is deliberately a
+notification only: it carries no detail and the message body is not parsed, so reconcile
+remains the single place that decides what a path should do rather than there being two
+interpretations of link state to keep in agreement.
+
+The write-failure poke covers what events cannot see at all - a route withdrawn while the
+address stays put, which is an attached modem with no PDP context and an ordinary dead-zone
+state. It fires only on the transition into failure, so a path failing every write asks
+once rather than continuously.
+
+**A second latency, found while testing the first.** Events made link *removal* prompt
+immediately, but a link *appearing* still took a full sweep about one run in five. An
+interface is built in steps - created, then addressed, then brought up - and each step is
+its own event. A reconcile woken by the first sees a half-built interface, finds nothing
+bindable, and the wakeup that would have caught it finished has already been coalesced
+away. The same shape covers a bind refused a moment too early, and a modem sitting up
+with no address while DHCP finishes.
+
+So reconcile now reports whether anything is still converging, and the loop looks again in
+100 ms when it is. The distinction that matters is "not ready yet" against "not there":
+an interface that exists but cannot be bound is worth retrying hard, while one that is
+simply absent is a link in a dead zone, where polling at 100 ms for hours would cost power
+on a box running off a battery to discover nothing. Only the first is pending.
+
+**Measured after the fix**, against a 2 s sweep, over eight consecutive runs: a link
+disappearing is acted on in **5.5-6 ms**, and a link appearing in **11-14 ms**. Both were
+previously bounded by the sweep, and the interface-down case cost roughly 3 s in the
+field. That is now comfortably inside protocol.md's 100-200 ms target with two orders of
+magnitude to spare.
+
+If the netlink subscription fails at startup the daemon logs it and carries on with the
+sweep alone, which is exactly how it behaved before events existed. Principle 5: slower,
+and working.
+
+Verified on the RV itself as well as in the sandbox - `6.12.107+deb13-cloud-amd64`, the
+kernel flavour that ships without most physical-NIC drivers - at 11.96 ms to bind and
+15.40 ms to drop.
+
+**Still owed by the code:** recovering the bind/rebind visibility D-020 costs by reading
+interface state, and making the TUN MTU track the daemon's own recommendation rather than
+the flag default.
 
 ---
 

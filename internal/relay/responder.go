@@ -25,6 +25,11 @@ type ResponderConfig struct {
 	// AuthKey authenticates the wire header. Empty runs unauthenticated,
 	// which is the current default; see relay.LoadAuthKey.
 	AuthKey []byte
+
+	// Tun runs D-020's data path - above WireGuard, writing plaintext
+	// inner packets into the host stack for egress - when its Name is
+	// set. Empty keeps the loopback relay.
+	Tun TunConfig
 }
 
 // RunResponder relays between the public endpoint, reachable from any of
@@ -52,15 +57,12 @@ func RunResponder(cfg ResponderConfig) error {
 	pubConn := pc.(*net.UDPConn)
 	defer pubConn.Close()
 
-	wgTarget, err := net.ResolveUDPAddr("udp", cfg.LoopbackTarget)
+	local, err := newResponderEndpoint(cfg)
 	if err != nil {
-		return fmt.Errorf("relay: resolve wireguard target: %w", err)
+		return err
 	}
-	wgConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		return fmt.Errorf("relay: open loopback socket to wireguard: %w", err)
-	}
-	defer wgConn.Close()
+	defer local.Close()
+	log.Printf("responder: local endpoint is %s", local.describe())
 
 	sess := newSession(cfg.Settings, cfg.Node, roleResponder)
 	sess.setAuthKey(cfg.AuthKey)
@@ -104,7 +106,7 @@ func RunResponder(cfg ResponderConfig) error {
 		},
 	)
 
-	// Any RV path -> local WireGuard. Which path a packet came in on is
+	// Any RV path -> the local endpoint. Which path a packet came in on is
 	// taken from the header rather than inferred from its source address,
 	// which is what makes the return route survive the RV's addresses
 	// moving under CGNAT: the address is merely recorded against the path
@@ -124,8 +126,8 @@ func RunResponder(cfg ResponderConfig) error {
 		if h.Type != protocol.TypeData {
 			return
 		}
-		if _, err := wgConn.WriteToUDP(payload, wgTarget); err != nil {
-			log.Printf("responder: write to wireguard failed: %v", err)
+		if err := local.write(payload); err != nil {
+			log.Printf("responder: write to local endpoint failed: %v", err)
 		}
 	})
 
@@ -133,14 +135,14 @@ func RunResponder(cfg ResponderConfig) error {
 	sess.sched = sched
 	go sched.run()
 
-	// WireGuard -> whichever paths the scheduler has chosen.
+	// Local endpoint -> whichever paths the scheduler has chosen.
 	//
 	// Both ends schedule independently and neither tells the other what it
 	// decided. That is deliberate: paths are asymmetric, a link can be
 	// clean inbound and unusable outbound, and each end has measured its
 	// own receive direction directly rather than been told about it.
 	scratch := make([]byte, 0, bufSize+maxHeaderLen)
-	go readLoop(wgConn, "responder-wg", func(payload []byte, _ *net.UDPAddr) {
+	go local.readPayloads("responder-local", func(payload []byte) {
 		globalSeq := sess.nextGlobalSeq()
 
 		tx := sched.txPaths()
