@@ -584,3 +584,36 @@ decision that went wrong; it was one nobody had made.
 **Rationale.** Protocol-based rather than vendor-based. Works for apps never configured,
 survives vendor IP range changes, needs no feed. Vendor prefix lists become a hint rather
 than a foundation, which is a much better role for them given how fast they rot.
+
+---
+
+## D-027 · An unclassified flow is bulk-ish, never real-time
+
+**Decision.** A flow the classifier has not identified is `ClassUnknown`, and the
+behavioural heuristic requires *both* of protocol.md's signals - small mean packet size
+and low inter-packet-gap variance - before it will say real-time. Either signal alone
+leaves the flow bulk.
+
+**Rationale.** The two mistakes are not symmetric. Calling a download real-time
+duplicates it across a metered link and reserves admission-control capacity for it,
+which is the failure that saturated the 512k standby link once already (D-023). Calling
+a call bulk for a few hundred milliseconds costs some quality at the start of the flow.
+The cheap mistake is the one to make by default.
+
+This costs less than it appears to, because the signal that actually protects a call
+fires first: ICE sends binding requests from the exact port pair the media will use, so
+a WebRTC conference is real-time from its first packet and never sits in the unknown
+state at all (D-019). The behavioural path only has to catch native clients that speak
+no ICE and have no usable vendor prefix, and for those, arriving at the right answer 24
+packets in is a good outcome.
+
+**Rejected.** Defaulting unknown UDP to real-time and demoting on evidence. It inverts
+the cost: every QUIC flow gets the expensive treatment for its first packets, and QUIC
+is the majority of UDP by volume - D-018's whole point.
+
+**Also rejected.** Requiring only one of the two signals. Small alone matches DNS,
+keepalives, and game control channels; metronomic alone matches a constant-bitrate
+download. Both together is what protocol.md claims separates RTP from QUIC "almost
+perfectly", and a replay of real captured traffic agrees: of 21.3 MB captured off the
+tunnel interface, 0.27% came out real-time, and that 0.27% was the metronomic test
+stream.

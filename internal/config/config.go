@@ -150,6 +150,23 @@ type Config struct {
 	// case this exists for.
 	BWFallbackKbps int `json:"bw_fallback_kbps"`
 
+	// The classification thresholds of step 7. The two that matter are
+	// ClassifyRTPMaxBytes and ClassifyGapVarianceMs: protocol.md's claim
+	// is that mean packet size and inter-packet-gap variance separate RTP
+	// media from QUIC bulk almost perfectly, and these are where that
+	// claim is set. They only ever apply to the behavioural catch-all -
+	// a flow identified by STUN is not subject to them.
+	ClassifySamplePackets int `json:"classify_sample_packets"`
+	ClassifyRTPMaxBytes   int `json:"classify_rtp_max_bytes"`
+	ClassifyGapVarianceMs int `json:"classify_gap_variance_ms"`
+
+	// ClassifyMaxFlows bounds the flow cache and ClassifyFlowIdleSeconds
+	// is how long a silent conversation is kept in it. The ceiling is a
+	// memory bound on a box with little of it; the idle timeout is what
+	// stops a reused port pair inheriting the last flow's class.
+	ClassifyMaxFlows        int `json:"classify_max_flows"`
+	ClassifyFlowIdleSeconds int `json:"classify_flow_idle_seconds"`
+
 	// DuplicateMode decides when a packet goes out more than one path.
 	// See DuplicateModes for the meanings.
 	DuplicateMode string `json:"duplicate_mode"`
@@ -263,6 +280,30 @@ var Bounds = map[string]bound{
 
 	// Zero means unknown, and unknown means no gate. See BWFallbackKbps.
 	"bw_fallback_kbps": {Min: 0, Max: 10_000_000, Default: 0},
+
+	// Twenty-four packets is under half a second of an RTP flow at its
+	// 20 ms cadence. Long enough for a gap variance to mean something,
+	// short enough that a native conferencing client nobody has a prefix
+	// for is caught early in the call rather than partway through it.
+	"classify_sample_packets": {Min: 4, Max: 1_000, Default: 24},
+
+	// The top of protocol.md's 60-250 byte RTP band. QUIC bulk sits at
+	// 1200-1400, so there is most of a kilobyte of daylight between them
+	// and this threshold does not need to be precise.
+	"classify_rtp_max_bytes": {Min: 64, Max: 1_400, Default: 250},
+
+	// Half the 20 ms cadence, as a standard deviation. Generous enough to
+	// survive scheduling noise on a loaded box and a cellular link's own
+	// jitter, tight enough that nothing bursty gets through it.
+	"classify_gap_variance_ms": {Min: 1, Max: 200, Default: 10},
+
+	// Eight thousand conversations is far more than a household behind
+	// one RV generates, and costs a few megabytes if it ever fills.
+	"classify_max_flows": {Min: 256, Max: 262_144, Default: 8_192},
+
+	// Two minutes. Long enough to hold a call's class through a lull,
+	// short enough that a port pair reused afterwards starts clean.
+	"classify_flow_idle_seconds": {Min: 5, Max: 3_600, Default: 120},
 }
 
 // Defaults returns a configuration that is correct to run with as-is.
@@ -301,6 +342,12 @@ func Defaults() Config {
 		BWHeadroomPercent: Bounds["bw_headroom_percent"].Default,
 		BWFallbackKbps:    Bounds["bw_fallback_kbps"].Default,
 		ReportIntervalMs:  Bounds["report_interval_ms"].Default,
+
+		ClassifySamplePackets:   Bounds["classify_sample_packets"].Default,
+		ClassifyRTPMaxBytes:     Bounds["classify_rtp_max_bytes"].Default,
+		ClassifyGapVarianceMs:   Bounds["classify_gap_variance_ms"].Default,
+		ClassifyMaxFlows:        Bounds["classify_max_flows"].Default,
+		ClassifyFlowIdleSeconds: Bounds["classify_flow_idle_seconds"].Default,
 
 		DuplicateMode: DuplicateSwitching,
 	}
@@ -376,6 +423,12 @@ func (c Config) Sanitised() Config {
 		BWHeadroomPercent: clamp(c.BWHeadroomPercent, Bounds["bw_headroom_percent"]),
 		BWFallbackKbps:    clamp(c.BWFallbackKbps, Bounds["bw_fallback_kbps"]),
 		ReportIntervalMs:  clamp(c.ReportIntervalMs, Bounds["report_interval_ms"]),
+
+		ClassifySamplePackets:   clamp(c.ClassifySamplePackets, Bounds["classify_sample_packets"]),
+		ClassifyRTPMaxBytes:     clamp(c.ClassifyRTPMaxBytes, Bounds["classify_rtp_max_bytes"]),
+		ClassifyGapVarianceMs:   clamp(c.ClassifyGapVarianceMs, Bounds["classify_gap_variance_ms"]),
+		ClassifyMaxFlows:        clamp(c.ClassifyMaxFlows, Bounds["classify_max_flows"]),
+		ClassifyFlowIdleSeconds: clamp(c.ClassifyFlowIdleSeconds, Bounds["classify_flow_idle_seconds"]),
 
 		DuplicateMode: duplicateMode(c.DuplicateMode),
 	}

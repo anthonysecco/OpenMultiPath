@@ -77,6 +77,11 @@ of reasoning up front.
     from inbound evidence. Wire version 2, rolling upgrade, header authentication
     alongside it. **Built** (2026-09-02). See D-024 and D-025.
 7. **Classification.** STUN watching first; it is the highest-value piece.
+   **Classifier built** (2026-09-02), **not yet wired in**: `internal/classify` implements
+   the full precedence - STUN, vendor prefixes, behavioural catch-all - behind a bounded
+   per-flow cache, and is validated against a real capture off the RV's tunnel interface.
+   It stays unwired until D-020 lands, because the daemon still sits below WireGuard and
+   a class cannot cross a crypto boundary. **D-020 is now the gate on the rest of step 7.**
 8. **Scheduling and real-time handling.** Duplication, make-before-break, stickiness.
 9. **Admission control.** Alongside the scheduler, not after.
 10. **Cost tracking and budget bands.**
