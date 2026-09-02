@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 	"testing"
 	"time"
 
@@ -32,7 +33,7 @@ func TestSessionCountsWhatItActuallySends(t *testing.T) {
 	const packets = 400
 	var wire int
 	for i := 0; i < packets; i++ {
-		out := s.stamp(0, s.nextGlobalSeq(), payload, buf)
+		out := s.stamp(0, s.nextGlobalSeq(), protocol.ClassUnknown, payload, buf)
 		wire += len(out) + ipUDPOverhead
 	}
 

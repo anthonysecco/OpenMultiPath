@@ -527,7 +527,9 @@ the negligible cost `protocol.md` assumes when it reasons about 40 kbps of audio
 Duplicating during a handover is where the redundancy actually buys something - it is what
 makes the switch gapless - and it is time-bounded.
 
-**Revisit when classification lands.** The right policy is per class and per budget band:
+**Revisit when classification lands.** Step 7 landed on 2026-09-02 and packets now carry
+a class above WireGuard, so this is unblocked and waiting on step 8 to read it. The right
+policy is per class and per budget band:
 audio duplicated whenever a second path exists and budget is green, video only when a link
 is unstable or an unmetered path is available. That cannot be expressed until packets
 carry a class, so **unstable** and **always** exist as manual escape hatches until then.

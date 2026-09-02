@@ -97,8 +97,14 @@ const (
 	TypeReport uint8 = 2
 )
 
-// Traffic classes. Classification is a later step, so everything currently
-// goes out as ClassUnknown.
+// Traffic classes, set by internal/classify from the inner packet.
+//
+// ClassUnknown is not a placeholder any more, it is a real answer: it means
+// the sender could not honestly say. That happens when the daemon runs
+// below WireGuard and its payloads are ciphertext, while a flow is still
+// being sampled, and for packets that belong to no flow at all. Carrying
+// the class is step 7; acting on it is step 8, so nothing downstream
+// distinguishes these yet.
 const (
 	ClassUnknown  uint8 = 0
 	ClassRealtime uint8 = 1

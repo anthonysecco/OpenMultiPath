@@ -141,8 +141,19 @@ func RunResponder(cfg ResponderConfig) error {
 	// decided. That is deliberate: paths are asymmetric, a link can be
 	// clean inbound and unusable outbound, and each end has measured its
 	// own receive direction directly rather than been told about it.
+	// Step 7. Only runs when the endpoint hands back plaintext; see
+	// flowClassifier.
+	clf := newFlowClassifier(local, cfg.Settings)
+	if clf.enabled() {
+		log.Printf("%s: classifying traffic (STUN, vendor prefixes, behaviour)", "responder")
+	} else {
+		log.Printf("%s: not classifying - payloads are ciphertext below WireGuard", "responder")
+	}
+
 	scratch := make([]byte, 0, bufSize+maxHeaderLen)
 	go local.readPayloads("responder-local", func(payload []byte) {
+		class := clf.classify(payload)
+		sess.noteClass(class)
 		globalSeq := sess.nextGlobalSeq()
 
 		tx := sched.txPaths()
@@ -154,7 +165,7 @@ func RunResponder(cfg ResponderConfig) error {
 			if addr == nil {
 				continue // never heard from, so nowhere to send
 			}
-			out := sess.stamp(id, globalSeq, payload, scratch)
+			out := sess.stamp(id, globalSeq, class, payload, scratch)
 			if _, err := pubConn.WriteToUDP(out, addr); err != nil {
 				log.Printf("responder: write to path %d at %s failed: %v", id, addr, err)
 			}

@@ -195,7 +195,7 @@ func TestStandaloneReportsOnlyWhenIdle(t *testing.T) {
 	s := newTestSession()
 	s.registerPath(0)
 
-	s.stamp(0, s.nextGlobalSeq(), []byte("data"), nil)
+	s.stamp(0, s.nextGlobalSeq(), protocol.ClassUnknown, []byte("data"), nil)
 	if s.dueForReport(0) {
 		t.Error("a standalone report is due immediately after sending data")
 	}
@@ -273,7 +273,7 @@ func TestBusyPathDoesNotSuppressReportsOnIdlePaths(t *testing.T) {
 
 	// Path 0 is carrying traffic; path 1 has never been used.
 	for i := 0; i < 5; i++ {
-		s.stamp(0, s.nextGlobalSeq(), []byte("data"), nil)
+		s.stamp(0, s.nextGlobalSeq(), protocol.ClassUnknown, []byte("data"), nil)
 	}
 
 	if s.dueForReport(0) {

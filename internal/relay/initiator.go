@@ -138,8 +138,19 @@ func RunInitiator(cfg InitiatorConfig) error {
 	// end. readLoop calls this from a single goroutine, so one scratch
 	// buffer serves every copy: each is written out before the next is
 	// built.
+	// Step 7. Only runs when the endpoint hands back plaintext; see
+	// flowClassifier.
+	clf := newFlowClassifier(local, cfg.Settings)
+	if clf.enabled() {
+		log.Printf("%s: classifying traffic (STUN, vendor prefixes, behaviour)", "initiator")
+	} else {
+		log.Printf("%s: not classifying - payloads are ciphertext below WireGuard", "initiator")
+	}
+
 	scratch := make([]byte, 0, bufSize+maxHeaderLen)
 	go local.readPayloads("initiator-local", func(payload []byte) {
+		class := clf.classify(payload)
+		sess.noteClass(class)
 		globalSeq := sess.nextGlobalSeq()
 
 		// Before the first evaluation the scheduler has no opinion, so
@@ -150,7 +161,7 @@ func RunInitiator(cfg InitiatorConfig) error {
 			tx = paths.active()
 		}
 		for _, id := range tx {
-			paths.send(id, sess.stamp(id, globalSeq, payload, scratch))
+			paths.send(id, sess.stamp(id, globalSeq, class, payload, scratch))
 		}
 	})
 

@@ -180,10 +180,13 @@ const (
 	DuplicateOff = "off"
 
 	// DuplicateSwitching duplicates only during a make-before-break
-	// handover. This is the default, and until classification lands it is
-	// the only honest setting: with every packet still ClassUnknown, any
-	// broader policy would duplicate bulk as readily as audio, which is
-	// what saturated the 512k Starlink standby link in the first place.
+	// handover. Still the default, though the reason has narrowed. Packets
+	// now carry a class when the daemon runs above WireGuard (step 7), so
+	// a per-class policy is finally expressible - but nothing reads the
+	// class yet, that being step 8, and below WireGuard every packet is
+	// still ClassUnknown. Until a broader mode can tell audio from bulk it
+	// would duplicate them alike, which is what saturated the 512k
+	// Starlink standby link in the first place.
 	DuplicateSwitching = "switching"
 
 	// DuplicateUnstable additionally duplicates while the chosen path is

@@ -80,12 +80,19 @@ of reasoning up front.
    **Classifier built** (2026-09-02), **not yet wired in**: `internal/classify` implements
    the full precedence - STUN, vendor prefixes, behavioural catch-all - behind a bounded
    per-flow cache, and is validated against a real capture off the RV's tunnel interface.
-   It is still unwired, but the reason has changed. D-020's data path is **built**
-   (2026-09-02) behind `-tun` and proven on the real boxes, so the daemon can now read
-   plaintext inner packets - which is what a classifier needs and what the loopback relay
-   could never give it. What remains of step 7 is calling the classifier from the TUN read
-   path and carrying its verdict in the header's class field, plus provisioning the
-   per-link WireGuard interfaces for good rather than for a rehearsal. See D-020.
+   **Wired in and done** (2026-09-02). The classifier runs on every packet read from the
+   TUN device and its verdict is carried in the header's class field, on both ends. It
+   runs only where payloads are plaintext: below WireGuard they are ciphertext, and a
+   5-tuple parser pointed at an encrypted blob does not fail, it finds plausible garbage -
+   so the loopback relay says plainly in its log that it is not classifying.
+   Counters for what was decided go to the log, because "saw no real-time traffic" and
+   "was not classifying" otherwise look identical from a campground.
+
+   Verified end to end in the running daemon: six STUN binding requests came out six
+   real-time, and sixty QUIC-shaped packets came out twenty-three unclassified - the
+   behavioural sampling window - then thirty-seven bulk.
+
+   Nothing reads the class yet. That is step 8.
 8. **Scheduling and real-time handling.** Duplication, make-before-break, stickiness.
 9. **Admission control.** Alongside the scheduler, not after.
 10. **Cost tracking and budget bands.**

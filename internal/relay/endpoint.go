@@ -43,6 +43,13 @@ type localEndpoint interface {
 	// describe names the endpoint for the log line at startup.
 	describe() string
 
+	// plaintext reports whether payloads are inner IP packets that can be
+	// looked inside, rather than ciphertext. It is what gates
+	// classification: below WireGuard the payload is an encrypted blob,
+	// and running a 5-tuple parser over one would not fail loudly - it
+	// would find plausible-looking garbage and classify traffic on it.
+	plaintext() bool
+
 	Close() error
 }
 
@@ -89,6 +96,8 @@ func (e *loopbackEndpoint) describe() string {
 	return fmt.Sprintf("loopback on %s, learning wireguard's address (below WireGuard)", e.conn.LocalAddr())
 }
 
+func (e *loopbackEndpoint) plaintext() bool { return false }
+
 func (e *loopbackEndpoint) Close() error { return e.conn.Close() }
 
 // tunEndpoint reads plaintext inner packets from a TUN device, which is
@@ -134,6 +143,8 @@ func (e *tunEndpoint) write(payload []byte) error {
 func (e *tunEndpoint) describe() string {
 	return fmt.Sprintf("tun device %s, mtu %d (above WireGuard, D-020)", e.dev.Name(), e.mtu)
 }
+
+func (e *tunEndpoint) plaintext() bool { return true }
 
 func (e *tunEndpoint) Close() error { return e.dev.Close() }
 

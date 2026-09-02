@@ -254,6 +254,10 @@ func (f *rttFloor) observe(now time.Duration, rtt uint32) {
 // share no epoch and need no clock synchronisation: a sender's readings
 // are only ever compared against its own.
 type session struct {
+	// classCounts is indexed by protocol class, so a packet's class is
+	// its own counter's index. Sized to the three that exist.
+	classCounts [3]atomic.Uint64
+
 	start     time.Time
 	globalSeq atomic.Uint32
 
@@ -432,24 +436,56 @@ func (s *session) remotes() []pathRemote {
 // globalSeq is passed in rather than allocated here because it must be
 // assigned once per packet before path selection, while the per-path
 // sequence is assigned here, at transmit on this specific path.
-func (s *session) stamp(pathID uint8, globalSeq uint32, payload, buf []byte) []byte {
-	return s.build(protocol.TypeData, pathID, globalSeq, payload, buf)
+// stamp builds one data packet, carrying the class the caller already
+// decided for it.
+//
+// The class is passed in rather than worked out here on purpose. A packet
+// that goes out several paths calls this once per copy, so classifying
+// inside would repeat the work - and worse, could hand two copies of the
+// same packet different classes if the flow's verdict settled in between.
+// One packet, one class, whatever it costs to deliver.
+// noteClass records what step 7 decided about one packet.
+//
+// Counters rather than a log line per packet, and atomic rather than under
+// the session mutex, because this runs on every packet the daemon carries
+// and the mutex is already the busiest lock in it.
+//
+// They exist to make the classifier answerable in the field. "No real-time
+// traffic was seen" and "classification is not running" produce identical
+// path statistics, and telling them apart from a campground otherwise
+// means reading source.
+func (s *session) noteClass(class uint8) {
+	if int(class) < len(s.classCounts) {
+		s.classCounts[class].Add(1)
+	}
 }
 
+// classTotals reads the counters back for the log and the interface.
+func (s *session) classTotals() (realtime, bulk, unknown uint64) {
+	return s.classCounts[protocol.ClassRealtime].Load(),
+		s.classCounts[protocol.ClassBulk].Load(),
+		s.classCounts[protocol.ClassUnknown].Load()
+}
+
+func (s *session) stamp(pathID uint8, globalSeq uint32, class uint8, payload, buf []byte) []byte {
+	return s.buildWith(protocol.TypeData, pathID, globalSeq, class, payload, buf, nil)
+}
+
+// build is for the packets that are not user traffic. Probes and reports
+// carry no flow to classify and nothing downstream would act on a class,
+// so they go out unclassified.
 func (s *session) build(typ, pathID uint8, globalSeq uint32, payload, buf []byte) []byte {
-	return s.buildWith(typ, pathID, globalSeq, payload, buf, nil)
+	return s.buildWith(typ, pathID, globalSeq, protocol.ClassUnknown, payload, buf, nil)
 }
 
-func (s *session) buildWith(typ, pathID uint8, globalSeq uint32, payload, buf []byte, reports []protocol.ReportEntry) []byte {
+func (s *session) buildWith(typ, pathID uint8, globalSeq uint32, class uint8, payload, buf []byte, reports []protocol.ReportEntry) []byte {
 	now := s.elapsed()
 
 	s.mu.Lock()
 	p := s.pathLocked(pathID)
 	h := protocol.Header{
-		Type: typ,
-		// Classification is a later step; until then nothing is
-		// distinguished as real-time.
-		Class:     protocol.ClassUnknown,
+		Type:      typ,
+		Class:     class,
 		PathID:    pathID,
 		GlobalSeq: globalSeq,
 		PathSeq:   p.nextSeq,
@@ -539,7 +575,7 @@ func (s *session) buildReport(pathID uint8, buf []byte) []byte {
 		s.mu.Unlock()
 	}
 
-	return s.buildWith(protocol.TypeReport, pathID, s.nextGlobalSeq(), nil, buf, reports)
+	return s.buildWith(protocol.TypeReport, pathID, s.nextGlobalSeq(), protocol.ClassUnknown, nil, buf, reports)
 }
 
 // collectReportsLocked describes what we have measured on the peer's
@@ -906,6 +942,9 @@ func (s *session) logStats() {
 		}
 		if d.blind {
 			log.Printf("scheduler: %s", d.reason)
+		}
+		if rt, bulk, unk := s.classTotals(); rt+bulk+unk > 0 {
+			log.Printf("traffic: %d real-time, %d bulk, %d unclassified", rt, bulk, unk)
 		}
 		if mtu := s.recommendedTunnelMTULocked(); mtu != 0 {
 			log.Printf("recommended tunnel mtu: %d", mtu)

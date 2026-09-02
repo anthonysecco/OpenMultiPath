@@ -24,11 +24,13 @@ import (
 // what a person can read at a glance.
 //
 // One caveat worth stating plainly: this is a voice model being used to
-// rank paths for all traffic, because until classification lands there is
-// no way to tell which traffic is voice. That is the right bias to have -
-// the primary use case is a video call, and a path good enough for audio is
-// good enough for everything else - but it does mean a path is being
-// scored on criteria that a bulk download would not care about.
+// rank paths for all traffic. Packets now carry a class (step 7), but
+// scoring does not read it - one score per path is handed to every flow
+// regardless. That is the right bias to have while it lasts, since the
+// primary use case is a video call and a path good enough for audio is
+// good enough for everything else, but it does mean a path is scored on
+// criteria a bulk download would not care about. Step 8 is where the class
+// starts to matter.
 
 const (
 	// r0Default is the basic signal-to-noise ratio with G.107's default
