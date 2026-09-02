@@ -325,12 +325,46 @@ into the RV's TUN crossed the tunnel and came out of home's TUN 103 us later wit
 source intact, and home's reply came back the other way 57 us after that. Both daemons
 logged no errors.
 
-**Not yet proven, and the honest gap:** the veth stood in for the WAN, so this has not run
-over real per-link WireGuard interfaces. What remains is provisioning - `wg1`/`wg2` on the
-RV with their own keypairs and fwmarks, one peer per link at home - plus two things the
-code still owes: recovering the bind/rebind visibility this costs by reading interface
-state, and making the TUN MTU track the daemon's own recommendation instead of a flag
-default.
+**Provisioned and proven on the real boxes** (2026-09-02), with production left running
+throughout. `wg1` and `wg2` exist at `/etc/wireguard/` on the RV with their own keypairs,
+addresses and fwmarks; `wgm` exists at home with one peer per link. None are enabled - see
+the blockers below.
+
+Two things were demonstrated on the hardware rather than in a sandbox:
+
+*Per-link pinning works.* With `wg1` marked `0x2001` and `wg2` marked `0x2002`, their
+handshake initiations left `enp2s0` (from `192.168.225.3`) and `enp1s0` (from
+`100.110.247.30`) respectively, and `wg0` carried none of it. That last part matters: the
+RV's default route is `dev wg0`, so without the fwmark this traffic would have recursed
+into the production tunnel. The staged `ip rule` plumbing does exactly what it was put
+there for.
+
+*The data path carries real load.* Running both daemons with `-tun` over a real WireGuard
+interface between the two boxes: ping across the tunnel addresses returned 5 of 5 at
+28-38 ms, and a 20 MB transfer ran at 40.7 Mbps with the daemon reporting `mos 4.4
+PRIMARY, rtt 25.4 ms, jitter 1.6 ms, lost 0`. That figure is not a throughput result worth
+quoting - the test had to nest inside the production tunnel, so it was triple-encapsulated
+- but it establishes that the path carries sustained traffic and measures it correctly.
+
+**Blocker 1: only one port reaches home.** Probing 51821, 51900, 48220 and 51822 from the
+RV, none arrived; a control probe to 48219 did, alongside 321 packets of live production
+traffic. So the only forwarded UDP port is the one the production responder already owns.
+A staged cutover needs a second port forwarded to the home box - the configs are written
+for 51822 - or it has to take 48219 at the moment production releases it, which is not a
+staged cutover at all.
+
+**Blocker 2, and the more serious one: the RV is only reachable through the tunnel it
+would be cutting over.** Home routes `10.0.0.0/24` down `wg0`, so administrative access to
+the vehicle traverses production. Stopping the production responder to free 48219 would
+strand the RV and the person doing it in the same instant, with no way back in. This is
+the failure `scope-v1.md` names under field upgrades - "a bad update that breaks the tunnel
+from 800 miles away is unrecoverable without fallback working" - and it is currently true
+of the *cutover itself*, not merely of a bad build. Out-of-band access to the RV is a
+prerequisite for the flag day, ahead of anything else in this entry.
+
+**Still owed by the code:** recovering the bind/rebind visibility D-020 costs by reading
+interface state, and making the TUN MTU track the daemon's own recommendation rather than
+the flag default.
 
 ---
 
