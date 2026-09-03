@@ -1,0 +1,43 @@
+#!/bin/bash
+# Unconditional return to the production shape: the loopback relay below
+# WireGuard, on wg0, supervised by systemd. Run by the dead-man timer during
+# a D-020 cutover, and safe to run by hand at any time, including when
+# nothing is wrong.
+#
+# Deliberately unconditional, and it ignores every error. This runs on a box
+# that may be reachable only over a marginal Wi-Fi link, where a rollback
+# that stops at its first failed step is worse than no rollback at all.
+# Every step is written to be a no-op when it was not needed.
+set +e
+
+# Stop whatever is running, under either name a cutover may have used.
+#
+# -x matches the executable name exactly. -f would also match this script
+# and the ssh command line that invoked it, which is how an operator kills
+# their own session on the box they are trying to recover.
+pkill -x ompd
+pkill -x ompd-d020
+
+# D-020's interfaces down, production's back up. The TUN is created by the
+# daemon and normally leaves with it; deleting it covers the case where the
+# daemon died without cleaning up.
+for iface in wgm wg1 wg2; do
+	wg-quick down "$iface" 2>/dev/null
+done
+ip link del omp0 2>/dev/null
+wg-quick up wg0 2>/dev/null
+
+# A cutover edits ExecStart, so restarting the service is not enough on its
+# own: it would bring the D-020 daemon straight back up against interfaces
+# that have just been taken down. The pristine unit is kept beside the
+# settings rather than in /etc/systemd, where a careless edit would find it.
+if [ -f /etc/openmultipath/ompd.service.production ]; then
+	install -m 0644 /etc/openmultipath/ompd.service.production \
+		/etc/systemd/system/ompd.service
+	systemctl daemon-reload
+fi
+
+# ompui is supervised separately, and it is the thing that explains what
+# happened once the box is back. Forgetting it is how both ends sat with no
+# web interface for a day after a rollback that otherwise worked.
+systemctl start ompd ompui
