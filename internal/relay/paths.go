@@ -342,12 +342,34 @@ func (ps *pathSet) send(id uint8, pkt []byte) {
 		// silent, which the measurement layer reports as a path
 		// delivering nothing. Nothing here can do better than say so once.
 		if bp.failing.CompareAndSwap(false, true) {
-			log.Printf("path %d: write failed, suppressing until it recovers: %v", id, err)
+			log.Printf("path %d: write failed, suppressing until it recovers: %v%s", id, err, ps.misroutedHint(id, err))
 			// Only on the transition, so a path failing every write asks
 			// once rather than continuously.
 			ps.poke()
 		}
 	}
+}
+
+// misroutedHint explains the one write error whose kernel wording reliably
+// sends people looking in the wrong place. WireGuard answers ENOKEY -
+// rendered "required key not available" - when no peer's AllowedIPs covers
+// the destination. That reads as a crypto fault and is in fact a routing
+// one, and it is the specific way a D-020 misconfiguration presents: the
+// paths are WireGuard interfaces there, so -remote has to name home's
+// address inside the tunnel rather than the public endpoint the loopback
+// relay dials.
+func (ps *pathSet) misroutedHint(id uint8, err error) string {
+	if !errors.Is(err, syscall.ENOKEY) {
+		return ""
+	}
+	name := "the bound interface"
+	for _, s := range ps.specs {
+		if s.id == id {
+			name = s.name
+			break
+		}
+	}
+	return fmt.Sprintf(" (no peer on %s covers %s in its AllowedIPs; under D-020 -remote takes home's tunnel address, not its public endpoint)", name, ps.dialing.IP)
 }
 
 // active lists the paths currently bound, which are the only ones worth

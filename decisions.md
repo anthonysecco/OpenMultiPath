@@ -400,6 +400,58 @@ twice on the second interface up. Because the daemon carries one remote for ever
 both links must dial the *same* home address, so the fix is `Table = off` plus an explicit
 per-interface route at differing metrics, with `SO_BINDTODEVICE` constraining the lookup.
 
+**Run end to end on the real boxes** (2026-09-03), both daemons above WireGuard over two
+real WAN links. Traffic crossed the TUNs at 0% loss over five round trips, 23.7-50.9 ms;
+the two paths were scored independently (30.5 ms against 35.1 ms) and the scheduler ran a
+make-before-break handover onto the better one, confirmed after 201 ms; both ends
+discovered a 1408 byte path MTU. Eight STUN binding requests sent through the tunnel came
+back out classified 8 real-time, 0 bulk - step 7 and step 8 working in the shape they were
+written for, rather than in the loopback relay where they cannot.
+
+**The flag shape, which is the part that is easy to get wrong.** Home:
+
+    ompd -role responder -tun omp0 -tun-addr 10.30.0.1/24 -public 10.20.1.1:51830
+
+RV:
+
+    ompd -role initiator -tun omp0 -tun-addr 10.30.0.2/24 \
+         -remote 10.20.1.1:51830 -paths wg1,wg2
+
+Three invariants sit behind that, and getting any of them wrong on the first attempt cost
+an evening:
+
+*There are two subnets, not one.* `10.20.1.0/24` is the **transport**: the WireGuard
+interfaces themselves (`wgm` .1, `wg1` .2, `wg2` .3), carrying omp-protocol packets
+between the daemons. The TUN devices are the **inner** network the user's plaintext rides,
+and need a range of their own - `10.30.0.0/24` above. Handing `-tun-addr` a transport
+address collides with the WireGuard interface already holding it.
+
+*`-remote` takes home's tunnel address.* The path sockets are bound to `wg1`/`wg2`, whose
+`AllowedIPs` is `10.20.1.1/32`. Aiming them at home's public endpoint means no peer covers
+the destination and WireGuard refuses with `ENOKEY`, which the kernel words as "required
+key not available" - it reads as a crypto fault and is a routing one. `paths.go` now
+appends a hint saying so on that specific errno.
+
+*`-public` must not be `wgm`'s port.* The responder always opens a public UDP socket; that
+is true in both shapes and is not gated on `-tun`. Under D-020 the socket carries omp
+packets *inside* the tunnel, so it binds the tunnel address on any free port. Leaving it at
+the default `0.0.0.0:48219` binds the exact port `wgm` holds and the daemon exits with
+"address already in use", which looks like `-tun` having been ignored and is not.
+
+**Blocker 1 does not apply to an in-place cutover.** Only UDP 48219 being forwarded still
+blocks running D-020 *beside* production, but the omp port lives inside the tunnel and
+needs no forward of its own. The second port is a convenience for staging, not a
+prerequisite.
+
+**Blocker 2's fallback needs bringing up, not just existing.** The out-of-band Wi-Fi was
+configured and idle: NetworkManager held a correct `Rigatony Outdoor` profile with a static
+`10.0.0.237/24`, but the interface was down, so the only route to the RV ran through the
+tunnel being cut. Taking home's `wg0` down stranded the vehicle exactly as this blocker
+predicted, and recovering meant reverting home. **Bring the lifeline up and confirm
+`ip route get 10.0.0.1` names the Wi-Fi device before touching either tunnel.** Once up it
+is genuinely independent - the RV stayed reachable throughout with home's `wg0` down - and
+still marginal: -69 dBm, MCS 0, ~33% loss, 15 s to open an SSH session.
+
 **Still blocking a real cutover:** nothing structural. What remains is moving the RV's
 default route onto the TUN and giving home egress for it, which is the part that changes
 what LAN clients experience and wants its own window.

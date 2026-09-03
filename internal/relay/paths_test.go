@@ -2,7 +2,9 @@ package relay
 
 import (
 	"net"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
@@ -149,5 +151,28 @@ func TestResponderReportsNoBindState(t *testing.T) {
 	}
 	if snap.Paths[0].Bound || snap.Paths[0].Local != "" {
 		t.Error("bind state leaked into a responder snapshot")
+	}
+}
+
+// A D-020 misconfiguration reaches the operator as ENOKEY from the kernel,
+// worded "required key not available", which reads as a crypto failure and
+// is really -remote naming an address no peer routes. The hint is the only
+// thing standing between that and a long detour, so it is worth a test.
+func TestMisroutedHintOnlyForENOKEY(t *testing.T) {
+	remote := &net.UDPAddr{IP: net.IPv4(162, 231, 243, 253), Port: 48219}
+	ps := newPathSet([]pathSpec{{id: 0, name: "wg1"}}, nil, remote, func(uint8, []byte) {})
+
+	got := ps.misroutedHint(0, &os.SyscallError{Syscall: "sendto", Err: syscall.ENOKEY})
+	if !strings.Contains(got, "wg1") || !strings.Contains(got, "162.231.243.253") {
+		t.Errorf("hint should name the interface and the destination, got %q", got)
+	}
+	if !strings.Contains(got, "tunnel address") {
+		t.Errorf("hint should point at -remote, got %q", got)
+	}
+
+	// Every other write failure is an ordinary dead-zone state and must
+	// not be dressed up as a configuration error.
+	if got := ps.misroutedHint(0, syscall.ENETUNREACH); got != "" {
+		t.Errorf("unrelated errors should get no hint, got %q", got)
 	}
 }
