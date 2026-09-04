@@ -105,6 +105,16 @@ of reasoning up front.
    Still to come here: steering bulk *away* from the real-time path when a second usable
    one exists, which is the canyon walkthrough's "pull bulk off Starlink immediately".
 9. **Admission control.** Alongside the scheduler, not after.
+   **Built** (2026-09-04, D-031). Bulk stops being sent entirely when the path carrying
+   real-time is also carrying it and the peer reports that path's send direction queueing
+   past a threshold. Dropped at the ingress, so the sending stack backs off and the queue
+   re-forms in a LAN client rather than in the WAN uplink. Real-time is never withheld,
+   which is what lets this be a gate rather than a shaper - the class that must not be
+   starved is the one too small to need pacing. Shuts on the first evaluation over the
+   line, reopens only after five seconds clear, and never fires in blind mode or when the
+   classes are already on separate paths.
+   Still to come here: shaping video down within real-time so audio survives while video
+   shrinks, which needs audio and video distinguished inside the class.
 10. **Cost tracking and budget bands.**
 11. **Fallback, watchdog, rollback.**
 

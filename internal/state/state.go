@@ -66,6 +66,13 @@ type Scheduler struct {
 	// say anything useful.
 	Blind bool `json:"blind"`
 
+	// WithholdingBulk means admission control is dropping bulk at the
+	// ingress to keep the call's path from queueing. It is deliberately
+	// visible: a starved link and an idle one look identical otherwise,
+	// and this is the daemon choosing to destroy traffic.
+	WithholdingBulk bool   `json:"withholding_bulk"`
+	WithheldBulk    uint64 `json:"withheld_bulk"`
+
 	// Reason is the scheduler's own one-line account of the current
 	// choice, which is the first thing worth reading when the choice looks
 	// wrong.

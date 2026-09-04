@@ -144,6 +144,7 @@ func RunResponder(cfg ResponderConfig) error {
 	// Step 7. Only runs when the endpoint hands back plaintext; see
 	// flowClassifier.
 	clf := newFlowClassifier(local, cfg.Settings)
+	sched.setClassifying(clf.enabled())
 	if clf.enabled() {
 		log.Printf("%s: classifying traffic (STUN, vendor prefixes, behaviour)", "responder")
 	} else {
@@ -154,6 +155,16 @@ func RunResponder(cfg ResponderConfig) error {
 	go local.readPayloads("responder-local", func(payload []byte) {
 		class := clf.classify(payload)
 		sess.noteClass(class)
+
+		// Step 9. Classification happens first and unconditionally: the
+		// classifier learns a flow from the packets it sees, so gating it
+		// on admission would stop a call being recognised precisely when
+		// it starts during congestion.
+		if !sched.admit(class) {
+			sess.noteWithheld()
+			return
+		}
+
 		globalSeq := sess.nextGlobalSeq()
 
 		tx := sched.txPaths(class)

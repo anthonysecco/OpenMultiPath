@@ -1018,3 +1018,96 @@ last resort for media carrying no RTP framing, which is rare. So its gap-varianc
 threshold was tightened from 10 ms to 5 ms. At 10 ms a stream of small QUIC
 acknowledgements passed as real-time, which is D-027's expensive mistake - a duplicated
 download on a metered link - and genuine audio sits nowhere near either bound.
+
+## D-031 · Admission control is a gate on bulk, not a shaper
+
+**Decision.** When the path carrying real-time is also carrying bulk and the peer reports
+the send direction queueing past a threshold, bulk stops being sent at all. Real-time is
+never withheld. There is no rate limiter, no queue discipline and no pacing loop.
+
+**Rationale.** `protocol.md` states the failure precisely: down to one degraded path the
+scheduler has nothing left to schedule, and one person loading a webpage fills the uplink
+queue and puts hundreds of milliseconds onto the call. Prioritisation does not fix that,
+because the packets are already in the queue by the time priority is expressed.
+
+Dropping bulk at the ingress is what makes a gate sufficient. The packet is destroyed
+before it is sent, so the sending stack on the LAN sees loss and backs off on its own -
+the queue re-forms in a client that can afford it rather than in the WAN uplink that
+cannot. `protocol.md`'s phrase is "let it queue at the ingress where it costs nothing".
+
+**Why not a shaper.** A shaper is the obvious answer and is more machinery than the
+problem needs. Real-time is the class that must not be starved and is also the class too
+small to need pacing - `architecture.md` puts Zoom audio at ~40 kbps. So the only decision
+worth making is binary: is bulk allowed on this path right now. A token bucket would add
+tuning, a queue, and a second place for latency to hide, in exchange for a smoothness
+nothing here benefits from. `CLAUDE.md` principle 2.
+
+**The queue read is the send direction, and only the send direction.** Our own bulk fills
+our uplink, and the only measurement of that is what the peer reports back (D-024). Every
+other queue figure the daemon holds is taken from arriving packets and describes the
+downlink, which bulk is not responsible for and which starving it would not improve. With
+no send-direction report - a wire-version-1 peer, or a path not yet heard from - the gate
+stays open, because there is no evidence to act on and the failure of admission control
+should be traffic flowing, not traffic dying.
+
+**Asymmetric hysteresis, matching the path machine.** The gate shuts on the first
+evaluation over the line: the call is being damaged while the measurement is being taken,
+and waiting to confirm means confirming it with the meeting. It reopens only after the
+queue has stayed clear for `admission_recover_intervals` consecutive evaluations - five
+seconds at the defaults. Symmetric thresholds would oscillate, and each oscillation is
+another burst of standing queue through the call.
+
+**Never in blind mode.** With no path usable the daemon is spraying everything everywhere
+in the hope something lands, and the measurements have stopped being able to support any
+distinction between classes. Withholding half the traffic there would be acting on
+evidence that no longer exists. Principle 5.
+
+**Off entirely where classes are not real.** Below WireGuard the payload is ciphertext,
+nothing can be classified, and every packet arrives as `ClassUnknown` - which D-027 says
+to carry as bulk. A gate honouring that would withhold the call along with the download
+and take the tunnel down at exactly the moment the link is congested. So the scheduler is
+told whether the classifier is actually running and disables admission control outright
+when it is not. This was written, caught before deployment, and is the reason step 9 only
+means anything in the D-020 shape.
+
+**Only when the classes share a path.** Bulk is worth starving because of what it does to
+the call, not because of what it is. Once step 8's outstanding half lands and bulk can be
+steered onto a path of its own, its queue is nobody else's problem and the gate stays
+open. Writing the condition as "they share a path" rather than "there is one path" means
+that improvement needs no change here.
+
+**Defaults.** `admission_queue_delay_ms` is 150, deliberately above
+`unstable_queue_delay_ms` at 100. Demoting a path and steering around it is the cheaper
+response and should be tried first; starving bulk is what is left when there is nowhere to
+steer to.
+
+**Rejected.** Shaping bulk down to a residual rate rather than stopping it: it is the
+letter of `protocol.md`'s "shaped down aggressively to whatever remains", but "whatever
+remains" is a number the daemon does not reliably have - D-023's ceiling is an estimate
+that ages, and pacing against a wrong one either starves bulk anyway or fails to protect
+the call. Stopping is the honest version of the same intent and has no tuning surface.
+
+Also rejected: gating on the receive-direction queue, which is measured more often and is
+the wrong direction; and gating real-time under any condition, which would trade the one
+thing the project exists to protect for bandwidth it barely uses.
+
+**Measured** (2026-09-04, on the real boxes in the D-020 shape, two real WAN links, with
+`admission_queue_delay_ms` dropped to 10 so the gate could be exercised without saturating
+a live link). A 25-second sustained load of 120,950 bulk packets with 2,419 STUN
+interleaved through it:
+
+- every one of the 2,419 real-time packets was admitted and delivered - 2,449 counted
+  real-time including the earlier probes, and none withheld;
+- 85,400 bulk packets were destroyed at the ingress, roughly 70% of the offered load;
+- the far end received 38,610 packets with **zero** drops, which is the admitted bulk plus
+  the real-time and nothing else;
+- the gate opened and shut 21 times across the run as the queue crossed the line, without
+  ever oscillating within an evaluation.
+
+That is the intended shape of the failure: the download absorbs the entire cost and the
+call does not notice.
+
+**Deferred.** Shaping video down within the real-time class, so audio survives while video
+shrinks, is the remaining half of `scope-v1.md`'s deep-canyon walkthrough. It needs audio
+and video told apart inside real-time, which D-030's RTP identification makes possible but
+which nothing currently carries in the header. Recorded rather than built.

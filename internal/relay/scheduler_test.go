@@ -55,6 +55,10 @@ func newWorld(t *testing.T, paths ...pathMetric) *world {
 		},
 	}
 	w.s.cur.Store(emptyDecision)
+	// The world models the D-020 shape, where payloads are plaintext and
+	// classes are real. TestAdmissionDisabledWithoutClassification covers
+	// the other one deliberately.
+	w.s.setClassifying(true)
 	return w
 }
 
@@ -810,5 +814,125 @@ func TestUnknownClassIsCarriedAsBulk(t *testing.T) {
 	if len(unknown) >= len(realtime) {
 		t.Errorf("unclassified traffic took %v, as many paths as real-time's %v;"+
 			" an unidentified download must not be duplicated", unknown, realtime)
+	}
+}
+
+// Step 9, and the canyon case scope-v1.md walks through: one path left, a
+// download filling its uplink, and hundreds of milliseconds of standing
+// queue landing on the call. Bulk is the sacrificial class and has to go.
+func TestBulkStarvedWhenTheCallsPathIsQueueing(t *testing.T) {
+	w := newWorld(t, path(0, 40))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	w.set(0, func(p *pathMetric) {
+		p.haveTx = true
+		p.txQueueMs = float64(w.c.AdmissionQueueDelayMs) * 2
+	})
+	d := w.tick(1)
+
+	if !d.withholdBulk {
+		t.Fatal("bulk still admitted with the call's own path queueing")
+	}
+	if !w.s.admit(protocol.ClassRealtime) {
+		t.Error("real-time withheld; scope-v1.md gives it an absolute reservation")
+	}
+	if w.s.admit(protocol.ClassBulk) {
+		t.Error("bulk admitted while the gate is shut")
+	}
+	// D-027: anything not positively identified as real-time is carried as
+	// bulk, and that has to include being starved as bulk.
+	if w.s.admit(protocol.ClassUnknown) {
+		t.Error("unclassified admitted while the gate is shut")
+	}
+}
+
+// The queue that matters is the one our own bulk fills, which is the send
+// direction and is only ever known from what the peer reports. Acting on a
+// figure measured on arriving packets would starve a download for a
+// downlink it is not responsible for. See D-024.
+func TestBulkAdmittedWithoutSendDirectionEvidence(t *testing.T) {
+	w := newWorld(t, path(0, 40))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	w.set(0, func(p *pathMetric) {
+		p.haveTx = false
+		p.txQueueMs = float64(w.c.AdmissionQueueDelayMs) * 4
+	})
+
+	if d := w.tick(1); d.withholdBulk {
+		t.Error("bulk starved with nobody having reported our send direction")
+	}
+}
+
+// Asymmetric, for the same reason the path machine is: shutting is cheap
+// and reversible, and reopening early costs the call another burst of
+// standing queue.
+func TestBulkReadmittedOnlyAfterTheQueueStaysClear(t *testing.T) {
+	w := newWorld(t, path(0, 40))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	w.set(0, func(p *pathMetric) {
+		p.haveTx = true
+		p.txQueueMs = float64(w.c.AdmissionQueueDelayMs) * 2
+	})
+	if d := w.tick(1); !d.withholdBulk {
+		t.Fatal("gate did not shut on the first evaluation over the line")
+	}
+
+	w.set(0, func(p *pathMetric) { p.txQueueMs = 0 })
+	if d := w.tick(w.c.AdmissionRecoverIntervals - 1); !d.withholdBulk {
+		t.Error("gate reopened before the queue had stayed clear long enough")
+	}
+	if d := w.tick(2); d.withholdBulk {
+		t.Error("gate never reopened after the queue stayed clear")
+	}
+}
+
+// Principle 5. In blind mode the measurements have stopped being able to
+// say anything, and withholding half the traffic would be acting on a
+// distinction nothing can currently support.
+func TestBlindModeNeverStarvesBulk(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	for _, id := range []uint8{0, 1} {
+		w.set(id, func(p *pathMetric) {
+			p.haveTx = true
+			p.txQueueMs = float64(w.c.AdmissionQueueDelayMs) * 4
+			p.silentFor = w.c.DownSilence() * 2
+			p.sentSinceHeard = uint64(w.c.DownProbePackets) * 2
+		})
+	}
+	d := w.tick(3)
+
+	if !d.blind {
+		t.Fatal("expected blind mode with every path down")
+	}
+	if d.withholdBulk {
+		t.Error("bulk starved in blind mode, where nothing can justify it")
+	}
+}
+
+// Below WireGuard the payload is ciphertext, nothing can be classified,
+// and every packet arrives as ClassUnknown. A gate that treats unknown as
+// bulk would then withhold the call along with the download - taking the
+// tunnel down at exactly the moment the link is congested. Admission
+// control has to be off entirely where classes are not real.
+func TestAdmissionDisabledWithoutClassification(t *testing.T) {
+	w := newWorld(t, path(0, 40))
+	w.s.setClassifying(false)
+	w.tick(w.c.PromoteIntervals + 5)
+
+	w.set(0, func(p *pathMetric) {
+		p.haveTx = true
+		p.txQueueMs = float64(w.c.AdmissionQueueDelayMs) * 4
+	})
+	d := w.tick(1)
+
+	if d.withholdBulk {
+		t.Error("gate shut with no classifier; unknown traffic includes the call")
+	}
+	if !w.s.admit(protocol.ClassUnknown) {
+		t.Error("unclassified traffic withheld below WireGuard, where it may be the call")
 	}
 }

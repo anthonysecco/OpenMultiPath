@@ -258,6 +258,11 @@ type session struct {
 	// its own counter's index. Sized to the three that exist.
 	classCounts [3]atomic.Uint64
 
+	// withheldBulk counts packets admission control dropped. Without it a
+	// starved link and an idle one read identically from a campground, the
+	// same trap the class counters exist for.
+	withheldBulk atomic.Uint64
+
 	start     time.Time
 	globalSeq atomic.Uint32
 
@@ -454,6 +459,9 @@ func (s *session) remotes() []pathRemote {
 // traffic was seen" and "classification is not running" produce identical
 // path statistics, and telling them apart from a campground otherwise
 // means reading source.
+// noteWithheld records a packet admission control refused to send.
+func (s *session) noteWithheld() { s.withheldBulk.Add(1) }
+
 func (s *session) noteClass(class uint8) {
 	if int(class) < len(s.classCounts) {
 		s.classCounts[class].Add(1)
@@ -946,6 +954,9 @@ func (s *session) logStats() {
 		if rt, bulk, unk := s.classTotals(); rt+bulk+unk > 0 {
 			log.Printf("traffic: %d real-time, %d bulk, %d unclassified", rt, bulk, unk)
 		}
+		if w := s.withheldBulk.Load(); w > 0 {
+			log.Printf("admission: %d bulk packets withheld to protect the call", w)
+		}
 		if mtu := s.recommendedTunnelMTULocked(); mtu != 0 {
 			log.Printf("recommended tunnel mtu: %d", mtu)
 		}
@@ -1154,13 +1165,15 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 	snap.Aggregate.LossPercent = lossPercent(snap.Aggregate.Received, snap.Aggregate.Lost)
 
 	snap.Scheduler = state.Scheduler{
-		Primary:       -1,
-		SwitchingTo:   -1,
-		Switching:     d.switching,
-		Blind:         d.blind,
-		Reason:        d.reason,
-		DuplicateMode: snap.Config.DuplicateMode,
-		Ranking:       d.ranking,
+		Primary:         -1,
+		SwitchingTo:     -1,
+		Switching:       d.switching,
+		Blind:           d.blind,
+		WithholdingBulk: d.withholdBulk,
+		WithheldBulk:    s.withheldBulk.Load(),
+		Reason:          d.reason,
+		DuplicateMode:   snap.Config.DuplicateMode,
+		Ranking:         d.ranking,
 	}
 	if d.havePrimary {
 		snap.Scheduler.Primary = int(d.primary)

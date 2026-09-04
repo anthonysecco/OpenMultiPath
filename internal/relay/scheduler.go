@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"fmt"
 	"log"
 	"sort"
 	"sync/atomic"
@@ -53,6 +54,13 @@ type decision struct {
 	// carrying nothing. It can tell them apart now.
 	tx     []uint8
 	txBulk []uint8
+
+	// withholdBulk is step 9. True means bulk is not being sent at all
+	// this evaluation - dropped at the ingress rather than queued into a
+	// link whose queue is already hurting the call. The zero value admits,
+	// which is what emptyDecision needs: coming up withholding would
+	// starve bulk until the first tick for no measured reason.
+	withholdBulk bool
 
 	primary     uint8
 	havePrimary bool
@@ -130,6 +138,21 @@ type scheduler struct {
 	challenger    uint8
 	challengerFor int
 
+	// withholdingBulk is the admission gate, and bulkClearFor how many
+	// consecutive evaluations have seen the queue back under the line. The
+	// gate is deliberately asymmetric - see AdmissionRecoverIntervals.
+	withholdingBulk bool
+	bulkClearFor    int
+
+	// classifying mirrors whether the classifier is actually running.
+	// Below WireGuard it is not: payloads are ciphertext, every packet
+	// comes back ClassUnknown, and a gate that treats unknown as bulk
+	// would withhold the call along with the download - killing the
+	// tunnel at exactly the moment the link is congested, which is the
+	// precise opposite of the point. Starving bulk is only meaningful
+	// where bulk can be told from a call.
+	classifying atomic.Bool
+
 	switching      bool
 	switchFrom     uint8
 	switchingTo    uint8
@@ -148,6 +171,10 @@ func newScheduler(sess *session, cfg *config.Holder, candidates func() []uint8) 
 	return s
 }
 
+// setClassifying tells the scheduler whether classes are real. See the
+// field comment: admission control is disabled outright when they are not.
+func (s *scheduler) setClassifying(on bool) { s.classifying.Store(on) }
+
 // current is the decision in force. Never nil.
 func (s *scheduler) current() *decision { return s.cur.Load() }
 
@@ -165,6 +192,113 @@ func (s *scheduler) txPaths(class uint8) []uint8 {
 		return d.tx
 	}
 	return d.txBulk
+}
+
+// admit reports whether a packet of this class should be sent at all.
+//
+// This is the one place the daemon deliberately destroys traffic, and
+// protocol.md is blunt about why. With a call and a download sharing a
+// path whose queue is filling, the download is what is adding hundreds of
+// milliseconds to the call: dropping it costs a stalled page, and carrying
+// it costs the meeting. Dropped here at the ingress the sending stack
+// backs off on its own, so the queue that forms is in a client on the LAN
+// where it is free rather than in the WAN uplink where it is not.
+//
+// Real-time is never withheld. That is the absolute reservation
+// scope-v1.md asks for, and it is also why a gate is enough where a shaper
+// would otherwise be needed: the class that must not be starved is exactly
+// the one too small to need pacing.
+func (s *scheduler) admit(class uint8) bool {
+	if class == protocol.ClassRealtime {
+		return true
+	}
+	if !s.classifying.Load() {
+		return true
+	}
+	return !s.cur.Load().withholdBulk
+}
+
+// applyAdmission sets the gate for this evaluation.
+func (s *scheduler) applyAdmission(d *decision, c config.Config, eligible []scored) {
+	q, ok := sharedQueueMs(d, eligible)
+	if !s.classifying.Load() {
+		// Reported as open, not merely ignored: the interface should not
+		// claim to be starving bulk that it cannot identify.
+		s.setWithholding(false)
+		d.withholdBulk = false
+		return
+	}
+	if !ok {
+		// Either nothing is shared, or there is no evidence about our own
+		// send direction. Neither justifies starving anything.
+		s.setWithholding(false)
+		d.withholdBulk = false
+		return
+	}
+
+	switch {
+	case q > float64(c.AdmissionQueueDelayMs):
+		// Shut on the first evaluation over the line. The call is being
+		// damaged while this is being measured; waiting to confirm would
+		// be confirming it with the meeting.
+		s.bulkClearFor = 0
+		s.setWithholding(true)
+	case s.withholdingBulk:
+		s.bulkClearFor++
+		if s.bulkClearFor >= c.AdmissionRecoverIntervals {
+			s.setWithholding(false)
+		}
+	}
+
+	d.withholdBulk = s.withholdingBulk
+	if s.withholdingBulk {
+		d.reason = fmt.Sprintf("bulk withheld, %.0f ms queue on the call's path", q)
+	}
+}
+
+// setWithholding flips the gate, logging only the transition. The gate is
+// checked on every packet and evaluated five times a second; logging the
+// state rather than the change would bury the journal on the box that is
+// hardest to reach.
+func (s *scheduler) setWithholding(on bool) {
+	if s.withholdingBulk == on {
+		return
+	}
+	s.withholdingBulk = on
+	if on {
+		log.Printf("admission: withholding bulk, the call's path is queueing")
+	} else {
+		s.bulkClearFor = 0
+		log.Printf("admission: admitting bulk again")
+	}
+}
+
+// sharedQueueMs is the send-direction queue delay on the path carrying
+// both classes, when there is one.
+//
+// Two conditions have to hold before starving bulk is the right answer.
+// The classes must actually share a path - once bulk can be steered onto
+// one of its own its queue is nobody else's problem - and the far end must
+// have reported our send direction, because that is the only direction our
+// own bulk fills. Acting on the receive figure would starve a download for
+// a downlink it is not responsible for. See D-024.
+func sharedQueueMs(d *decision, eligible []scored) (float64, bool) {
+	if d.blind {
+		return 0, false
+	}
+	for _, b := range d.txBulk {
+		for _, r := range d.tx {
+			if b != r {
+				continue
+			}
+			for _, sc := range eligible {
+				if sc.m.id == b && sc.m.haveTx {
+					return sc.m.txQueueMs, true
+				}
+			}
+		}
+	}
+	return 0, false
 }
 
 // run evaluates forever on the configured cadence.
@@ -243,6 +377,7 @@ func (s *scheduler) evaluate(now time.Duration, c config.Config) {
 
 	s.choose(now, c, eligible)
 	s.buildTx(d, c, eligible, sendable)
+	s.applyAdmission(d, c, eligible)
 
 	for _, sc := range all {
 		d.views[sc.m.id] = pathView{

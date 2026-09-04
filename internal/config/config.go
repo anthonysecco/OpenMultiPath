@@ -170,6 +170,29 @@ type Config struct {
 	// DuplicateMode decides when a packet goes out more than one path.
 	// See DuplicateModes for the meanings.
 	DuplicateMode string `json:"duplicate_mode"`
+
+	// Admission control, step 9. When the path carrying the call is also
+	// carrying bulk and its queue is building, bulk stops being admitted:
+	// it is dropped here at the ingress, where the cost is a stalled
+	// download and the sending stack backing off on its own. Letting it
+	// through instead feeds a queue that is already adding hundreds of
+	// milliseconds to the call, which is protocol.md's "one person loading
+	// a webpage destroys the meeting".
+	//
+	// AdmissionQueueDelayMs sits deliberately above UnstableQueueDelayMs.
+	// Demoting a path and steering around it is the cheaper answer and
+	// should be tried first; starving bulk is what is left when there is
+	// nowhere to steer to.
+	AdmissionQueueDelayMs int `json:"admission_queue_delay_ms"`
+
+	// AdmissionRecoverIntervals is the asymmetric half, for the same
+	// reason DemoteIntervals and PromoteIntervals differ. The gate shuts
+	// on the first evaluation that sees the queue over the line, because
+	// the call is being damaged as it is measured, and reopens only after
+	// the queue has stayed clear this many evaluations running. Reopening
+	// as eagerly as it shut would oscillate, and every oscillation is
+	// another burst of standing queue through the call.
+	AdmissionRecoverIntervals int `json:"admission_recover_intervals"`
 }
 
 // The duplication policies, in increasing order of cost.
@@ -238,6 +261,14 @@ var Bounds = map[string]bound{
 	"unstable_loss_percent":   {Min: 1, Max: 100, Default: 2},
 	"unstable_queue_delay_ms": {Min: 5, Max: 5_000, Default: 100},
 	"unstable_jitter_ms":      {Min: 1, Max: 1_000, Default: 30},
+
+	// Above unstable_queue_delay_ms on purpose: a path is called unstable
+	// at 100 ms, and bulk is starved at 150 ms only if it is still sharing
+	// that path with the call. Twenty-five evaluations is five seconds at
+	// the default cadence - long enough that a download does not stutter
+	// back and forth across the threshold.
+	"admission_queue_delay_ms":    {Min: 10, Max: 5_000, Default: 150},
+	"admission_recover_intervals": {Min: 1, Max: 1_000, Default: 25},
 
 	// Three intervals to demote, ten to promote, straight from
 	// protocol.md. At the default cadence that is 600 ms down and 2 s up.
@@ -338,24 +369,26 @@ func Defaults() Config {
 		RecordMaxMegabytes:    Bounds["record_max_megabytes"].Default,
 		RecordKeepFiles:       Bounds["record_keep_files"].Default,
 
-		EvalIntervalMs:       Bounds["eval_interval_ms"].Default,
-		UnstableLossPercent:  Bounds["unstable_loss_percent"].Default,
-		UnstableQueueDelayMs: Bounds["unstable_queue_delay_ms"].Default,
-		UnstableJitterMs:     Bounds["unstable_jitter_ms"].Default,
-		DemoteIntervals:      Bounds["demote_intervals"].Default,
-		PromoteIntervals:     Bounds["promote_intervals"].Default,
-		DownSilenceMs:        Bounds["down_silence_ms"].Default,
-		DownProbePackets:     Bounds["down_probe_packets"].Default,
-		FlapWindowSeconds:    Bounds["flap_window_seconds"].Default,
-		FlapThreshold:        Bounds["flap_threshold"].Default,
-		FlapPenaltyR:         Bounds["flap_penalty_r"].Default,
-		UnstablePenaltyR:     Bounds["unstable_penalty_r"].Default,
-		SwitchMarginR:        Bounds["switch_margin_r"].Default,
-		MinAcceptableR:       Bounds["min_acceptable_r"].Default,
-		SwitchHoldIntervals:  Bounds["switch_hold_intervals"].Default,
-		BaseDelayMs:          Bounds["base_delay_ms"].Default,
-		MBBMinMs:             Bounds["mbb_min_ms"].Default,
-		MBBMaxMs:             Bounds["mbb_max_ms"].Default,
+		EvalIntervalMs:            Bounds["eval_interval_ms"].Default,
+		UnstableLossPercent:       Bounds["unstable_loss_percent"].Default,
+		UnstableQueueDelayMs:      Bounds["unstable_queue_delay_ms"].Default,
+		UnstableJitterMs:          Bounds["unstable_jitter_ms"].Default,
+		AdmissionQueueDelayMs:     Bounds["admission_queue_delay_ms"].Default,
+		AdmissionRecoverIntervals: Bounds["admission_recover_intervals"].Default,
+		DemoteIntervals:           Bounds["demote_intervals"].Default,
+		PromoteIntervals:          Bounds["promote_intervals"].Default,
+		DownSilenceMs:             Bounds["down_silence_ms"].Default,
+		DownProbePackets:          Bounds["down_probe_packets"].Default,
+		FlapWindowSeconds:         Bounds["flap_window_seconds"].Default,
+		FlapThreshold:             Bounds["flap_threshold"].Default,
+		FlapPenaltyR:              Bounds["flap_penalty_r"].Default,
+		UnstablePenaltyR:          Bounds["unstable_penalty_r"].Default,
+		SwitchMarginR:             Bounds["switch_margin_r"].Default,
+		MinAcceptableR:            Bounds["min_acceptable_r"].Default,
+		SwitchHoldIntervals:       Bounds["switch_hold_intervals"].Default,
+		BaseDelayMs:               Bounds["base_delay_ms"].Default,
+		MBBMinMs:                  Bounds["mbb_min_ms"].Default,
+		MBBMaxMs:                  Bounds["mbb_max_ms"].Default,
 
 		BWOnsetMs:         Bounds["bw_onset_ms"].Default,
 		BWMinLoadKbps:     Bounds["bw_min_load_kbps"].Default,
@@ -419,24 +452,26 @@ func (c Config) Sanitised() Config {
 		RecordMaxMegabytes:    clamp(c.RecordMaxMegabytes, Bounds["record_max_megabytes"]),
 		RecordKeepFiles:       clamp(c.RecordKeepFiles, Bounds["record_keep_files"]),
 
-		EvalIntervalMs:       clamp(c.EvalIntervalMs, Bounds["eval_interval_ms"]),
-		UnstableLossPercent:  clamp(c.UnstableLossPercent, Bounds["unstable_loss_percent"]),
-		UnstableQueueDelayMs: clamp(c.UnstableQueueDelayMs, Bounds["unstable_queue_delay_ms"]),
-		UnstableJitterMs:     clamp(c.UnstableJitterMs, Bounds["unstable_jitter_ms"]),
-		DemoteIntervals:      clamp(c.DemoteIntervals, Bounds["demote_intervals"]),
-		PromoteIntervals:     clamp(c.PromoteIntervals, Bounds["promote_intervals"]),
-		DownSilenceMs:        clamp(c.DownSilenceMs, Bounds["down_silence_ms"]),
-		DownProbePackets:     clamp(c.DownProbePackets, Bounds["down_probe_packets"]),
-		FlapWindowSeconds:    clamp(c.FlapWindowSeconds, Bounds["flap_window_seconds"]),
-		FlapThreshold:        clamp(c.FlapThreshold, Bounds["flap_threshold"]),
-		FlapPenaltyR:         clamp(c.FlapPenaltyR, Bounds["flap_penalty_r"]),
-		UnstablePenaltyR:     clamp(c.UnstablePenaltyR, Bounds["unstable_penalty_r"]),
-		SwitchMarginR:        clamp(c.SwitchMarginR, Bounds["switch_margin_r"]),
-		MinAcceptableR:       clamp(c.MinAcceptableR, Bounds["min_acceptable_r"]),
-		SwitchHoldIntervals:  clamp(c.SwitchHoldIntervals, Bounds["switch_hold_intervals"]),
-		BaseDelayMs:          clamp(c.BaseDelayMs, Bounds["base_delay_ms"]),
-		MBBMinMs:             clamp(c.MBBMinMs, Bounds["mbb_min_ms"]),
-		MBBMaxMs:             clamp(c.MBBMaxMs, Bounds["mbb_max_ms"]),
+		EvalIntervalMs:            clamp(c.EvalIntervalMs, Bounds["eval_interval_ms"]),
+		UnstableLossPercent:       clamp(c.UnstableLossPercent, Bounds["unstable_loss_percent"]),
+		UnstableQueueDelayMs:      clamp(c.UnstableQueueDelayMs, Bounds["unstable_queue_delay_ms"]),
+		UnstableJitterMs:          clamp(c.UnstableJitterMs, Bounds["unstable_jitter_ms"]),
+		AdmissionQueueDelayMs:     clamp(c.AdmissionQueueDelayMs, Bounds["admission_queue_delay_ms"]),
+		AdmissionRecoverIntervals: clamp(c.AdmissionRecoverIntervals, Bounds["admission_recover_intervals"]),
+		DemoteIntervals:           clamp(c.DemoteIntervals, Bounds["demote_intervals"]),
+		PromoteIntervals:          clamp(c.PromoteIntervals, Bounds["promote_intervals"]),
+		DownSilenceMs:             clamp(c.DownSilenceMs, Bounds["down_silence_ms"]),
+		DownProbePackets:          clamp(c.DownProbePackets, Bounds["down_probe_packets"]),
+		FlapWindowSeconds:         clamp(c.FlapWindowSeconds, Bounds["flap_window_seconds"]),
+		FlapThreshold:             clamp(c.FlapThreshold, Bounds["flap_threshold"]),
+		FlapPenaltyR:              clamp(c.FlapPenaltyR, Bounds["flap_penalty_r"]),
+		UnstablePenaltyR:          clamp(c.UnstablePenaltyR, Bounds["unstable_penalty_r"]),
+		SwitchMarginR:             clamp(c.SwitchMarginR, Bounds["switch_margin_r"]),
+		MinAcceptableR:            clamp(c.MinAcceptableR, Bounds["min_acceptable_r"]),
+		SwitchHoldIntervals:       clamp(c.SwitchHoldIntervals, Bounds["switch_hold_intervals"]),
+		BaseDelayMs:               clamp(c.BaseDelayMs, Bounds["base_delay_ms"]),
+		MBBMinMs:                  clamp(c.MBBMinMs, Bounds["mbb_min_ms"]),
+		MBBMaxMs:                  clamp(c.MBBMaxMs, Bounds["mbb_max_ms"]),
 
 		BWOnsetMs:         clamp(c.BWOnsetMs, Bounds["bw_onset_ms"]),
 		BWMinLoadKbps:     clamp(c.BWMinLoadKbps, Bounds["bw_min_load_kbps"]),
