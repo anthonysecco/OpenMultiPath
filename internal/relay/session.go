@@ -1172,6 +1172,7 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 		Blind:           d.blind,
 		WithholdingBulk: d.withholdBulk,
 		WithheldBulk:    s.withheldBulk.Load(),
+		BulkPath:        -1,
 		Reason:          d.reason,
 		DuplicateMode:   snap.Config.DuplicateMode,
 		Ranking:         d.ranking,
@@ -1181,6 +1182,12 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 	}
 	if d.switching {
 		snap.Scheduler.SwitchingTo = int(d.switchingTo)
+	}
+	// Bulk rides exactly one path once it has been steered; more than one
+	// only happens in blind mode, where the distinction has stopped
+	// meaning anything.
+	if len(d.txBulk) == 1 && !d.blind {
+		snap.Scheduler.BulkPath = int(d.txBulk[0])
 	}
 	return snap
 }

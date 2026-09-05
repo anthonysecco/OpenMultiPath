@@ -1174,3 +1174,69 @@ The companion fix is in `deploy/omp-restore`, which killed `ompd` and `ompd-d020
 by exact name and therefore missed the `ompd-step9` binary that caused this. It
 now matches `^ompd`, which catches any `ompd-<experiment>` a future test leaves
 behind and still leaves `ompui` alone, and it prints what it is stopping.
+
+## D-033 · Bulk takes the best path real-time is not using
+
+Step 8 published a transmit set per class but then put both on the same path:
+`txBulk` was the primary, always. That left the download and the call sharing one
+link, which is the condition admission control (D-031) exists to survive - so the
+daemon spent step 9 destroying traffic to solve a problem step 8 could have
+avoided.
+
+**Bulk takes the best eligible path that real-time is not on. It shares the
+primary only when real-time is using all of them.**
+
+The trade is not close. Bulk sharing the call's path costs a standing queue built
+by a download, arriving as delay in a meeting. Moving it costs a slower page, and
+scope-v1.md calls web and map traffic explicitly sacrificial while naming
+conferencing quality as the metric that matters.
+
+This is one rule where the canyon walkthrough asks for two behaviours. "Pull bulk
+off Starlink immediately" on a canyon approach happens because the degrading link
+stops being the primary. "Use Starlink only for bulk, where intermittency costs
+nothing" under an hour of forest canopy happens because an unstable path is still
+eligible. That second case is why **no capacity or stability test guards the
+target**: a flapping link is a perfectly good place to put traffic that can wait,
+and refusing it would leave the download on the call's path instead - the exact
+outcome this exists to prevent.
+
+**Real-time's whole transmit set is avoided, not just the primary.** During a
+make-before-break overlap real-time is on two paths, and the second one is there
+specifically to protect the call through the handover; steering bulk onto it
+would load the insurance. Same for duplication targets.
+
+**Stickiness, for a different reason than the primary's.** Moving bulk between
+links reorders every TCP flow in progress on it, and a receiver reads reordering
+as loss and retransmits. A scheduler chasing the better link each time two scores
+crossed would pay for the move repeatedly in exactly the traffic it was trying to
+speed up. Bulk therefore stays where it is while its path remains eligible and
+free of real-time.
+
+**It is off entirely below WireGuard**, and this matters more here than it did
+for D-031. Payloads are ciphertext, nothing classifies, every packet arrives
+`ClassUnknown`, and D-027 carries unknown as bulk. Steering on that would not
+merely mislabel traffic - it would move *all* of it off the best path onto the
+second best, leaving the primary carrying probes and the call riding the leftover
+link. Same trap as step 9's, one level worse, caught the same way.
+
+**Not cost-aware, and does not need to be.** The target comes off the eligible
+ranking, so when step 10 puts a billing penalty into the score, bulk stops being
+steered onto an expensive link with no change here.
+
+**Rejected: steering only once the primary degrades.** It reads as the
+conservative option and matches "pull bulk off *immediately*" on its face, but it
+waits for damage before avoiding it. The queue a download builds is already in
+the call by the time the path machine demotes anything, and there is no reason to
+share a link when a free one is sitting there.
+
+**Rejected: keeping bulk on the primary because scope-v1.md says "single best
+path".** That line contrasts with the deferred multipath aggregation and the
+resequencer - it means *one* path rather than several, not *the same* path as
+real-time.
+
+Verified by unit tests including the walkthrough's canopy case, each confirmed to
+fail when the behaviour it names is removed. Steering above WireGuard is not yet
+exercised on hardware: it needs a cutover, and both boxes' out-of-band Wi-Fi
+adapters are currently absent from the USB bus, so there is no lifeline to do one
+behind. What *is* verified on hardware is the guard - production below WireGuard
+keeps bulk on the primary and is unchanged by this.

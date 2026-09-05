@@ -144,6 +144,13 @@ type scheduler struct {
 	withholdingBulk bool
 	bulkClearFor    int
 
+	// bulkPath is the path bulk was steered onto, held across evaluations
+	// so a flow is not walked between links every time two scores cross.
+	// Unset means bulk is riding the primary because nothing else was
+	// free.
+	bulkPath     uint8
+	haveBulkPath bool
+
 	// classifying mirrors whether the classifier is actually running.
 	// Below WireGuard it is not: payloads are ciphertext, every packet
 	// comes back ClassUnknown, and a gate that treats unknown as bulk
@@ -216,6 +223,97 @@ func (s *scheduler) admit(class uint8) bool {
 		return true
 	}
 	return !s.cur.Load().withholdBulk
+}
+
+// steerBulk puts bulk on the best path real-time is not using, which is
+// the rest of step 8 and the thing that makes step 9 rare.
+//
+// The rule is one sentence: bulk takes the best eligible path that
+// real-time is not on, and shares the primary only when real-time is using
+// all of them. The whole cost of bulk sharing the call's path is a
+// standing queue built by a download, arriving as delay in a meeting. The
+// whole cost of moving it is a slower page, and scope-v1.md calls web and
+// map traffic explicitly sacrificial. That ordering is not close.
+//
+// It is also, in one rule, two scenarios the walkthrough asks for
+// separately. "Pull bulk off Starlink immediately" on a canyon approach
+// happens because the degrading link stops being the primary. "Use
+// Starlink only for bulk, where intermittency costs nothing" under forest
+// canopy happens because an unstable path is still eligible - which is why
+// no capacity or stability test guards the target. A flapping link is a
+// perfectly good place to put traffic that can wait, and refusing to use
+// it would leave the download on the call's path instead, which is the
+// outcome this exists to prevent.
+//
+// Nothing here is cost-aware yet. It does not need to be: the target is
+// taken from the eligible ranking, so once step 10 puts a billing penalty
+// into the score, bulk stops being steered onto an expensive link without
+// this code changing.
+func (s *scheduler) steerBulk(d *decision, c config.Config, eligible []scored) {
+	// Blind mode has no opinion worth acting on - see buildTx, which
+	// sprays both classes alike because the measurements have stopped
+	// being able to tell them apart.
+	if d.blind || !d.havePrimary {
+		s.setBulkPath(0, false)
+		return
+	}
+
+	// The same trap step 9 fell into, and worth stating separately
+	// because it bites harder here. Below WireGuard payloads are
+	// ciphertext, nothing can be classified, and every packet comes back
+	// ClassUnknown - which D-027 carries as bulk. Steering on that would
+	// not merely mislabel traffic, it would move *all* of it off the best
+	// path onto the second best, leaving the primary carrying probes and
+	// the call riding whatever was left over. Keeping the call off the
+	// download's path is only meaningful where the two can be told apart.
+	if !s.classifying.Load() {
+		s.setBulkPath(0, false)
+		return
+	}
+
+	carrying := make(map[uint8]bool, len(d.tx))
+	for _, id := range d.tx {
+		carrying[id] = true
+	}
+
+	// Stickiness before ranking. Moving bulk between links reorders every
+	// TCP flow in progress on it, and the receiver reads reordering as
+	// loss and retransmits - so a scheduler that chased the better link
+	// each time two scores crossed would pay for the move over and over
+	// in exactly the traffic it was trying to speed up. Keep what is
+	// working while it still works.
+	if s.haveBulkPath && !carrying[s.bulkPath] && s.stillEligible(s.bulkPath, eligible) {
+		d.txBulk = []uint8{s.bulkPath}
+		return
+	}
+
+	for _, sc := range eligible {
+		if carrying[sc.m.id] {
+			continue
+		}
+		s.setBulkPath(sc.m.id, true)
+		d.txBulk = []uint8{sc.m.id}
+		return
+	}
+
+	// Real-time is on everything usable. Bulk shares the primary, as
+	// buildTx left it, and admission control decides whether it flows.
+	s.setBulkPath(0, false)
+}
+
+// setBulkPath records where bulk is going, logging only the transitions.
+// The scheduler evaluates five times a second and the journal lives on the
+// box that is hardest to reach.
+func (s *scheduler) setBulkPath(id uint8, have bool) {
+	if s.haveBulkPath == have && (!have || s.bulkPath == id) {
+		return
+	}
+	s.bulkPath, s.haveBulkPath = id, have
+	if have {
+		log.Printf("scheduler: bulk -> path %d, off the call's path", id)
+	} else {
+		log.Printf("scheduler: bulk -> path %d, sharing the call's path (nothing else usable)", s.primary)
+	}
 }
 
 // applyAdmission sets the gate for this evaluation.
@@ -377,6 +475,7 @@ func (s *scheduler) evaluate(now time.Duration, c config.Config) {
 
 	s.choose(now, c, eligible)
 	s.buildTx(d, c, eligible, sendable)
+	s.steerBulk(d, c, eligible)
 	s.applyAdmission(d, c, eligible)
 
 	for _, sc := range all {

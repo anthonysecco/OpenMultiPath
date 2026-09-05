@@ -102,8 +102,14 @@ of reasoning up front.
    handovers-only to duplicating real-time while its path is degraded, which D-022 could
    not do while nothing could tell a call from a download. Verified on the wire: sixty
    real-time packets went out both paths, sixty bulk packets went out one.
-   Still to come here: steering bulk *away* from the real-time path when a second usable
-   one exists, which is the canyon walkthrough's "pull bulk off Starlink immediately".
+   **Bulk steering built** (2026-09-05, D-033), which completes this step. Bulk takes the
+   best eligible path real-time is not using, and shares the primary only when real-time
+   is on all of them. One rule covers two walkthrough cases: "pull bulk off Starlink
+   immediately" on a canyon approach, and "use Starlink only for bulk" under forest
+   canopy - the latter is why an unstable path is still a valid target. Real-time's whole
+   transmit set is avoided, not just the primary, so a download never lands on the path
+   carrying a make-before-break overlap. Off entirely below WireGuard, where everything is
+   unclassified and steering would move all traffic onto the second-best link.
 9. **Admission control.** Alongside the scheduler, not after.
    **Built** (2026-09-04, D-031). Bulk stops being sent entirely when the path carrying
    real-time is also carrying it and the peer reports that path's send direction queueing

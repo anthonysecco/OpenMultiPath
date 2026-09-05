@@ -936,3 +936,217 @@ func TestAdmissionDisabledWithoutClassification(t *testing.T) {
 		t.Error("unclassified traffic withheld below WireGuard, where it may be the call")
 	}
 }
+
+// Step 8's remaining half. With a second path usable, a download has no
+// business sharing the link carrying the call: the queue it builds arrives
+// as delay in a meeting, and the cost of moving it is a slower page.
+func TestBulkIsSteeredOffTheCallsPath(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	if len(d.txBulk) != 1 {
+		t.Fatalf("bulk on %v, want exactly one path", d.txBulk)
+	}
+	if d.txBulk[0] == d.primary {
+		t.Errorf("bulk on path %d, the same path as the call, with another usable", d.txBulk[0])
+	}
+	if len(d.tx) != 1 || d.tx[0] != d.primary {
+		t.Errorf("real-time on %v, want the primary alone", d.tx)
+	}
+}
+
+// The condition admission control exists for. One path means there is
+// nowhere to steer to, so the classes share and step 9 decides whether
+// bulk flows at all.
+func TestBulkSharesThePrimaryWhenNothingElseIsUsable(t *testing.T) {
+	w := newWorld(t, path(0, 40))
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	if len(d.txBulk) != 1 || d.txBulk[0] != d.primary {
+		t.Fatalf("bulk on %v with one usable path, want the primary", d.txBulk)
+	}
+
+	w.set(0, func(p *pathMetric) {
+		p.haveTx = true
+		p.txQueueMs = float64(w.c.AdmissionQueueDelayMs) * 2
+	})
+	if d := w.tick(1); !d.withholdBulk {
+		t.Error("classes share the only path and it is queueing, but bulk was not withheld")
+	}
+}
+
+// Steering is the better answer than starving whenever both are available,
+// so the two have to compose: once bulk is on a path of its own, its queue
+// is nobody else's problem and the gate must stay open.
+func TestSteeringBulkAwayRemovesTheNeedToStarveIt(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	// The call's path is queueing hard in our send direction.
+	w.set(0, func(p *pathMetric) {
+		p.haveTx = true
+		p.txQueueMs = float64(w.c.AdmissionQueueDelayMs) * 4
+	})
+	d := w.tick(1)
+
+	if d.withholdBulk {
+		t.Error("bulk starved while it was already riding a path of its own")
+	}
+	if d.txBulk[0] == d.primary {
+		t.Errorf("bulk still on the call's queueing path %d", d.primary)
+	}
+}
+
+// Make-before-break puts real-time on two paths at once. Bulk should take
+// the third rather than land on the path that is carrying the overlap,
+// which exists precisely to protect the call through the handover.
+func TestBulkAvoidsTheHandoverOverlapPath(t *testing.T) {
+	w := newWorld(t, path(0, 400), path(1, 400), path(2, 400))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	w.set(0, func(p *pathMetric) { p.recentLoss = 40; p.burstRatio = 20 })
+
+	var d *decision
+	for i := 0; i < 50; i++ {
+		if d = w.tick(1); d.switching {
+			break
+		}
+	}
+	if !d.switching {
+		t.Fatal("a collapsed primary never started a handover")
+	}
+
+	rt := txSet(d)
+	if len(d.txBulk) != 1 {
+		t.Fatalf("bulk on %v during a handover, want exactly one path", d.txBulk)
+	}
+	if rt[d.txBulk[0]] {
+		t.Errorf("bulk on path %d, which is carrying the handover overlap %v", d.txBulk[0], d.tx)
+	}
+}
+
+// When real-time is duplicated onto everything, there is no path free of
+// it and bulk shares the primary. Steering it onto a duplication target
+// would put the download on the very link insuring the call.
+func TestBulkSharesThePrimaryWhenRealTimeUsesEveryPath(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.c.DuplicateMode = config.DuplicateAlways
+	w.s.cfg = config.NewHolder(w.c)
+
+	d := w.tick(w.c.PromoteIntervals + 5)
+	if len(d.tx) != 2 {
+		t.Fatalf("real-time on %v, want both paths in always mode", d.tx)
+	}
+	if len(d.txBulk) != 1 || d.txBulk[0] != d.primary {
+		t.Errorf("bulk on %v with real-time everywhere, want the primary", d.txBulk)
+	}
+}
+
+// The forest canopy case from scope-v1.md: an hour of intermittent
+// obstruction, real-time pinned to the good link, "use Starlink only for
+// bulk, where intermittency costs nothing". An unstable path is still an
+// eligible target, which is why no stability test guards the choice.
+func TestBulkUsesAFlappingPathRatherThanTheCallsPath(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	// Degrade path 1 without taking it down: loss enough to demote it,
+	// not enough silence to make it unusable.
+	w.set(1, func(p *pathMetric) { p.recentLoss = 12; p.burstRatio = 3 })
+	d := w.tick(w.c.DemoteIntervals + 2)
+
+	if w.s.machines[1].state != stateUnstable {
+		t.Fatalf("path 1 is %s, wanted it demoted to unstable", w.s.machines[1].state)
+	}
+	if d.primary != 0 {
+		t.Fatalf("primary is path %d, want the clean path 0", d.primary)
+	}
+	if len(d.txBulk) != 1 || d.txBulk[0] != 1 {
+		t.Errorf("bulk on %v, want the flapping path 1 rather than the call's", d.txBulk)
+	}
+}
+
+// Moving bulk between links reorders every TCP flow on it, and the
+// receiver reads reordering as loss. A scheduler that chased the better
+// link every time two scores crossed would pay for the move repeatedly in
+// exactly the traffic it was trying to speed up.
+func TestBulkStaysPutWhileItsPathStillWorks(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60), path(2, 80))
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	first := d.txBulk[0]
+	if first == d.primary {
+		t.Fatalf("bulk started on the call's path %d", d.primary)
+	}
+
+	// Make the other spare clearly better than the one bulk is on,
+	// without making bulk's path unusable.
+	other := uint8(1)
+	if first == 1 {
+		other = 2
+	}
+	w.set(other, func(p *pathMetric) { p.rttMs = 5 })
+	w.set(first, func(p *pathMetric) { p.rttMs = 90 })
+
+	if d := w.tick(10); d.txBulk[0] != first {
+		t.Errorf("bulk moved from path %d to %d for a better score alone", first, d.txBulk[0])
+	}
+}
+
+// Blind mode sprays both classes alike: there is no measurement left to
+// tell them apart with, so steering would be acting on a distinction
+// nothing can currently support.
+func TestBlindModeLeavesBulkOnEveryPath(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	for _, id := range []uint8{0, 1} {
+		w.set(id, func(p *pathMetric) {
+			p.silentFor = w.c.DownSilence() * 2
+			p.sentSinceHeard = uint64(w.c.DownProbePackets) * 2
+		})
+	}
+	d := w.tick(3)
+
+	if !d.blind {
+		t.Fatal("expected blind mode with every path down")
+	}
+	if len(d.txBulk) != len(d.tx) {
+		t.Errorf("bulk on %v and real-time on %v; blind mode sprays both alike", d.txBulk, d.tx)
+	}
+}
+
+// The step 9 trap, one level worse. Below WireGuard nothing can be
+// classified and every packet is ClassUnknown, which is carried as bulk.
+// Steering on that would move all traffic off the best path onto the
+// second best, leaving the call on the worse link and the primary
+// carrying probes.
+func TestBulkIsNotSteeredWithoutClassification(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.s.setClassifying(false)
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	if len(d.txBulk) != 1 || d.txBulk[0] != d.primary {
+		t.Fatalf("bulk on %v below WireGuard, want the primary %d", d.txBulk, d.primary)
+	}
+	if !sameSet(w.s.txPaths(protocol.ClassUnknown), d.tx) {
+		t.Errorf("unclassified traffic on %v but real-time on %v; below WireGuard they are the same packets",
+			w.s.txPaths(protocol.ClassUnknown), d.tx)
+	}
+}
+
+func sameSet(a, b []uint8) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := map[uint8]bool{}
+	for _, id := range a {
+		seen[id] = true
+	}
+	for _, id := range b {
+		if !seen[id] {
+			return false
+		}
+	}
+	return true
+}

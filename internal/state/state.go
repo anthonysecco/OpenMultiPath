@@ -73,6 +73,13 @@ type Scheduler struct {
 	WithholdingBulk bool   `json:"withholding_bulk"`
 	WithheldBulk    uint64 `json:"withheld_bulk"`
 
+	// BulkPath is the path bulk is being steered onto to keep it off the
+	// call's, or -1 when it is sharing the primary because real-time is
+	// using everything usable. Worth showing next to Primary: the two
+	// being equal is the condition admission control exists for, and it
+	// explains a withheld counter that would otherwise look arbitrary.
+	BulkPath int `json:"bulk_path"`
+
 	// Reason is the scheduler's own one-line account of the current
 	// choice, which is the first thing worth reading when the choice looks
 	// wrong.
