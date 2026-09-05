@@ -10,13 +10,22 @@
 # Every step is written to be a no-op when it was not needed.
 set +e
 
-# Stop whatever is running, under either name a cutover may have used.
+# Stop every daemon variant, matched by pattern rather than by a list of
+# names known in advance.
 #
-# -x matches the executable name exactly. -f would also match this script
-# and the ssh command line that invoked it, which is how an operator kills
-# their own session on the box they are trying to recover.
-pkill -x ompd
-pkill -x ompd-d020
+# The list was the bug. It named ompd and ompd-d020, so an orphaned
+# ompd-step9 from a hardware test survived a rollback and went on writing
+# the shared state file for a day. The web interface rendered its dead view
+# of torn-down interfaces and the live daemon's view alternately, which
+# reads exactly like both links flapping between stable and down. ^ompd
+# catches any ompd-<experiment> binary the next test leaves behind, and
+# does not match ompui, which is supervised separately and wanted up.
+#
+# Not -f. That would also match this script and the ssh command line that
+# invoked it, which is how an operator kills their own session on the box
+# they are trying to recover.
+pgrep -a '^ompd' 2>/dev/null | sed 's/^/omp-restore: stopping /'
+pkill '^ompd'
 
 # D-020's interfaces down, production's back up. The TUN is created by the
 # daemon and normally leaves with it; deleting it covers the case where the

@@ -1111,3 +1111,66 @@ call does not notice.
 shrinks, is the remaining half of `scope-v1.md`'s deep-canyon walkthrough. It needs audio
 and video told apart inside real-time, which D-030's RTP identification makes possible but
 which nothing currently carries in the header. Recorded rather than built.
+
+## D-032 · One writer per state file, enforced by the kernel
+
+The state file is the instrument. Nothing else on either box explains what the
+links are doing, so a state file that lies is worse than no state file at all -
+it costs you the time you spend believing it.
+
+Two daemons writing one state file lie in a particularly bad way. Each rewrites
+the whole snapshot on its own timer, so the file alternates between two
+unrelated views of the world and the web interface renders both, faithfully. It
+happened: a test binary left running after a rollback kept publishing its dead
+view of interfaces that had already been torn down, alongside the live daemon's
+view of two perfectly healthy links. What that looks like is both links flapping
+between stable and down every few seconds - which is indistinguishable from the
+fault the interface exists to diagnose. The daemon's own log was clean the whole
+time and said `stable (clean)` on every line.
+
+Nothing detected it, and nothing could have. The two processes had different
+sockets and different interfaces, so no bind collision ever fired. The only
+symptom was corrupted observability, and corrupted observability is exactly the
+condition you cannot observe your way out of.
+
+**The state file is claimed with an exclusive `flock` on a sibling lock file,
+held for the life of the process.**
+
+`flock` rather than a pidfile because the kernel releases it when the holder
+exits, crashes, or is killed outright. There is no stale lock to clear by hand,
+and nothing a power cut can leave behind that stops the next boot - which is the
+only property that matters for a lock on a vehicle.
+
+A sibling file rather than the state file itself because `state.Write` replaces
+the state file by rename on every pass. A lock taken on that inode would guard a
+file with no name left, and each writer would contentedly lock its own orphan.
+The lock file is never unlinked, for the same reason: removing it lets the next
+process create a fresh inode and lock that instead.
+
+**The loser keeps relaying and keeps retrying.** It does not exit. Principle 5
+asks for a box that still carries traffic when a part of it is broken, and the
+part that is broken here is the web interface, not the tunnel. Retrying every 30
+seconds also means the survivor picks the file up on its own once whatever else
+was holding it goes away - no restart, no trip to the vehicle.
+
+It reminds the log every five minutes rather than saying this once at startup.
+That is not tidiness. The failure is invisible from a distance, so by the time an
+operator looks, a line written when the daemon started is long outside the window
+they are looking at. In the incident that produced this decision, the orphan had
+been running for a day.
+
+**Rejected: making the daemon exit on a busy lock.** It is the obvious design and
+it is wrong here. Whoever started first wins, and first is not the same as
+correct - in the incident, the orphan started first, so exiting would have taken
+down the daemon that was actually carrying the traffic. Failing to nothing to
+protect a JSON file inverts the priority.
+
+**Rejected: deriving a per-process state path.** It removes the collision by
+removing the shared file, and with it the property that one known path always
+holds the current truth. The web interface would then have to guess which file to
+read, which is the same problem one level up.
+
+The companion fix is in `deploy/omp-restore`, which killed `ompd` and `ompd-d020`
+by exact name and therefore missed the `ompd-step9` binary that caused this. It
+now matches `^ompd`, which catches any `ompd-<experiment>` a future test leaves
+behind and still leaves `ompui` alone, and it prints what it is stopping.

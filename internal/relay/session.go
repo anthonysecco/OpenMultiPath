@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -1209,8 +1210,59 @@ func burstsOf(st *pathStats) []state.Burst {
 	return out
 }
 
+// stateLockRetry is how often a daemon that lost the state file tries for
+// it again, and stateLockRemind how often it says so in the log.
+const (
+	stateLockRetry  = 30 * time.Second
+	stateLockRemind = 5 * time.Minute
+)
+
+// holdStateLock returns once this process owns the right to write path.
+//
+// A daemon that loses the race keeps relaying and keeps retrying rather
+// than exiting. The state file is the instrument, not the job, and
+// principle 5 asks for a box that still carries traffic when a part of it
+// is broken. Retrying also means the survivor picks the file up by itself
+// once whatever else was holding it goes away, with no restart and no
+// trip to the vehicle.
+//
+// It reminds the log on a slow cadence instead of saying this once at
+// startup. The whole failure being guarded against is invisible from a
+// distance, and a single line written when the daemon started is not in
+// the window an operator looks at once they finally notice.
+func holdStateLock(path string) *state.Lock {
+	var waited, nextRemind time.Duration
+	for {
+		lock, err := state.TryLock(path)
+		if err == nil {
+			if waited > 0 {
+				log.Printf("state: %s came free after %s; writing it again",
+					path, waited.Round(time.Second))
+			}
+			return lock
+		}
+		if waited >= nextRemind {
+			if errors.Is(err, state.ErrLocked) {
+				log.Printf("state: another ompd is already writing %s, so this one is not. "+
+					"Traffic is unaffected, but the web interface is showing that daemon's "+
+					"view of the world and not this one's. Find it with: pgrep -a '^ompd'", path)
+			} else {
+				log.Printf("state: cannot lock %s: %v; retrying", path, err)
+			}
+			nextRemind = waited + stateLockRemind
+		}
+		time.Sleep(stateLockRetry)
+		waited += stateLockRetry
+	}
+}
+
 // writeState keeps the state file current for the web interface.
 func (s *session) writeState(path, wgInterface string) {
+	// One writer per state file, or the two views interleave into
+	// something that reads as a link fault. See state.Lock.
+	lock := holdStateLock(path)
+	defer lock.Close()
+
 	var last time.Duration
 	for range time.Tick(100 * time.Millisecond) {
 		if now := s.elapsed(); now-last < s.cfg.Get().StateInterval() {
