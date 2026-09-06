@@ -1822,3 +1822,41 @@ it through the existing fwmark -> table -> device chain. It is bounded by
 duration and reports the bytes it moved, because a full run spends tens of
 megabytes of real, possibly metered, data in each direction - which is the
 whole reason it is a button a person presses, never a poll.
+
+## D-041 · BBR, because cubic collapses the tunnel's upload on a cellular link
+
+**Decision.** Set the congestion control to BBR (with the `fq` qdisc and larger
+socket buffers) on both nodes, shipped as `deploy/99-omp-tuning.conf`.
+
+**How it was found.** The tunnel's TCP upload sat around 5 Mbps single-stream
+while the speedtest showed 81. A layered set of iperf tests, taking the tunnel
+down to test the raw path directly (authorised for this), placed the bottleneck
+exactly:
+
+| RV -> home upload | Mbps |
+|---|--:|
+| raw UDP, no tunnel | 70 |
+| WireGuard-encapsulated UDP | 63 |
+| WireGuard TCP, cubic, 8 streams | 23 |
+| WireGuard TCP, cubic, 1 stream | 5.5 |
+| **WireGuard TCP, BBR, 1 stream** | **68.5** |
+
+So the path carries ~70, WireGuard carries ~63, and it was **cubic** throwing
+the rest away: it read the cellular uplink's ordinary random loss and jitter as
+congestion and backed off. Download never suffered (104) because home's uplink
+is clean - the asymmetry was the tell. Both CPUs were idle throughout, so it was
+never compute. BBR paces to bandwidth*RTT and ignores non-congestive loss, and
+took the single-stream upload from 5.5 to 68.5 - essentially the whole link.
+
+**What this fixes, and what it does not.** It fixes traffic that originates on
+the vehicle or home, and the daemon's own measurement flows. Traffic forwarded
+for a LAN client keeps that client's own congestion control end to end, so a
+cubic client (or a container that cannot set its own, as the test box was) still
+backs off. Masking the path's loss inside the tunnel - FEC or duplication for
+bulk - is what would help those, and it stays future work (see D-007).
+
+**A second, separate ceiling remains.** Even with BBR, traffic through the
+daemon's own data path (`omp0`) tops out around 55-60 Mbps with both CPUs idle,
+where the raw WireGuard transport now does 68 up and 113 down. That is the
+single-threaded, unbatched relay loop, not congestion control - a data-plane
+project (batched TUN/UDP I/O, or segmentation offload) for later.
