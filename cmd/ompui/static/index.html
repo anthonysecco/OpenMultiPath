@@ -54,6 +54,13 @@
   .path.dead  { border-left-color: var(--bad); }
   .path-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
   .path-name { font-weight: 650; font-size: 16px; }
+  .diag { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line);
+          display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .diag-btn { font: inherit; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+              border: 1px solid var(--line); background: var(--panel); color: inherit; }
+  .diag-btn:hover:not(:disabled) { border-color: var(--accent); }
+  .diag-btn:disabled { opacity: 0.6; cursor: default; }
+  .diag-result { flex-basis: 100%; margin-top: 4px; }
   .metrics { display: grid; gap: 10px 16px; grid-template-columns: repeat(auto-fit, minmax(105px, 1fr)); }
   .metric .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
   .dir { display: inline-block; padding: 0 4px; border-radius: 3px; background: rgba(127,127,127,.18);
@@ -150,6 +157,13 @@
 
 <script>
 const $ = id => document.getElementById(id);
+
+// lastState is the most recent snapshot, kept so a bandwidth test can
+// re-render the path cards the instant it finishes rather than waiting for
+// the next poll. diagRuns holds each path's test state (running / result /
+// error) outside the DOM, so the once-a-second rebuild does not wipe it.
+let lastState = null;
+const diagRuns = {};
 const fmt = (n, d = 1) => (n === undefined || n === null) ? "—" : Number(n).toFixed(d);
 
 // Data volumes against a monthly cap. Always two significant figures at
@@ -450,8 +464,65 @@ function renderPaths(s) {
         ${bindRow}
       </div>
       ${burstRow}
+      ${diagBlock(owns, p)}
     </div>`;
   }).join("");
+}
+
+// diagBlock is the on-demand uplink test for one path. It is shown only on
+// the end that owns the path and only while the link is up, because the test
+// pins itself to the interface with the same SO_BINDTODEVICE the daemon uses
+// and there is nothing to bind to on a link that is down. Its state lives in
+// diagRuns rather than the DOM, so the once-a-second state refresh - which
+// rebuilds every card - does not wipe a test in progress or its result.
+function diagBlock(owns, p) {
+  if (!owns || !p.bound) return "";
+  const d = diagRuns[p.id] || {};
+  let result = "";
+  if (d.running) {
+    result = `<span class="muted">saturating ${p.name}…</span>`;
+  } else if (d.error) {
+    result = `<span style="color:var(--bad)">iperf: ${d.error}</span>`;
+  } else if (d.mbps != null) {
+    const est = d.est || {};
+    const estStr = est.ceiling_known ? rate(est.ceiling_kbps)
+      : (est.ceiling_age_seconds >= 0 ? "≥ " + rate(est.proven_kbps) : "unmeasured");
+    result = `<strong>${d.mbps.toFixed(1)} Mbps</strong> measured`
+      + (d.retransmits ? ` · ${d.retransmits} retransmits` : "")
+      + ` · estimator says ${estStr}`;
+  }
+  return `<div class="diag">
+    <button class="diag-btn" ${d.running ? "disabled" : ""} onclick="runBandwidthTest(${p.id})">
+      ${d.running ? "Testing…" : "Test uplink (iperf)"}</button>
+    <span class="muted" title="This runs a real saturating upload over the path to measure it against the passive estimate. It spends uplink data - a diagnostic, not something to leave running on a metered link.">saturates this link for ~10 s and spends uplink data</span>
+    <div class="diag-result">${result}</div>
+  </div>`;
+}
+
+// runBandwidthTest triggers the test and records the outcome in diagRuns.
+// The estimate returned alongside is the daemon's opinion at test time, so
+// the two numbers can be read against each other.
+async function runBandwidthTest(id) {
+  diagRuns[id] = { running: true };
+  if (lastState) renderPaths(lastState);
+  try {
+    const r = await fetch("/api/diag/bandwidth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path_id: id, seconds: 10 }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      diagRuns[id] = { error: d.error || ("HTTP " + r.status) };
+    } else if (d.error) {
+      diagRuns[id] = { error: d.error, est: d.estimate };
+    } else {
+      diagRuns[id] = { mbps: d.result.mbps, retransmits: d.result.retransmits, est: d.estimate };
+    }
+  } catch (e) {
+    diagRuns[id] = { error: String(e) };
+  }
+  if (lastState) renderPaths(lastState);
 }
 
 async function refreshState() {
@@ -471,6 +542,7 @@ async function refreshState() {
   }
 
   const s = r.state, age = r.age_seconds;
+  lastState = s;
   // Two report intervals of slack before calling it stale, so a single
   // missed write does not raise an alarm.
   const limit = Math.max(5, (s.config.state_interval_ms / 1000) * 3);

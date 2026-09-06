@@ -1,0 +1,30 @@
+# iperf3 server for the UI's per-path uplink diagnostic (D-040).
+#
+# This is the home end of the on-demand bandwidth test the web interface
+# triggers on the vehicle. It is not part of the tunnel or the scheduler:
+# it exists only so an operator can check the passive capacity estimate
+# (D-023) against a real saturating transfer.
+#
+# Bound to the transport hub address 10.20.1.1, which is reachable only
+# through the WireGuard tunnels - never the public interface - so the test
+# target is not exposed to the internet. If wgm is not up yet at boot the
+# bind fails and systemd retries until it is; that is the whole reason for
+# Restart=always here rather than a hard ordering dependency on an
+# interface systemd does not manage.
+[Unit]
+Description=OpenMultiPath uplink diagnostic server (iperf3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/iperf3 --server --bind 10.20.1.1 --port 5201
+Restart=always
+RestartSec=2
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

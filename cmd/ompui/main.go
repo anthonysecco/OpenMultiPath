@@ -12,18 +12,23 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
+	"github.com/anthonysecco/OpenMultiPath/internal/diag"
 	"github.com/anthonysecco/OpenMultiPath/internal/state"
 )
 
@@ -34,6 +39,13 @@ type server struct {
 	statePath  string
 	configPath string
 	unit       string
+
+	// iperfServer is the home end's iperf3 address (host:port) for the
+	// on-demand uplink diagnostic. diagMu makes the test single-flight: the
+	// iperf server serves one client at a time, and two saturating uploads
+	// at once would measure neither path honestly.
+	iperfServer string
+	diagMu      sync.Mutex
 }
 
 func main() {
@@ -42,9 +54,10 @@ func main() {
 	statePath := flag.String("state", "/var/lib/openmultipath/state.json", "state file written by the daemon")
 	configPath := flag.String("config", "/etc/openmultipath/config.json", "settings file shared with the daemon")
 	unit := flag.String("unit", "ompd", "systemd unit for the daemon, for log access and restarts")
+	iperfServer := flag.String("iperf-server", "10.20.1.1:5201", "initiator only: home's iperf3 address for the on-demand per-path uplink test")
 	flag.Parse()
 
-	s := &server{statePath: *statePath, configPath: *configPath, unit: *unit}
+	s := &server{statePath: *statePath, configPath: *configPath, unit: *unit, iperfServer: *iperfServer}
 
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(mustSubFS())))
@@ -52,6 +65,7 @@ func main() {
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/logs", s.handleLogs)
 	mux.HandleFunc("/api/restart", s.handleRestart)
+	mux.HandleFunc("/api/diag/bandwidth", s.handleDiagBandwidth)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	log.Printf("ompui: serving on http://%s (state %s)", *listen, *statePath)
@@ -154,6 +168,107 @@ func (s *server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"restarted": s.unit})
+}
+
+// handleDiagBandwidth runs an on-demand iperf3 uplink test pinned to one
+// path, for checking the passive estimate against a real saturating
+// transfer. It is deliberately not part of scheduling: it costs uplink data,
+// which on a metered link is the whole reason the estimator avoids active
+// probing, so it happens only when a person asks for it.
+func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		PathID  *uint8 `json:"path_id"`
+		Seconds int    `json:"seconds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PathID == nil {
+		http.Error(w, "expected a JSON body with a path_id", http.StatusBadRequest)
+		return
+	}
+	// A short test is enough to load the link; a long one just spends more
+	// data. Clamp both ends so a bad value cannot flood the uplink for
+	// minutes.
+	if req.Seconds < 1 || req.Seconds > 30 {
+		req.Seconds = 10
+	}
+
+	snap, err := state.Read(s.statePath)
+	if err != nil {
+		http.Error(w, "cannot read state to resolve the path: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if !snap.ManagesPaths {
+		http.Error(w, "this end does not own its paths; run the test from the vehicle", http.StatusBadRequest)
+		return
+	}
+	var path *state.Path
+	for i := range snap.Paths {
+		if snap.Paths[i].ID == *req.PathID {
+			path = &snap.Paths[i]
+			break
+		}
+	}
+	if path == nil {
+		http.Error(w, "no such path", http.StatusNotFound)
+		return
+	}
+	if path.Name == "" {
+		http.Error(w, "that path has no interface to bind to", http.StatusBadRequest)
+		return
+	}
+	if !path.Bound {
+		http.Error(w, "that link is down; nothing to test over", http.StatusConflict)
+		return
+	}
+
+	host, portStr, err := net.SplitHostPort(s.iperfServer)
+	if err != nil {
+		http.Error(w, "iperf server address is misconfigured: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	port, _ := strconv.Atoi(portStr)
+
+	// Single-flight: the server takes one client at a time, and two uploads
+	// at once would measure neither honestly.
+	if !s.diagMu.TryLock() {
+		http.Error(w, "a bandwidth test is already running", http.StatusConflict)
+		return
+	}
+	defer s.diagMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(req.Seconds+15)*time.Second)
+	defer cancel()
+
+	res, runErr := diag.Run(ctx, diag.Options{
+		Iface:   path.Name,
+		Server:  host,
+		Port:    port,
+		Seconds: req.Seconds,
+	})
+
+	out := map[string]any{
+		"path_id": *req.PathID,
+		"iface":   path.Name,
+		// The estimator's current opinion, so the two sit side by side.
+		"estimate": map[string]any{
+			"ceiling_kbps":        path.CeilingKbps,
+			"ceiling_known":       path.CeilingKnown,
+			"proven_kbps":         path.ProvenKbps,
+			"limit_kbps":          path.LimitKbps,
+			"ceiling_age_seconds": path.CeilingAgeSeconds,
+		},
+	}
+	if runErr != nil {
+		out["error"] = runErr.Error()
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	out["result"] = res
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleMetrics exposes the same figures for Prometheus, which is nearly
