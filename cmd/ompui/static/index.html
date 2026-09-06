@@ -534,11 +534,14 @@ function udpResultHTML(d) {
   if (d.error) return `<span style="color:var(--bad)">flood: ${d.error}</span>`;
   if (d.delivered == null) return "";
   const lossColor = d.loss >= 5 ? "var(--bad)" : d.loss >= 1 ? "var(--warn)" : "var(--good)";
-  const mb = d.bytes ? ` · spent ${(d.bytes / 1e6).toFixed(0)} MB` : "";
+  // No byte figure: iperf's "offered" bytes count everything written to the
+  // socket, most of which a -b 0 flood drops at the local send queue before
+  // it ever reaches the carrier, so reporting it as data spent overstates the
+  // real cost many times over. The rates and loss are the honest result.
   return `<strong>${d.delivered.toFixed(1)} Mbps</strong> delivered`
     + ` of ${d.offered.toFixed(0)} offered`
     + ` · <span style="color:${lossColor}">${d.loss.toFixed(1)}% loss</span>`
-    + ` · ${d.jitter.toFixed(1)} ms jitter` + mb;
+    + ` · ${d.jitter.toFixed(1)} ms jitter`;
 }
 
 // runBandwidthTest and runSpeedtest each trigger their test and record the
