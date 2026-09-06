@@ -66,6 +66,7 @@ func main() {
 	mux.HandleFunc("/api/logs", s.handleLogs)
 	mux.HandleFunc("/api/restart", s.handleRestart)
 	mux.HandleFunc("/api/diag/bandwidth", s.handleDiagBandwidth)
+	mux.HandleFunc("/api/diag/speedtest", s.handleDiagSpeedtest)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	log.Printf("ompui: serving on http://%s (state %s)", *listen, *statePath)
@@ -262,6 +263,84 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 			"ceiling_age_seconds": path.CeilingAgeSeconds,
 		},
 	}
+	if runErr != nil {
+		out["error"] = runErr.Error()
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	out["result"] = res
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleDiagSpeedtest runs a public-internet speed test pinned to one path's
+// physical WAN link, via the omp-speedtest helper. Unlike the iperf test,
+// which measures the tunnel to home, this measures the carrier's own
+// capacity - a different and heavier thing: a full run spends tens of
+// megabytes of real, possibly metered, data in each direction, which is why
+// it is a button a person presses and the bytes it moved are reported back.
+func (s *server) handleDiagSpeedtest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		PathID  *uint8 `json:"path_id"`
+		Seconds int    `json:"seconds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PathID == nil {
+		http.Error(w, "expected a JSON body with a path_id", http.StatusBadRequest)
+		return
+	}
+	if req.Seconds < 3 || req.Seconds > 20 {
+		req.Seconds = 5
+	}
+
+	snap, err := state.Read(s.statePath)
+	if err != nil {
+		http.Error(w, "cannot read state to resolve the path: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if !snap.ManagesPaths {
+		http.Error(w, "this end does not own its paths; run the test from the vehicle", http.StatusBadRequest)
+		return
+	}
+	var path *state.Path
+	for i := range snap.Paths {
+		if snap.Paths[i].ID == *req.PathID {
+			path = &snap.Paths[i]
+			break
+		}
+	}
+	if path == nil {
+		http.Error(w, "no such path", http.StatusNotFound)
+		return
+	}
+	if path.Name == "" {
+		http.Error(w, "that path has no interface to resolve", http.StatusBadRequest)
+		return
+	}
+	if !path.Bound {
+		http.Error(w, "that link is down; nothing to test over", http.StatusConflict)
+		return
+	}
+
+	// One link test at a time, shared with the iperf test: both saturate a
+	// physical link, and two at once would measure neither.
+	if !s.diagMu.TryLock() {
+		http.Error(w, "a link test is already running", http.StatusConflict)
+		return
+	}
+	defer s.diagMu.Unlock()
+
+	// Generous margin over the duration: a speed test also spends time
+	// selecting a server and running both directions.
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(req.Seconds*2+45)*time.Second)
+	defer cancel()
+
+	res, runErr := diag.RunSpeedtest(ctx, "", path.Name, req.Seconds)
+
+	out := map[string]any{"path_id": *req.PathID, "iface": path.Name}
 	if runErr != nil {
 		out["error"] = runErr.Error()
 		writeJSON(w, http.StatusOK, out)

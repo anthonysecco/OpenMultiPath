@@ -55,7 +55,8 @@
   .path-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
   .path-name { font-weight: 650; font-size: 16px; }
   .diag { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line);
-          display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+          display: flex; flex-direction: column; gap: 10px; }
+  .diag-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .diag-btn { font: inherit; padding: 5px 12px; border-radius: 6px; cursor: pointer;
               border: 1px solid var(--line); background: var(--panel); color: inherit; }
   .diag-btn:hover:not(:disabled) { border-color: var(--accent); }
@@ -469,41 +470,63 @@ function renderPaths(s) {
   }).join("");
 }
 
-// diagBlock is the on-demand uplink test for one path. It is shown only on
-// the end that owns the path and only while the link is up, because the test
-// pins itself to the interface with the same SO_BINDTODEVICE the daemon uses
-// and there is nothing to bind to on a link that is down. Its state lives in
-// diagRuns rather than the DOM, so the once-a-second state refresh - which
-// rebuilds every card - does not wipe a test in progress or its result.
+// diagBlock is the on-demand link tests for one path: the iperf test of the
+// tunnel uplink to home, and the speedtest of the carrier's own internet
+// capacity. Both are shown only on the end that owns the path and only while
+// the link is up, since both pin to the interface with the same
+// SO_BINDTODEVICE the daemon uses and there is nothing to bind to on a link
+// that is down. Each test's state lives in diagRuns[id] - .iperf and .speed -
+// rather than in the DOM, so the once-a-second refresh that rebuilds every
+// card does not wipe a test in progress or its result, and running one test
+// does not clear the other's result.
 function diagBlock(owns, p) {
   if (!owns || !p.bound) return "";
   const d = diagRuns[p.id] || {};
-  let result = "";
-  if (d.running) {
-    result = `<span class="muted">saturating ${p.name}…</span>`;
-  } else if (d.error) {
-    result = `<span style="color:var(--bad)">iperf: ${d.error}</span>`;
-  } else if (d.mbps != null) {
-    const est = d.est || {};
-    const estStr = est.ceiling_known ? rate(est.ceiling_kbps)
-      : (est.ceiling_age_seconds >= 0 ? "≥ " + rate(est.proven_kbps) : "unmeasured");
-    result = `<strong>${d.mbps.toFixed(1)} Mbps</strong> measured`
-      + (d.retransmits ? ` · ${d.retransmits} retransmits` : "")
-      + ` · estimator says ${estStr}`;
-  }
   return `<div class="diag">
-    <button class="diag-btn" ${d.running ? "disabled" : ""} onclick="runBandwidthTest(${p.id})">
-      ${d.running ? "Testing…" : "Test uplink (iperf)"}</button>
-    <span class="muted" title="This runs a real saturating upload over the path to measure it against the passive estimate. It spends uplink data - a diagnostic, not something to leave running on a metered link.">saturates this link for ~10 s and spends uplink data</span>
-    <div class="diag-result">${result}</div>
+    <div class="diag-row">
+      <button class="diag-btn" ${d.iperf && d.iperf.running ? "disabled" : ""} onclick="runBandwidthTest(${p.id})">
+        ${d.iperf && d.iperf.running ? "Testing…" : "Test uplink (iperf)"}</button>
+      <span class="muted" title="A real saturating upload over the tunnel to home, to check the passive estimate. Spends uplink data - a diagnostic, not something to leave running on a metered link.">tunnel uplink to home · spends uplink data</span>
+      <div class="diag-result">${iperfResultHTML(d.iperf)}</div>
+    </div>
+    <div class="diag-row">
+      <button class="diag-btn" ${d.speed && d.speed.running ? "disabled" : ""} onclick="runSpeedtest(${p.id})">
+        ${d.speed && d.speed.running ? "Testing…" : "Speedtest (internet)"}</button>
+      <span class="muted" title="A public-internet speed test over this link's own carrier, bypassing the tunnel - a different measurement from the iperf test. It runs download AND upload and spends tens of MB of real, possibly metered, data each run.">carrier internet, down + up · spends tens of MB</span>
+      <div class="diag-result">${speedResultHTML(d.speed)}</div>
+    </div>
   </div>`;
 }
 
-// runBandwidthTest triggers the test and records the outcome in diagRuns.
-// The estimate returned alongside is the daemon's opinion at test time, so
-// the two numbers can be read against each other.
+function iperfResultHTML(d) {
+  if (!d) return "";
+  if (d.running) return `<span class="muted">saturating the tunnel…</span>`;
+  if (d.error) return `<span style="color:var(--bad)">iperf: ${d.error}</span>`;
+  if (d.mbps == null) return "";
+  const est = d.est || {};
+  const estStr = est.ceiling_known ? rate(est.ceiling_kbps)
+    : (est.ceiling_age_seconds >= 0 ? "≥ " + rate(est.proven_kbps) : "unmeasured");
+  return `<strong>${d.mbps.toFixed(1)} Mbps</strong> up to home`
+    + (d.retransmits ? ` · ${d.retransmits} retransmits` : "")
+    + ` · estimator says ${estStr}`;
+}
+
+function speedResultHTML(d) {
+  if (!d) return "";
+  if (d.running) return `<span class="muted">running internet speed test…</span>`;
+  if (d.error) return `<span style="color:var(--bad)">speedtest: ${d.error}</span>`;
+  if (d.down == null) return "";
+  const mb = d.bytes ? ` · spent ${(d.bytes / 1e6).toFixed(0)} MB` : "";
+  return `<strong>↓ ${d.down.toFixed(1)}</strong> / <strong>↑ ${d.up.toFixed(1)} Mbps</strong>`
+    + ` · ${d.ping.toFixed(0)} ms`
+    + (d.server ? ` · ${d.server}` : "") + mb;
+}
+
+// runBandwidthTest and runSpeedtest each trigger their test and record the
+// outcome under diagRuns[id], leaving the other test's result untouched.
 async function runBandwidthTest(id) {
-  diagRuns[id] = { running: true };
+  const d = diagRuns[id] || (diagRuns[id] = {});
+  d.iperf = { running: true };
   if (lastState) renderPaths(lastState);
   try {
     const r = await fetch("/api/diag/bandwidth", {
@@ -511,16 +534,36 @@ async function runBandwidthTest(id) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path_id: id, seconds: 10 }),
     });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      diagRuns[id] = { error: d.error || ("HTTP " + r.status) };
-    } else if (d.error) {
-      diagRuns[id] = { error: d.error, est: d.estimate };
-    } else {
-      diagRuns[id] = { mbps: d.result.mbps, retransmits: d.result.retransmits, est: d.estimate };
-    }
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok) d.iperf = { error: b.error || ("HTTP " + r.status) };
+    else if (b.error) d.iperf = { error: b.error, est: b.estimate };
+    else d.iperf = { mbps: b.result.mbps, retransmits: b.result.retransmits, est: b.estimate };
   } catch (e) {
-    diagRuns[id] = { error: String(e) };
+    d.iperf = { error: String(e) };
+  }
+  if (lastState) renderPaths(lastState);
+}
+
+async function runSpeedtest(id) {
+  const d = diagRuns[id] || (diagRuns[id] = {});
+  d.speed = { running: true };
+  if (lastState) renderPaths(lastState);
+  try {
+    const r = await fetch("/api/diag/speedtest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path_id: id, seconds: 5 }),
+    });
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok) d.speed = { error: b.error || ("HTTP " + r.status) };
+    else if (b.error) d.speed = { error: b.error };
+    else d.speed = {
+      down: b.result.download_mbps, up: b.result.upload_mbps,
+      ping: b.result.ping_ms, server: b.result.server,
+      bytes: (b.result.bytes_sent || 0) + (b.result.bytes_received || 0),
+    };
+  } catch (e) {
+    d.speed = { error: String(e) };
   }
   if (lastState) renderPaths(lastState);
 }

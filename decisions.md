@@ -1809,3 +1809,16 @@ transport hub `10.20.1.1`, reachable only through the tunnels, one client at a
 time. The interface makes the test single-flight for the same reason. The
 result is shown next to the estimator's ceiling/floor so the two can be read
 against each other, and the UI says plainly that the test spends uplink data.
+
+**Companion: a per-path internet speedtest** (D-040, 2026-09-06). Alongside the
+iperf test of the tunnel uplink to home sits a second per-path button that runs
+a public-internet speed test over the link's own carrier - a different and
+heavier measurement. It uses `librespeed-cli` (open source, so principle 1
+holds where the Ookla CLI would not) bound to the physical NIC with
+`--interface`, the same SO_BINDTODEVICE the daemon and the iperf test use;
+source-address binding would not do, since every transport address routes out
+the tunnel. `deploy/omp-speedtest` resolves the wg transport to the NIC beneath
+it through the existing fwmark -> table -> device chain. It is bounded by
+duration and reports the bytes it moved, because a full run spends tens of
+megabytes of real, possibly metered, data in each direction - which is the
+whole reason it is a button a person presses, never a poll.

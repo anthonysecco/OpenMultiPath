@@ -52,3 +52,39 @@ func TestParseNonJSON(t *testing.T) {
 		t.Fatal("expected an error from non-JSON output")
 	}
 }
+
+// librespeed-cli prints a one-element array; the parser reads the first entry
+// and carries the bytes moved, which are the cost of the test.
+func TestParseSpeedtest(t *testing.T) {
+	out := []byte(`[{"server":{"name":"Los Angeles, USA (Sharktech)"},"ping":41.18,"jitter":3.61,"upload":12.5,"download":118.62,"bytes_sent":8000000,"bytes_received":53397760}]`)
+	r, err := ParseSpeedtest(out)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if r.DownloadMbps != 118.62 || r.UploadMbps != 12.5 {
+		t.Errorf("rates = %v/%v, want 118.62/12.5", r.DownloadMbps, r.UploadMbps)
+	}
+	if r.PingMs != 41.18 {
+		t.Errorf("ping = %v, want 41.18", r.PingMs)
+	}
+	if r.Server != "Los Angeles, USA (Sharktech)" {
+		t.Errorf("server = %q", r.Server)
+	}
+	if r.BytesReceived != 53397760 {
+		t.Errorf("bytes_received = %d", r.BytesReceived)
+	}
+}
+
+// An empty array - no server was reachable over the pinned link - is an
+// error, not a zero-valued success that would read as "0 Mbps".
+func TestParseSpeedtestEmpty(t *testing.T) {
+	if _, err := ParseSpeedtest([]byte(`[]`)); err == nil {
+		t.Fatal("expected an error from an empty result")
+	}
+}
+
+func TestParseSpeedtestNonJSON(t *testing.T) {
+	if _, err := ParseSpeedtest([]byte("librespeed-cli: not found")); err == nil {
+		t.Fatal("expected an error from non-JSON output")
+	}
+}

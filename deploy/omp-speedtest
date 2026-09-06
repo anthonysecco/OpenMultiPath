@@ -1,0 +1,58 @@
+#!/bin/bash
+# Run a public-internet speed test pinned to the physical WAN link under one
+# path, and print librespeed-cli's --json (D-040 companion, the internet-side
+# counterpart to the tunnel-side iperf test).
+#
+#     omp-speedtest <wg-transport-iface|physical-iface> [duration-seconds]
+#
+# The point is to measure the carrier's own capacity, so the test has to
+# egress the physical NIC directly rather than the tunnel. Binding to a source
+# address does not achieve that here - every transport address routes out the
+# tunnel - so the test binds to the interface (SO_BINDTODEVICE, librespeed's
+# --interface), the same primitive the daemon uses to pin its own sockets.
+#
+# Given a wg transport (wg1, wg2) it first resolves the NIC underneath it,
+# through the fwmark -> table -> device chain the daemon set up. Given a
+# physical interface it uses it directly.
+#
+# This is a deliberate, operator-run diagnostic and it is NOT cheap: a full
+# run spends tens of megabytes of real, possibly metered, data in each
+# direction. Nothing calls it on its own.
+set -e
+
+IFACE="${1:?usage: omp-speedtest <interface> [duration-seconds]}"
+DUR="${2:-5}"
+
+# resolve_nic turns a wg transport into the physical NIC beneath it. A device
+# that is not a wg transport - i.e. has no fwmark pinning it to a table - is
+# assumed to be a physical NIC already and used as given.
+resolve_nic() {
+	local iface="$1" mark table nic
+	mark=$(wg show "$iface" fwmark 2>/dev/null || true)
+	if [ -z "$mark" ] || [ "$mark" = "off" ]; then
+		echo "$iface"
+		return 0
+	fi
+	table=$(ip rule show 2>/dev/null | sed -n "s/.*fwmark $mark lookup \([0-9]*\).*/\1/p" | head -1)
+	if [ -z "$table" ]; then
+		echo "omp-speedtest: no ip rule for $iface's fwmark $mark" >&2
+		return 1
+	fi
+	nic=$(ip route show table "$table" 2>/dev/null | sed -n "s/.*dev \([^ ]*\).*/\1/p" | head -1)
+	if [ -z "$nic" ]; then
+		echo "omp-speedtest: table $table for $iface has no device" >&2
+		return 1
+	fi
+	echo "$nic"
+}
+
+NIC=$(resolve_nic "$IFACE") || exit 1
+if ! ip link show "$NIC" >/dev/null 2>&1; then
+	echo "omp-speedtest: resolved device $NIC does not exist" >&2
+	exit 1
+fi
+
+# --json prints a one-element array with download/upload in Mbit/s, ping and
+# jitter in ms, and the bytes moved - which is the cost of the test, worth
+# surfacing so a metered link's budget is not spent blind.
+exec librespeed-cli --interface "$NIC" --duration "$DUR" --json
