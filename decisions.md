@@ -1432,3 +1432,74 @@ Verified by a fake vehicle for the decisions - every external command replaced w
 a recording fake, so a canyon, a wedged daemon and a bad upgrade can be produced on
 demand, and each behaviour named above confirmed to fail when it is removed - and
 then on the real RV for the parts only hardware can answer.
+
+## D-036 · D-020 is the deployed shape, and what the cutover cost
+
+Steps 7, 8 and 9 were built, tested and completely inert: production ran below
+WireGuard, where every payload is ciphertext, so the daemon logged
+`0 real-time, 0 bulk, N unclassified` for four days. The cutover moves both ends
+above WireGuard and makes classification real.
+
+**The shape.** Home runs `-tun omp0 -tun-addr 10.30.0.1/24 -public 10.20.1.1:51830`
+on the transport tunnel `wgm`; the vehicle runs the same with `.2`, `-remote
+10.20.1.1:51830` and `-paths wg1,wg2`. Two subnets, as D-020 always said: transport
+`10.20.1.0/24` carrying omp-protocol packets between the daemons, inner
+`10.30.0.0/24` carrying the plaintext the classifier reads.
+
+**Routing is the half that was never done before.** Proving the daemons talk above
+WireGuard is not the same as making it the path user traffic takes.
+`deploy/omp-tun-up` runs as `ExecStartPost` and moves the vehicle's default route
+onto the TUN, tells home where the LAN now lives, and clamps TCP to the smaller
+inner MTU. Running it from the unit rather than by hand is what makes a daemon
+restart survivable: the device belongs to the daemon and every route through it
+dies with the process.
+
+**The DNS leak.** Carriers hand out /32 host routes for their resolvers so those
+queries stay on-link, and a /32 beats any default however low its metric. Left
+alone that is a split tunnel by accident, which D-004 rules out - and DNS is the
+one leak that also tells the carrier every name the vehicle looks up. `wg0.conf`
+had a PostUp overriding exactly two of these; `omp-tun-up` mirrors it rather than
+generalising to "every DHCP host route", because some of those are carrier
+infrastructure reachable only on-link.
+
+**MTU.** The daemon's own recommendation (1292) is taken rather than the 1300 that
+happens to work today. The difference is the worst-case header, which is what a
+packet gets once D-025's authentication is on - and a PMTU black hole that only
+appears when a security feature is enabled is a miserable thing to find later.
+
+### Two bugs in step 11's fallback, found by being stranded by them
+
+**The catch-all needs its own suppress rule.** `omp-fallback` installed a rule at
+priority 2000 pointing at a table holding one default route, and relied on
+wg-quick's rule at 1999 - `lookup main suppress_prefixlength 0` - to honour
+specific routes first. In the D-020 shape `wg0` is down and that rule does not
+exist, so the catch-all swallowed everything: the LAN, and the path sockets'
+packets to home's tunnel address.
+
+Losing the LAN cost the out-of-band way in. Losing the path sockets cost the
+recovery itself, and that is the part that matters: the watchdog leaves fallback
+only when the tunnel answers, and the tunnel cannot answer while its own transport
+is routed into the clear. A deadlock, cleared only from the hypervisor's serial
+console. `omp-fallback` now installs its own suppress rule at 1998.
+
+**Leaving must not cycle a tunnel wg-quick does not own.** Above WireGuard the
+tunnel is a TUN the daemon created; there is no config to bring back up and the
+displaced rules were entirely ours, so removing them is the whole job.
+
+Both were invisible to the fake vehicle for the same reason the start-limit bug
+was: a recording fake has no rule table, so it cannot show what the kernel would
+have done with the rules in the order they were installed.
+
+### What the diagnosis turned on
+
+ARP resolved while ICMP and TCP timed out. ARP is answered by the kernel at layer
+two with no route lookup; a reply needs one. That single asymmetry says "the box is
+alive and receiving, and cannot route an answer back" and rules out every
+hypothesis about a dead interface or a dead box. Worth remembering, because the
+first reading of the same evidence - taken from a neighbour table flushed a moment
+earlier and read before the probe completed - said the opposite.
+
+**Verified in the deployed shape:** 1240 STUN binding requests produced a tx delta
+on the real-time path of exactly 1240 while a bulk flood rode the other physical
+link; LAN egress, DNS and both web interfaces healthy; routes reinstall themselves
+on daemon restart; `wg1`/`wg2`/`wgm` enabled at boot and `wg0` disabled.

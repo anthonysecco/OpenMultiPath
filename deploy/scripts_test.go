@@ -33,6 +33,11 @@ type box struct {
 	// noFallback models the responder, which has nowhere to route around
 	// to and must never touch the routing.
 	noFallback bool
+
+	// wgConfDir stands in for /etc/wireguard. Pointing it at an empty
+	// directory models the D-020 shape, where the tunnel is a TUN the
+	// daemon owns and wg-quick has no config for.
+	wgConfDir string
 }
 
 func newBox(t *testing.T) *box {
@@ -61,6 +66,16 @@ func newBox(t *testing.T) *box {
 		if err := os.WriteFile(filepath.Join(b.sbin, s), src, 0o755); err != nil {
 			t.Fatal(err)
 		}
+	}
+
+	// By default wg-quick owns the tunnel, which is the production shape.
+	// Tests modelling D-020 point wgConfDir at an empty directory instead.
+	b.wgConfDir = filepath.Join(root, "wireguard")
+	if err := os.MkdirAll(b.wgConfDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(b.wgConfDir, "wg0.conf"), []byte("[Interface]\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
 	b.fake("ping", `[ -e "$FAKE/ping_ok" ] && exit 0 || exit 1`)
@@ -173,6 +188,7 @@ func (b *box) env() []string {
 		"OMP_FAIL_CHECKS=4",
 		"OMP_OK_CHECKS=12",
 		"OMP_FALLBACK_ENABLED="+map[bool]string{true: "0", false: "1"}[b.noFallback],
+		"OMP_WG_CONF_DIR="+b.wgConfDir,
 	)
 }
 
@@ -564,5 +580,79 @@ func TestResponderRollsBackButNeverFallsBack(t *testing.T) {
 	b.tick(4)
 	if got, _ := os.ReadFile(filepath.Join(usr, "ompd")); string(got) != "GOOD" {
 		t.Errorf("responder did not roll back a failed upgrade; binary is %q", got)
+	}
+}
+
+// The catch-all cannot be the only rule fallback installs.
+//
+// wg-quick puts a `lookup main suppress_prefixlength 0` rule at 1999 when
+// the tunnel owns the default route, and that is what keeps the LAN, the
+// connected subnets and the transport tunnels' own endpoints reachable.
+// In the D-020 shape wg0 is down and that rule does not exist, so a bare
+// catch-all swallows everything: the vehicle's LAN replies, and the path
+// sockets' packets to home's tunnel address.
+//
+// The second of those is a deadlock, not an inconvenience. The watchdog
+// leaves fallback only when the tunnel answers, and the tunnel cannot
+// answer while its own transport is being routed into the clear.
+func TestFallbackHonoursSpecificRoutesBeforeItsCatchAll(t *testing.T) {
+	b := newBox(t)
+	b.link("enp2s0", "192.168.225.1")
+	b.healthy(false)
+	b.tick(4)
+
+	calls := b.calls()
+	suppress := strings.Index(calls, "suppress_prefixlength 0 priority 1998")
+	catchAll := strings.Index(calls, "lookup 2500 priority 2000")
+
+	if suppress < 0 {
+		t.Fatalf("fallback installed no suppress_prefixlength rule; a bare catch-all "+
+			"strands the box when wg-quick's own rule is absent. calls:\n%s", calls)
+	}
+	if catchAll < 0 {
+		t.Fatalf("fallback installed no catch-all; calls:\n%s", calls)
+	}
+	if suppress > catchAll {
+		t.Error("installed the catch-all before the suppress rule")
+	}
+
+	// And both come back out on the way home, or the next shape inherits
+	// a rule nobody put there.
+	b.healthy(true)
+	b.tick(12)
+	after := b.calls()[len(calls):]
+	if !strings.Contains(after, "rule del priority 1998") {
+		t.Error("leaving fallback left the suppress rule behind")
+	}
+	if !strings.Contains(after, "rule del priority 2000") {
+		t.Error("leaving fallback left the catch-all behind")
+	}
+}
+
+// Above WireGuard the tunnel is a TUN the daemon created, and wg-quick
+// has never heard of it: there is no config to bring back up, and the
+// rules fallback displaced were entirely its own. Cycling an interface
+// wg-quick does not own is at best a no-op and at worst deletes the
+// daemon's device out from under it.
+func TestLeavingFallbackDoesNotCycleATunnelWgQuickDoesNotOwn(t *testing.T) {
+	b := newBox(t)
+	b.link("enp2s0", "192.168.225.1")
+	// No wg0.conf here: the tunnel is a TUN the daemon owns.
+	b.wgConfDir = filepath.Join(b.root, "wireguard-empty")
+	os.MkdirAll(b.wgConfDir, 0o755)
+
+	b.healthy(false)
+	b.tick(4)
+	mark := len(b.calls())
+
+	b.healthy(true)
+	b.tick(12)
+
+	after := b.calls()[mark:]
+	if strings.Contains(after, "wg-quick") {
+		t.Errorf("cycled a tunnel wg-quick does not own; calls:\n%s", after)
+	}
+	if !strings.Contains(after, "rule del priority 2000") {
+		t.Error("did not remove its own catch-all rule")
 	}
 }

@@ -1,0 +1,93 @@
+#!/bin/bash
+# Put the routing around D-020's TUN in place, once the daemon has
+# created it.
+#
+#     omp-tun-up initiator|responder
+#
+# Run as ExecStartPost on ompd.service, so the routes come back with the
+# daemon rather than needing a human after every restart.
+#
+# The device belongs to the daemon: it is created by `-tun`, addressed by
+# `-tun-addr`, and it disappears when the process exits, taking every
+# route through it with it. That is why this waits for the device rather
+# than assuming it, and why nothing here has to be undone on shutdown.
+set +e
+
+ROLE="${1:-}"
+TUN="${OMP_TUN:-omp0}"
+LAN="${OMP_LAN:-10.0.0.0/24}"
+PEER_TUN="${OMP_PEER_TUN:-10.30.0.2}"
+
+# The daemon opens the device early, but "early" is not "before systemd
+# runs the next line". A few seconds of patience here is the difference
+# between a working cutover and one that needs somebody to add a route by
+# hand from 800 miles away.
+for _ in $(seq 1 50); do
+	ip link show "$TUN" >/dev/null 2>&1 && break
+	sleep 0.2
+done
+if ! ip link show "$TUN" >/dev/null 2>&1; then
+	echo "omp-tun-up: $TUN never appeared; leaving routing alone" >&2
+	exit 0
+fi
+
+case "$ROLE" in
+initiator)
+	# The vehicle's default route moves onto the TUN, which is the whole
+	# point of the cutover: until this line runs, the daemon is carrying
+	# its own probes above WireGuard and nothing else.
+	#
+	# The transport tunnels cannot loop through it. wg1 and wg2 carry
+	# fwmarks matched by ip rules at 2001 and 2002, which send their
+	# encrypted packets straight to a per-link table pinned to a physical
+	# NIC - evaluated long before the main table's default is reached.
+	ip route replace default dev "$TUN" metric 40
+
+	# Carriers hand out host routes for their DNS resolvers so those
+	# queries stay on-link, and a /32 beats any default however low its
+	# metric. Left alone they are a split tunnel by accident, which
+	# D-004 rules out - and DNS is the one leak that also tells the
+	# carrier every name the vehicle looks up.
+	#
+	# This mirrors wg0.conf's PostUp exactly rather than generalising to
+	# "every DHCP host route". Some of those are carrier infrastructure
+	# reachable only on-link, and pulling them into the tunnel would be a
+	# policy change dressed up as a cutover.
+	for pin in ${OMP_TUN_PIN:-1.1.1.1 8.8.8.8}; do
+		ip route replace "$pin/32" dev "$TUN" metric 40
+	done
+	;;
+responder)
+	# Home has to know where the vehicle's LAN lives now. Without this
+	# the inner packets arrive, get written into home's stack, and their
+	# replies have nowhere to go.
+	ip route replace "$LAN" dev "$TUN"
+	ip route replace "$PEER_TUN"/32 dev "$TUN"
+	;;
+*)
+	echo "usage: omp-tun-up initiator|responder" >&2
+	exit 2
+	;;
+esac
+
+# Clamp TCP to the path, the same way the production tunnel does. The
+# inner MTU here is smaller than wg0's - the daemon's header rides inside
+# WireGuard rather than outside it - so a connection that worked before
+# the cutover can black-hole after it without this, and PMTU black holes
+# are the single most miserable thing to diagnose from a campground.
+if command -v nft >/dev/null 2>&1; then
+	nft delete table inet omp-tun 2>/dev/null
+	nft add table inet omp-tun 2>/dev/null
+	nft add chain inet omp-tun forward \
+		'{ type filter hook forward priority mangle ; policy accept ; }' 2>/dev/null
+	nft add chain inet omp-tun output \
+		'{ type filter hook output priority mangle ; policy accept ; }' 2>/dev/null
+	for dir in oifname iifname; do
+		nft add rule inet omp-tun forward \
+			$dir "\"$TUN\"" tcp flags syn tcp option maxseg size set rt mtu 2>/dev/null
+	done
+	nft add rule inet omp-tun output \
+		oifname "\"$TUN\"" tcp flags syn tcp option maxseg size set rt mtu 2>/dev/null
+fi
+
+echo "omp-tun-up: $ROLE routing in place on $TUN"

@@ -47,6 +47,11 @@ LAN="${OMP_LAN:-10.0.0.0/24}"
 # borrow while in fallback.
 TABLE="${OMP_FALLBACK_TABLE:-2500}"
 RULE_PRIO="${OMP_FALLBACK_PRIO:-2000}"
+
+# Just ahead of the catch-all, so specific routes always win over it.
+# Deliberately not 1999: that is wg-quick's own, and this has to exist
+# whether or not wg-quick does.
+SUPPRESS_PRIO="${OMP_FALLBACK_SUPPRESS_PRIO:-1998}"
 NFT_TABLE="omp_fallback"
 
 # state_age_seconds is how stale the scheduler's opinion is. A dead
@@ -140,6 +145,25 @@ enter() {
 	# already been matched by wg-quick's rule at 1999.
 	ip route replace default via "$gw" dev "$dev" table "$TABLE" 2>/dev/null
 
+	# Honour every specific route before the catch-all, and this rule is
+	# not optional.
+	#
+	# wg-quick installs one of these at 1999 when the tunnel owns the
+	# default route, and it is what keeps the LAN, the connected subnets
+	# and the transport tunnels' own endpoints reachable while everything
+	# else goes into the tunnel. Relying on it is a bug: in the D-020
+	# shape wg0 is down and that rule does not exist, so a bare catch-all
+	# swallows *everything* - the vehicle's LAN replies, and the path
+	# sockets' packets to home's tunnel address.
+	#
+	# Losing the LAN costs the out-of-band way in. Losing the path
+	# sockets costs the recovery itself: the watchdog leaves fallback only
+	# when the tunnel answers, and the tunnel cannot answer while its own
+	# transport is being routed into the clear. That is a deadlock only a
+	# power cycle clears, and it has happened once.
+	ip rule del priority "$SUPPRESS_PRIO" 2>/dev/null
+	ip rule add from all lookup main suppress_prefixlength 0 priority "$SUPPRESS_PRIO" 2>/dev/null
+
 	# Take over the catch-all priority. The tunnel interface stays up so
 	# the watchdog can keep probing it - see the header.
 	ip rule del priority "$RULE_PRIO" 2>/dev/null
@@ -174,13 +198,23 @@ leave() {
 	fi
 
 	ip rule del priority "$RULE_PRIO" 2>/dev/null
+	ip rule del priority "$SUPPRESS_PRIO" 2>/dev/null
 	ip route flush table "$TABLE" 2>/dev/null
 
 	# Cycle the interface so wg-quick puts its own rules back exactly as
 	# it wrote them. Reconstructing that rule by hand from `ip rule show`
 	# is one wg-quick release away from stranding the vehicle.
-	wg-quick down "$WG" 2>/dev/null
-	wg-quick up "$WG" 2>/dev/null
+	#
+	# Only when wg-quick actually owns the tunnel. Above WireGuard the
+	# tunnel is a TUN the daemon created and wg-quick has never heard of
+	# it - there is no config to bring back up, and the rules that were
+	# displaced were entirely ours, so deleting them above is the whole
+	# job. Cycling something wg-quick does not own is at best a no-op and
+	# at worst deletes the daemon's device out from under it.
+	if [ -f "${OMP_WG_CONF_DIR:-/etc/wireguard}/$WG.conf" ]; then
+		wg-quick down "$WG" 2>/dev/null
+		wg-quick up "$WG" 2>/dev/null
+	fi
 	rm -f "$MARKER"
 	return 0
 }

@@ -10,6 +10,12 @@
 # Every step is written to be a no-op when it was not needed.
 set +e
 
+# Silence the watchdog first. It probes the tunnel every few seconds, and
+# a rollback necessarily takes the tunnel down partway through - without
+# this it would enter fallback in the middle of the repair and leave the
+# box in a shape nobody asked for.
+systemctl stop omp-watchdog.timer 2>/dev/null
+
 # Stop every daemon variant, matched by pattern rather than by a list of
 # names known in advance.
 #
@@ -36,10 +42,25 @@ done
 ip link del omp0 2>/dev/null
 wg-quick up wg0 2>/dev/null
 
-# A cutover edits ExecStart, so restarting the service is not enough on its
-# own: it would bring the D-020 daemon straight back up against interfaces
-# that have just been taken down. The pristine unit is kept beside the
-# settings rather than in /etc/systemd, where a careless edit would find it.
+# Drop-ins first, and this is the part that is easy to get wrong.
+#
+# A cutover done with a drop-in leaves the base unit untouched and correct,
+# so restoring the base unit looks like it worked and changes nothing at
+# all - systemd merges the drop-in back over the top and the D-020 daemon
+# comes straight back up against interfaces that have just been taken
+# down. The rollback then reports success and the vehicle stays broken,
+# which is worse than a rollback that fails loudly.
+#
+# The watchdog's drop-in has to go with it: it points at the TUN's peer
+# address, and left behind it would judge a healthy production tunnel to
+# be an outage and fall out of it within half a minute.
+rm -f /etc/systemd/system/ompd.service.d/d020.conf
+rm -f /etc/systemd/system/omp-watchdog.service.d/d020.conf
+rmdir /etc/systemd/system/ompd.service.d 2>/dev/null
+
+# A cutover may also have edited ExecStart in place, so the pristine unit
+# is restored regardless. It is kept beside the settings rather than in
+# /etc/systemd, where a careless edit would find it.
 if [ -f /etc/openmultipath/ompd.service.production ]; then
 	install -m 0644 /etc/openmultipath/ompd.service.production \
 		/etc/systemd/system/ompd.service
@@ -50,3 +71,8 @@ fi
 # happened once the box is back. Forgetting it is how both ends sat with no
 # web interface for a day after a rollback that otherwise worked.
 systemctl start ompd ompui
+
+# The watchdog is stopped for the duration of a rollback and started again
+# at the end, so it cannot see the half-configured box in between and
+# decide to fall back on top of a recovery that is already under way.
+systemctl restart omp-watchdog.timer 2>/dev/null
