@@ -495,6 +495,12 @@ function diagBlock(owns, p) {
       <span class="muted" title="A public-internet speed test over this link's own carrier, bypassing the tunnel - a different measurement from the iperf test. It runs download AND upload and spends tens of MB of real, possibly metered, data each run.">carrier internet, down + up · spends tens of MB</span>
       <div class="diag-result">${speedResultHTML(d.speed)}</div>
     </div>
+    <div class="diag-row">
+      <button class="diag-btn" ${d.udp && d.udp.running ? "disabled" : ""} onclick="runUdpFlood(${p.id})">
+        ${d.udp && d.udp.running ? "Flooding…" : "Flood uplink (UDP)"}</button>
+      <span class="muted" title="A UDP flood over the tunnel to home: iperf sends as fast as it can and reports what got through plus the loss above that. Unlike TCP it does not back off, so it finds the raw forwarding ceiling - and it saturates the link for the duration, disrupting anything else on it, and spends data at the full offered rate. A deliberate stress test.">tunnel, unlimited UDP · saturates the link · spends data fast</span>
+      <div class="diag-result">${udpResultHTML(d.udp)}</div>
+    </div>
   </div>`;
 }
 
@@ -520,6 +526,19 @@ function speedResultHTML(d) {
   return `<strong>↓ ${d.down.toFixed(1)}</strong> / <strong>↑ ${d.up.toFixed(1)} Mbps</strong>`
     + ` · ${d.ping.toFixed(0)} ms`
     + (d.server ? ` · ${d.server}` : "") + mb;
+}
+
+function udpResultHTML(d) {
+  if (!d) return "";
+  if (d.running) return `<span class="muted">flooding the tunnel…</span>`;
+  if (d.error) return `<span style="color:var(--bad)">flood: ${d.error}</span>`;
+  if (d.delivered == null) return "";
+  const lossColor = d.loss >= 5 ? "var(--bad)" : d.loss >= 1 ? "var(--warn)" : "var(--good)";
+  const mb = d.bytes ? ` · spent ${(d.bytes / 1e6).toFixed(0)} MB` : "";
+  return `<strong>${d.delivered.toFixed(1)} Mbps</strong> delivered`
+    + ` of ${d.offered.toFixed(0)} offered`
+    + ` · <span style="color:${lossColor}">${d.loss.toFixed(1)}% loss</span>`
+    + ` · ${d.jitter.toFixed(1)} ms jitter` + mb;
 }
 
 // runBandwidthTest and runSpeedtest each trigger their test and record the
@@ -564,6 +583,30 @@ async function runSpeedtest(id) {
     };
   } catch (e) {
     d.speed = { error: String(e) };
+  }
+  if (lastState) renderPaths(lastState);
+}
+
+async function runUdpFlood(id) {
+  const d = diagRuns[id] || (diagRuns[id] = {});
+  d.udp = { running: true };
+  if (lastState) renderPaths(lastState);
+  try {
+    const r = await fetch("/api/diag/bandwidth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path_id: id, seconds: 5, udp: true, target_mbps: 0 }),
+    });
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok) d.udp = { error: b.error || ("HTTP " + r.status) };
+    else if (b.error) d.udp = { error: b.error };
+    else d.udp = {
+      delivered: b.result.mbps, offered: b.result.offered_mbps,
+      loss: b.result.loss_percent, jitter: b.result.jitter_ms,
+      bytes: b.result.bytes,
+    };
+  } catch (e) {
+    d.udp = { error: String(e) };
   }
   if (lastState) renderPaths(lastState);
 }

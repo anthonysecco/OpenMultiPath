@@ -32,6 +32,15 @@ type Options struct {
 	Port    int    // iperf3 server port
 	Seconds int    // test duration
 	Streams int    // parallel TCP streams; <=1 runs a single stream
+
+	// UDP runs a UDP flood instead of a TCP transfer. TargetMbps caps the
+	// send rate; 0 means unlimited - a true flood that sends as fast as the
+	// sender can and finds the wall by where loss appears. TCP measures what
+	// gets through after backing off; UDP measures the raw forwarding
+	// ceiling and the loss above it, which TCP can never show because it
+	// never overshoots for long.
+	UDP        bool
+	TargetMbps int
 }
 
 // Args is the iperf3 command line for these options. Split out from the run
@@ -50,31 +59,59 @@ func (o Options) Args() []string {
 		"--bind-dev", o.Iface,
 		"-J",
 	}
+	if o.UDP {
+		// -b 0 is unlimited; iperf3's UDP default is a gentle 1 Mbit/s,
+		// which would not flood anything.
+		rate := "0"
+		if o.TargetMbps > 0 {
+			rate = strconv.Itoa(o.TargetMbps) + "M"
+		}
+		args = append(args, "-u", "-b", rate)
+	}
 	if o.Streams > 1 {
 		args = append(args, "-P", strconv.Itoa(o.Streams))
 	}
 	return args
 }
 
-// Result is the outcome of a run, in the units the interface shows.
+// Result is the outcome of a run, in the units the interface shows. For TCP,
+// Mbps is what was carried and Retransmits the cost of getting it there. For
+// UDP, Mbps is what was delivered, OfferedMbps what was pushed to get it, and
+// LossPercent/JitterMs what the overshoot cost - the numbers a flood exists
+// to produce.
 type Result struct {
+	Protocol    string  `json:"protocol"`
 	Mbps        float64 `json:"mbps"`
-	Retransmits int     `json:"retransmits"`
+	OfferedMbps float64 `json:"offered_mbps,omitempty"`
+	LossPercent float64 `json:"loss_percent,omitempty"`
+	JitterMs    float64 `json:"jitter_ms,omitempty"`
+	Retransmits int     `json:"retransmits,omitempty"`
 	Seconds     float64 `json:"seconds"`
 	Bytes       int64   `json:"bytes"`
 }
 
-// iperfReport is the slice of iperf3's -J output that matters. sum_sent is
-// the client's transmit side, which is the uplink under test.
+// iperfReport is the slice of iperf3's -J output that matters. sum_sent is the
+// client's transmit side; for UDP sum_received carries the delivered rate and
+// the loss and jitter the receiver measured.
 type iperfReport struct {
 	Error string `json:"error"`
-	End   struct {
+	Start struct {
+		TestStart struct {
+			Protocol string `json:"protocol"`
+		} `json:"test_start"`
+	} `json:"start"`
+	End struct {
 		SumSent struct {
 			BitsPerSecond float64 `json:"bits_per_second"`
 			Retransmits   int     `json:"retransmits"`
 			Seconds       float64 `json:"seconds"`
 			Bytes         int64   `json:"bytes"`
 		} `json:"sum_sent"`
+		SumReceived struct {
+			BitsPerSecond float64 `json:"bits_per_second"`
+			JitterMs      float64 `json:"jitter_ms"`
+			LostPercent   float64 `json:"lost_percent"`
+		} `json:"sum_received"`
 	} `json:"end"`
 }
 
@@ -89,12 +126,23 @@ func Parse(out []byte) (Result, error) {
 	if rep.Error != "" {
 		return Result{}, fmt.Errorf("iperf3: %s", rep.Error)
 	}
-	return Result{
-		Mbps:        rep.End.SumSent.BitsPerSecond / 1e6,
-		Retransmits: rep.End.SumSent.Retransmits,
-		Seconds:     rep.End.SumSent.Seconds,
-		Bytes:       rep.End.SumSent.Bytes,
-	}, nil
+	res := Result{
+		Protocol: rep.Start.TestStart.Protocol,
+		Seconds:  rep.End.SumSent.Seconds,
+		Bytes:    rep.End.SumSent.Bytes,
+	}
+	if rep.Start.TestStart.Protocol == "UDP" {
+		// Delivered is what the receiver got; offered is what we pushed to
+		// get it. The gap, and the loss, are the point of a flood.
+		res.Mbps = rep.End.SumReceived.BitsPerSecond / 1e6
+		res.OfferedMbps = rep.End.SumSent.BitsPerSecond / 1e6
+		res.LossPercent = rep.End.SumReceived.LostPercent
+		res.JitterMs = rep.End.SumReceived.JitterMs
+		return res, nil
+	}
+	res.Mbps = rep.End.SumSent.BitsPerSecond / 1e6
+	res.Retransmits = rep.End.SumSent.Retransmits
+	return res, nil
 }
 
 // Run executes iperf3 for one uplink test and parses the result. The output

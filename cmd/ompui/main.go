@@ -183,9 +183,11 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		PathID  *uint8 `json:"path_id"`
-		Seconds int    `json:"seconds"`
-		Streams int    `json:"streams"`
+		PathID     *uint8 `json:"path_id"`
+		Seconds    int    `json:"seconds"`
+		Streams    int    `json:"streams"`
+		UDP        bool   `json:"udp"`
+		TargetMbps int    `json:"target_mbps"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PathID == nil {
 		http.Error(w, "expected a JSON body with a path_id", http.StatusBadRequest)
@@ -197,11 +199,21 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 	if req.Seconds < 1 || req.Seconds > 30 {
 		req.Seconds = 10
 	}
-	// Parallel streams by default: a single stream over the tunnel is
-	// window-limited and reads far below the real capacity. Clamp so a bad
-	// value cannot open hundreds of connections.
+	// Parallel streams by default for TCP: a single stream over the tunnel
+	// is window-limited and reads far below the real capacity. Clamp so a
+	// bad value cannot open hundreds of connections. A UDP flood is a single
+	// stream by default - the -b rate, not stream count, is what floods.
 	if req.Streams < 1 || req.Streams > 32 {
-		req.Streams = 8
+		if req.UDP {
+			req.Streams = 1
+		} else {
+			req.Streams = 8
+		}
+	}
+	// TargetMbps caps a UDP flood; 0 means unlimited. Clamp the ceiling so a
+	// typo cannot ask for an absurd rate.
+	if req.TargetMbps < 0 || req.TargetMbps > 10000 {
+		req.TargetMbps = 0
 	}
 
 	snap, err := state.Read(s.statePath)
@@ -252,11 +264,13 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	res, runErr := diag.Run(ctx, diag.Options{
-		Iface:   path.Name,
-		Server:  host,
-		Port:    port,
-		Seconds: req.Seconds,
-		Streams: req.Streams,
+		Iface:      path.Name,
+		Server:     host,
+		Port:       port,
+		Seconds:    req.Seconds,
+		Streams:    req.Streams,
+		UDP:        req.UDP,
+		TargetMbps: req.TargetMbps,
 	})
 
 	out := map[string]any{
