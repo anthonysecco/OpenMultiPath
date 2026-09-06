@@ -66,15 +66,10 @@ func (o Options) Args() []string {
 		"-J",
 	}
 	if o.Bytes > 0 {
-		// -n is per-stream in iperf3, so divide the target across the
-		// streams to move the intended total. -n and -t are mutually
-		// exclusive; the run stops when the bytes are sent, however long
-		// that takes.
-		per := o.Bytes
-		if o.Streams > 1 {
-			per = o.Bytes / int64(o.Streams)
-		}
-		args = append(args, "-n", strconv.FormatInt(per, 10))
+		// -n is the total to transfer across all streams (verified on
+		// iperf3 3.18), and is mutually exclusive with -t; the run stops
+		// when the bytes are sent, however long that takes.
+		args = append(args, "-n", strconv.FormatInt(o.Bytes, 10))
 	} else {
 		args = append(args, "-t", strconv.Itoa(o.Seconds))
 	}
