@@ -14,10 +14,18 @@ func className(c uint8) string {
 		return "realtime"
 	case protocol.ClassBulk:
 		return "bulk"
+	case protocol.ClassTransactional:
+		return "transactional"
 	default:
 		return "unknown"
 	}
 }
+
+// notRealtime is what most of the profile tests actually mean. Whether a
+// non-call flow is transactional or bulk is a separate axis, decided by
+// volume over time and tested on its own; these care only that a download
+// was not mistaken for a conference.
+func notRealtime(c uint8) bool { return c != protocol.ClassRealtime }
 
 // The claim that makes STUN the primary classifier: it fires on the flow's
 // very first packet, before any media has been sent. Every other signal is
@@ -86,8 +94,8 @@ func TestQUICBulkOnUDP443IsNotRealtime(t *testing.T) {
 		got = c.Classify(udp4("10.20.0.2", 44001, "142.250.1.1", 443, nil, 1350))
 	}
 
-	if got != protocol.ClassBulk {
-		t.Fatalf("MTU-sized bursty UDP/443 classified %s, want bulk;"+
+	if !notRealtime(got) {
+		t.Fatalf("MTU-sized bursty UDP/443 classified %s, want anything but real-time;"+
 			" this is the YouTube-over-QUIC case D-018 exists for", className(got))
 	}
 }
@@ -120,8 +128,9 @@ func TestSmallButRaggedIsNotRealtime(t *testing.T) {
 		got = c.Classify(udp4("10.20.0.2", 5353, "1.1.1.1", 53, nil, 90))
 	}
 
-	if got != protocol.ClassBulk {
-		t.Fatalf("small but ragged UDP classified %s, want bulk; size alone does not make a call", className(got))
+	if !notRealtime(got) {
+		t.Fatalf("small but ragged UDP classified %s, want anything but real-time;"+
+			" size alone does not make a call", className(got))
 	}
 }
 
@@ -136,37 +145,61 @@ func TestMetronomicButFatIsNotRealtime(t *testing.T) {
 		got = c.Classify(udp4("10.20.0.2", 44002, "142.250.1.1", 443, nil, 1350))
 	}
 
-	if got != protocol.ClassBulk {
-		t.Fatalf("metronomic MTU-sized UDP classified %s, want bulk; cadence alone does not make a call", className(got))
+	if !notRealtime(got) {
+		t.Fatalf("metronomic MTU-sized UDP classified %s, want anything but real-time;"+
+			" cadence alone does not make a call", className(got))
 	}
 }
 
 // protocol.md's free first-pass exclusion. Shape must not get a vote:
 // a TCP flow that happens to look metronomic and small is still not a call.
+//
+// A small, slow TCP flow is exactly what transactional is for, so this
+// also pins the new default: never real-time, and transactional until it
+// proves otherwise.
 func TestTCPIsNeverRealtime(t *testing.T) {
 	c, clk := testClassifier(t)
 
 	for i := 0; i < 60; i++ {
 		clk.add(20 * time.Millisecond)
-		if got := c.Classify(tcp4("10.20.0.2", 40001, "142.250.1.1", 443, 120)); got != protocol.ClassBulk {
-			t.Fatalf("TCP packet %d classified %s, want bulk unconditionally", i, className(got))
+		got := c.Classify(tcp4("10.20.0.2", 40001, "142.250.1.1", 443, 120))
+		if got == protocol.ClassRealtime {
+			t.Fatalf("TCP packet %d classified real-time; no TCP flow is a call", i)
+		}
+		if got != protocol.ClassTransactional {
+			t.Fatalf("TCP packet %d classified %s, want transactional at this rate", i, className(got))
 		}
 	}
-	if n := c.Flows(); n != 0 {
-		t.Errorf("TCP occupied %d flow cache entries, want none; it is decided without being remembered", n)
+
+	// TCP now takes a cache entry, which it deliberately did not before.
+	// The volume detector has to remember the flow to run at all, and web
+	// requests - the traffic transactional exists for - are almost all
+	// TCP.
+	if n := c.Flows(); n != 1 {
+		t.Errorf("TCP occupied %d flow cache entries, want 1; the volume detector needs the state", n)
 	}
 }
 
-// The safe default while evidence is still being gathered. Guessing
-// real-time would duplicate an unidentified download over a metered link
-// and reserve admission-control capacity for it.
-func TestUndecidedFlowIsUnknownNotRealtime(t *testing.T) {
+// The safe default while evidence is still being gathered.
+//
+// This reverses D-027 deliberately. With two classes the safe guess was
+// bulk, because guessing real-time duplicates an unidentified download
+// over a metered link. With three, the safe guess is the middle: a flow
+// nobody has placed yet has by definition not moved much data, so
+// treating it as small is both the accurate guess and the cheap one. It
+// is never duplicated, and it leaves the low-latency path within a dwell
+// if it turns out to be a download.
+func TestUndecidedFlowIsTransactionalNotRealtime(t *testing.T) {
 	c, clk := testClassifier(t)
 
 	for i := 0; i < defaults().ClassifySamplePackets-1; i++ {
 		clk.add(20 * time.Millisecond)
-		if got := c.Classify(udp4("10.20.0.2", 5001, "9.9.9.9", 5001, nil, 180)); got != protocol.ClassUnknown {
-			t.Fatalf("packet %d of an unproven flow classified %s, want unknown", i, className(got))
+		got := c.Classify(udp4("10.20.0.2", 5001, "9.9.9.9", 5001, nil, 180))
+		if got == protocol.ClassRealtime {
+			t.Fatalf("packet %d of an unproven flow classified real-time", i)
+		}
+		if got != protocol.ClassTransactional {
+			t.Fatalf("packet %d of an unproven flow classified %s, want transactional", i, className(got))
 		}
 	}
 }

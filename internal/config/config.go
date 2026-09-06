@@ -160,6 +160,31 @@ type Config struct {
 	ClassifyRTPMaxBytes   int `json:"classify_rtp_max_bytes"`
 	ClassifyGapVarianceMs int `json:"classify_gap_variance_ms"`
 
+	// The transactional/bulk split. A flow is transactional until it
+	// proves itself an elephant, and goes back when it stops.
+	//
+	// Rate with a dwell rather than cumulative bytes, because HTTP/2 and
+	// HTTP/3 multiplex a whole page load and a large download onto one
+	// connection - so total volume says almost nothing about whether the
+	// user is waiting on it. What separates them is duration: a page load
+	// is a burst of a second or two and then idle, a download is
+	// sustained. ClassifyBulkDwellMs is therefore the load-bearing knob,
+	// not the rate.
+	//
+	// ClassifyBulkBytes is a backstop for a transfer fast enough to move
+	// serious volume inside the dwell window, and the clear pair is the
+	// hysteresis: reusing one threshold would flap the class of a flow
+	// every time a download paused.
+	//
+	// All of these are guesses. Nothing has been measured, the drive that
+	// step 5 wants has not happened, and the demotions are logged
+	// precisely so the field data can settle them later.
+	ClassifyBulkKbps      int `json:"classify_bulk_kbps"`
+	ClassifyBulkDwellMs   int `json:"classify_bulk_dwell_ms"`
+	ClassifyBulkClearKbps int `json:"classify_bulk_clear_kbps"`
+	ClassifyBulkClearMs   int `json:"classify_bulk_clear_ms"`
+	ClassifyBulkBytes     int `json:"classify_bulk_bytes"`
+
 	// ClassifyMaxFlows bounds the flow cache and ClassifyFlowIdleSeconds
 	// is how long a silent conversation is kept in it. The ceiling is a
 	// memory bound on a box with little of it; the idle timeout is what
@@ -303,8 +328,19 @@ var Bounds = map[string]bound{
 	"budget_yellow_penalty_r": {Min: 0, Max: 100, Default: 15},
 	"budget_red_penalty_r":    {Min: 0, Max: 100, Default: 60},
 
-	"link_cap_mb":    {Min: 0, Max: 100_000_000, Default: 0},
-	"link_cycle_day": {Min: 1, Max: 28, Default: 1},
+	"link_cap_mb": {Min: 0, Max: 100_000_000, Default: 0},
+
+	// The transactional/bulk split. Biased toward calling things
+	// transactional, because the two mistakes are not symmetric: calling
+	// a download transactional costs a few seconds of the shared path,
+	// while calling a page load bulk costs every page load - which is the
+	// thing the class exists to fix.
+	"classify_bulk_kbps":       {Min: 64, Max: 1_000_000, Default: 2_000},
+	"classify_bulk_dwell_ms":   {Min: 200, Max: 60_000, Default: 3_000},
+	"classify_bulk_clear_kbps": {Min: 0, Max: 1_000_000, Default: 1_000},
+	"classify_bulk_clear_ms":   {Min: 200, Max: 300_000, Default: 5_000},
+	"classify_bulk_bytes":      {Min: 64 << 10, Max: 1 << 30, Default: 8 << 20},
+	"link_cycle_day":           {Min: 1, Max: 28, Default: 1},
 
 	"echo_interval_ms":       {Min: 20, Max: 5_000, Default: 100},
 	"probe_interval_seconds": {Min: 5, Max: 3_600, Default: 15},
@@ -462,6 +498,11 @@ func Defaults() Config {
 		ClassifySamplePackets:   Bounds["classify_sample_packets"].Default,
 		ClassifyRTPMaxBytes:     Bounds["classify_rtp_max_bytes"].Default,
 		ClassifyGapVarianceMs:   Bounds["classify_gap_variance_ms"].Default,
+		ClassifyBulkKbps:        Bounds["classify_bulk_kbps"].Default,
+		ClassifyBulkDwellMs:     Bounds["classify_bulk_dwell_ms"].Default,
+		ClassifyBulkClearKbps:   Bounds["classify_bulk_clear_kbps"].Default,
+		ClassifyBulkClearMs:     Bounds["classify_bulk_clear_ms"].Default,
+		ClassifyBulkBytes:       Bounds["classify_bulk_bytes"].Default,
 		ClassifyMaxFlows:        Bounds["classify_max_flows"].Default,
 		ClassifyFlowIdleSeconds: Bounds["classify_flow_idle_seconds"].Default,
 
@@ -549,6 +590,11 @@ func (c Config) Sanitised() Config {
 		ClassifySamplePackets:   clamp(c.ClassifySamplePackets, Bounds["classify_sample_packets"]),
 		ClassifyRTPMaxBytes:     clamp(c.ClassifyRTPMaxBytes, Bounds["classify_rtp_max_bytes"]),
 		ClassifyGapVarianceMs:   clamp(c.ClassifyGapVarianceMs, Bounds["classify_gap_variance_ms"]),
+		ClassifyBulkKbps:        clamp(c.ClassifyBulkKbps, Bounds["classify_bulk_kbps"]),
+		ClassifyBulkDwellMs:     clamp(c.ClassifyBulkDwellMs, Bounds["classify_bulk_dwell_ms"]),
+		ClassifyBulkClearKbps:   clamp(c.ClassifyBulkClearKbps, Bounds["classify_bulk_clear_kbps"]),
+		ClassifyBulkClearMs:     clamp(c.ClassifyBulkClearMs, Bounds["classify_bulk_clear_ms"]),
+		ClassifyBulkBytes:       clamp(c.ClassifyBulkBytes, Bounds["classify_bulk_bytes"]),
 		ClassifyMaxFlows:        clamp(c.ClassifyMaxFlows, Bounds["classify_max_flows"]),
 		ClassifyFlowIdleSeconds: clamp(c.ClassifyFlowIdleSeconds, Bounds["classify_flow_idle_seconds"]),
 

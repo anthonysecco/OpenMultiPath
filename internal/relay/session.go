@@ -262,7 +262,7 @@ func (f *rttFloor) observe(now time.Duration, rtt uint32) {
 type session struct {
 	// classCounts is indexed by protocol class, so a packet's class is
 	// its own counter's index. Sized to the three that exist.
-	classCounts [3]atomic.Uint64
+	classCounts [4]atomic.Uint64
 
 	// withheldBulk counts packets admission control dropped. Without it a
 	// starved link and an idle one read identically from a campground, the
@@ -482,8 +482,9 @@ func (s *session) noteClass(class uint8) {
 }
 
 // classTotals reads the counters back for the log and the interface.
-func (s *session) classTotals() (realtime, bulk, unknown uint64) {
+func (s *session) classTotals() (realtime, transactional, bulk, unknown uint64) {
 	return s.classCounts[protocol.ClassRealtime].Load(),
+		s.classCounts[protocol.ClassTransactional].Load(),
 		s.classCounts[protocol.ClassBulk].Load(),
 		s.classCounts[protocol.ClassUnknown].Load()
 }
@@ -1031,8 +1032,9 @@ func (s *session) logStats() {
 		if d.blind {
 			log.Printf("scheduler: %s", d.reason)
 		}
-		if rt, bulk, unk := s.classTotals(); rt+bulk+unk > 0 {
-			log.Printf("traffic: %d real-time, %d bulk, %d unclassified", rt, bulk, unk)
+		if rt, tx, bulk, unk := s.classTotals(); rt+tx+bulk+unk > 0 {
+			log.Printf("traffic: %d real-time, %d transactional, %d bulk, %d unclassified",
+				rt, tx, bulk, unk)
 		}
 		if w := s.withheldBulk.Load(); w > 0 {
 			log.Printf("admission: %d bulk packets withheld to protect the call", w)
@@ -1271,6 +1273,8 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 	if d.switching {
 		snap.Scheduler.SwitchingTo = int(d.switchingTo)
 	}
+	snap.Scheduler.ClassRealtime, snap.Scheduler.ClassTransactional,
+		snap.Scheduler.ClassBulk, snap.Scheduler.ClassUnknown = s.classTotals()
 	// Bulk rides exactly one path once it has been steered; more than one
 	// only happens in blind mode, where the distinction has stopped
 	// meaning anything.

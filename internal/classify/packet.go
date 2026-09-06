@@ -17,6 +17,10 @@ import (
 const (
 	protoTCP = 6
 	protoUDP = 17
+
+	// portDNS is named rather than inferred: resolution latency is felt
+	// directly in every page load and moves almost nothing.
+	portDNS = 53
 )
 
 // FlowKey identifies a conversation, not a direction. The two endpoints

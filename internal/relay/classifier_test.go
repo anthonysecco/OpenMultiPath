@@ -127,11 +127,15 @@ func TestClassCountersRecordWhatWasDecided(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		s.noteClass(protocol.ClassBulk)
 	}
+	for i := 0; i < 7; i++ {
+		s.noteClass(protocol.ClassTransactional)
+	}
 	s.noteClass(protocol.ClassUnknown)
 	s.noteClass(200) // out of range; must not panic or corrupt a counter
 
-	rt, bulk, unk := s.classTotals()
-	if rt != 5 || bulk != 3 || unk != 1 {
-		t.Errorf("counted realtime=%d bulk=%d unknown=%d, want 5/3/1", rt, bulk, unk)
+	rt, tx, bulk, unk := s.classTotals()
+	if rt != 5 || tx != 7 || bulk != 3 || unk != 1 {
+		t.Errorf("counted realtime=%d transactional=%d bulk=%d unknown=%d, want 5/7/3/1",
+			rt, tx, bulk, unk)
 	}
 }

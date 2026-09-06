@@ -101,15 +101,40 @@ const (
 //
 // ClassUnknown is not a placeholder any more, it is a real answer: it means
 // the sender could not honestly say. That happens when the daemon runs
-// below WireGuard and its payloads are ciphertext, while a flow is still
-// being sampled, and for packets that belong to no flow at all. Carrying
-// the class is step 7; acting on it is step 8, so nothing downstream
-// distinguishes these yet.
+// below WireGuard and its payloads are ciphertext, and for packets that
+// belong to no flow at all.
+// ClassTransactional is the middle: small, latency-bound request/response
+// traffic - a web page load, a DNS lookup, an API call. It exists because
+// "not a call" is two different things with opposite needs. A download
+// wants a fat pipe and does not care about round trips; a web request
+// wants the shortest round trip and moves almost nothing. Carrying both as
+// bulk meant a page load could be exiled onto a high-latency standby link
+// and starved by admission control, which is the traffic the user is
+// actually looking at while they wait.
+//
+// The field is two bits and this is the fourth value, so a third class
+// costs nothing on the wire.
 const (
-	ClassUnknown  uint8 = 0
-	ClassRealtime uint8 = 1
-	ClassBulk     uint8 = 2
+	ClassUnknown       uint8 = 0
+	ClassRealtime      uint8 = 1
+	ClassBulk          uint8 = 2
+	ClassTransactional uint8 = 3
 )
+
+// ClassName is for logs and the state file, where a number would make
+// every reader go and look it up.
+func ClassName(c uint8) string {
+	switch c {
+	case ClassRealtime:
+		return "real-time"
+	case ClassBulk:
+		return "bulk"
+	case ClassTransactional:
+		return "transactional"
+	default:
+		return "unclassified"
+	}
+}
 
 // BaseLen is the size of the header carried on every packet, excluding any
 // echo block.

@@ -1,4 +1,5 @@
-// Package classify decides whether an inner packet is real-time or bulk.
+// Package classify decides whether an inner packet is real-time,
+// transactional or bulk.
 //
 // This is step 7, and protocol.md sets out the shape: three signals in
 // strict precedence, first match wins, with a per-flow cache so that the
@@ -18,14 +19,36 @@
 // hand YouTube the duplicated low-latency treatment and spend a metered
 // link on it.
 //
+// # Transactional, and why it is a separate axis
+//
+// The three signals above answer one question: is this a call. Everything
+// they reject then faces a second, independent question - is the user
+// waiting on it. A download wants a fat pipe and does not care about
+// round trips; a web request wants the shortest round trip and moves
+// almost nothing. Carrying both as bulk meant a page load could be exiled
+// onto a high-latency standby link and starved by admission control.
+//
+// That second question is answered by volume over time, not by a verdict
+// taken once. One HTTP/2 or HTTP/3 connection carries a page load and
+// then a large download, so the class has to move with the flow: rate
+// above a threshold, held for a dwell, demotes it; falling quiet for
+// longer promotes it back. The dwell is what separates a page load - a
+// burst of a second or two, then idle - from a transfer.
+//
 // # The default when nothing is known
 //
-// A flow under observation is ClassUnknown, not ClassRealtime. Guessing
-// real-time is the expensive mistake in both directions that matter:
-// duplication burns a metered link, and admission control would reserve
-// capacity for a download. Guessing bulk is cheap by comparison, and the
-// signal that actually protects a call - STUN - fires before the media
-// does, so a real conference is rarely in the unknown state at all.
+// A flow under observation is ClassTransactional, which reverses D-027's
+// asymmetry on purpose. With two classes the safe guess was bulk, because
+// guessing real-time duplicates an unidentified download over a metered
+// link. With three the safe guess is the middle: a flow nobody has placed
+// yet has by definition not moved much data, so treating it as small is
+// both the accurate guess and the cheap one. It is never duplicated, and
+// it leaves the low-latency path within a dwell if it turns out to be a
+// download.
+//
+// ClassUnknown survives for the cases where the daemon genuinely cannot
+// say: a payload that is ciphertext below WireGuard, and a packet that
+// belongs to no flow at all.
 package classify
 
 import (
@@ -80,7 +103,28 @@ type flow struct {
 	gapMean  float64 // milliseconds, Welford running mean
 	gapM2    float64 // Welford sum of squared deviations
 	gapCount int
+
+	// The transactional/bulk split, which is a question about right now
+	// rather than about the flow. One HTTP/2 connection carries a page
+	// load and then a large download; the class has to move with it.
+	//
+	// total is everything the flow has carried, winBytes and winStart
+	// the current rate window, and elephant whether it is currently
+	// being treated as bulk. overSince and clearSince are when the rate
+	// first crossed the demote and promote lines, which is what turns a
+	// threshold into a dwell.
+	total      int64
+	winBytes   int64
+	winStart   time.Time
+	elephant   bool
+	overSince  time.Time
+	clearSince time.Time
 }
+
+// rateWindow is how often the flow's throughput is recomputed. The dwell
+// is expressed in these, so it wants to be comfortably shorter than the
+// shortest dwell worth configuring.
+const rateWindow = 500 * time.Millisecond
 
 // New returns a classifier reading its thresholds from settings, which may
 // be nil in tests.
@@ -119,13 +163,6 @@ func (c *Classifier) Classify(pkt []byte) uint8 {
 		return protocol.ClassUnknown
 	}
 
-	// protocol.md's free first-pass exclusion. Nothing about a TCP flow
-	// needs remembering, so this returns ahead of the cache and keeps
-	// bulk transfers from occupying entries that real conversations want.
-	if p.flow.Proto == protoTCP {
-		return protocol.ClassBulk
-	}
-
 	cfg := c.config()
 	now := c.now()
 
@@ -156,8 +193,42 @@ func (c *Classifier) Classify(pkt []byte) uint8 {
 	}
 	f.lastSeen = now
 
+	// Volume is tracked for every non-real-time flow on every packet,
+	// including ones whose real-time question is already settled: a QUIC
+	// connection that was carrying a web page a moment ago can start
+	// carrying a download, and the class has to move with it.
+	if !f.decided || f.class != protocol.ClassRealtime {
+		f.noteVolume(p.size, cfg, now)
+	}
+
 	if f.decided {
-		return f.class
+		if f.class == protocol.ClassRealtime {
+			return protocol.ClassRealtime
+		}
+		return f.nonRealtime()
+	}
+
+	// protocol.md's free first-pass exclusion: no TCP flow is a call.
+	//
+	// It used to return here without a cache entry, on the reasoning that
+	// nothing about a TCP flow needed remembering. That stopped being
+	// true the moment transactional existed - web requests are the
+	// traffic this class is for, and almost all of them are TCP - so TCP
+	// now takes an entry and runs the volume detector like anything else.
+	if p.flow.Proto == protoTCP {
+		f.decided = true
+		f.class = protocol.ClassBulk // the "not real-time" verdict; nonRealtime picks the class
+		return f.nonRealtime()
+	}
+
+	// DNS resolution is felt directly in every page load and moves almost
+	// nothing, so it is named rather than inferred. Waiting for the
+	// behavioural sample to place a handful of 80-byte lookups is the
+	// wrong answer for the one flow whose latency the user notices most.
+	if p.flow.APort == portDNS || p.flow.BPort == portDNS {
+		f.decided = true
+		f.class = protocol.ClassBulk
+		return protocol.ClassTransactional
 	}
 
 	// 1. STUN. Checked on every packet of an undecided flow rather than
@@ -187,12 +258,26 @@ func (c *Classifier) Classify(pkt []byte) uint8 {
 		return f.class
 	}
 
-	// 4. Behavioural catch-all.
+	// 4. Behavioural catch-all. It answers "is this a call", and anything
+	// it does not call real-time falls through to the volume detector
+	// rather than being carried as bulk outright.
 	c.observe(f, p, now)
 	if f.samples >= cfg.ClassifySamplePackets {
 		f.class, f.decided = c.behavioural(f, cfg), true
+		if f.class == protocol.ClassRealtime {
+			return protocol.ClassRealtime
+		}
+		return f.nonRealtime()
 	}
-	return f.class
+
+	// Still sampling. Unknown now means transactional rather than bulk,
+	// which reverses D-027's asymmetry on purpose: with three classes the
+	// safe default is the middle. A flow nobody has placed yet has by
+	// definition not moved much data, so treating it as small is both the
+	// accurate guess and the cheap one - it is never duplicated, and it
+	// is off the low-latency path within a dwell if it turns out to be a
+	// download.
+	return protocol.ClassTransactional
 }
 
 // observe folds one packet into a flow's behavioural sample.
@@ -296,4 +381,80 @@ func (c *Classifier) config() config.Config {
 		return config.Defaults()
 	}
 	return c.settings.Get()
+}
+
+// noteVolume folds one packet into the flow's rate window and decides
+// whether it is currently an elephant.
+//
+// The window closes on a fixed cadence rather than on every packet, so a
+// flow that goes completely silent stops being evaluated - which is
+// correct. An idle flow is neither transactional nor bulk, and whatever
+// it was last is the right answer until it says otherwise.
+func (f *flow) noteVolume(size int, cfg config.Config, now time.Time) {
+	f.total += int64(size)
+	f.winBytes += int64(size)
+
+	// A transfer fast enough to move serious volume inside the dwell
+	// window would otherwise ride the low-latency path for the whole of
+	// it. This is the backstop, and it is deliberately large: it is for
+	// obvious elephants, not for close calls.
+	if f.total >= int64(cfg.ClassifyBulkBytes) {
+		f.elephant = true
+	}
+
+	if f.winStart.IsZero() {
+		f.winStart = now
+		return
+	}
+	elapsed := now.Sub(f.winStart)
+	if elapsed < rateWindow {
+		return
+	}
+
+	kbps := float64(f.winBytes*8) / elapsed.Seconds() / 1000
+	f.winBytes, f.winStart = 0, now
+
+	if !f.elephant {
+		// Demote only on a rate held for the dwell. The dwell is what
+		// separates a page load - a burst of a second or two, then idle -
+		// from a download, and it is the reason this is not simply a
+		// threshold on bytes.
+		if kbps >= float64(cfg.ClassifyBulkKbps) {
+			if f.overSince.IsZero() {
+				f.overSince = now
+			}
+			if now.Sub(f.overSince) >= time.Duration(cfg.ClassifyBulkDwellMs)*time.Millisecond {
+				f.elephant = true
+				f.overSince = time.Time{}
+			}
+			return
+		}
+		f.overSince = time.Time{}
+		return
+	}
+
+	// Promotion back, on its own lower threshold and its own longer
+	// dwell. One line for both directions would flap the class of a flow
+	// every time a download paused, and every flap moves it between
+	// paths - which reorders it and costs the move twice.
+	if kbps <= float64(cfg.ClassifyBulkClearKbps) {
+		if f.clearSince.IsZero() {
+			f.clearSince = now
+		}
+		if now.Sub(f.clearSince) >= time.Duration(cfg.ClassifyBulkClearMs)*time.Millisecond {
+			f.elephant = false
+			f.clearSince = time.Time{}
+			f.total = 0
+		}
+		return
+	}
+	f.clearSince = time.Time{}
+}
+
+// nonRealtime is the class of a flow that is definitively not a call.
+func (f *flow) nonRealtime() uint8 {
+	if f.elephant {
+		return protocol.ClassBulk
+	}
+	return protocol.ClassTransactional
 }

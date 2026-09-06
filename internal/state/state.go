@@ -80,6 +80,16 @@ type Scheduler struct {
 	// explains a withheld counter that would otherwise look arbitrary.
 	BulkPath int `json:"bulk_path"`
 
+	// What the classifier decided, cumulative since the daemon started.
+	// Transactional is broken out because its thresholds are guesses and
+	// this is the only place the field data can show whether they are
+	// right - a split that reads 0 transactional, or 0 bulk, is the
+	// detector saying it is not working.
+	ClassRealtime      uint64 `json:"class_realtime"`
+	ClassTransactional uint64 `json:"class_transactional"`
+	ClassBulk          uint64 `json:"class_bulk"`
+	ClassUnknown       uint64 `json:"class_unknown"`
+
 	// Reason is the scheduler's own one-line account of the current
 	// choice, which is the first thing worth reading when the choice looks
 	// wrong.

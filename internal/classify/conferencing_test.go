@@ -94,8 +94,16 @@ func TestRealWorldConferencingProfiles(t *testing.T) {
 				at = i + 1
 			}
 		}
+		// The profiles assert the real-time question only. A QUIC
+		// download is "not a call"; whether it is transactional or bulk
+		// depends on how long it sustains a rate, which these synthetic
+		// bursts deliberately do not model.
+		ok := className(got) == p.want
+		if p.want == "bulk" {
+			ok = notRealtime(got)
+		}
 		status := "ok"
-		if className(got) != p.want {
+		if !ok {
 			status = "WRONG"
 			t.Errorf("%s classified %s, want %s", p.name, className(got), p.want)
 		}
