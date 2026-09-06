@@ -41,6 +41,13 @@ type Options struct {
 	// never overshoots for long.
 	UDP        bool
 	TargetMbps int
+
+	// Bytes, when > 0, transfers a fixed amount of data rather than running
+	// for Seconds - an equal-payload comparison against a tool that moved a
+	// known number of bytes, rather than an equal-time one. The duration
+	// then falls out of the rate, which is the point: the same payload over
+	// a slower path simply takes longer.
+	Bytes int64
 }
 
 // Args is the iperf3 command line for these options. Split out from the run
@@ -55,9 +62,21 @@ func (o Options) Args() []string {
 	args := []string{
 		"-c", o.Server,
 		"-p", strconv.Itoa(o.Port),
-		"-t", strconv.Itoa(o.Seconds),
 		"--bind-dev", o.Iface,
 		"-J",
+	}
+	if o.Bytes > 0 {
+		// -n is per-stream in iperf3, so divide the target across the
+		// streams to move the intended total. -n and -t are mutually
+		// exclusive; the run stops when the bytes are sent, however long
+		// that takes.
+		per := o.Bytes
+		if o.Streams > 1 {
+			per = o.Bytes / int64(o.Streams)
+		}
+		args = append(args, "-n", strconv.FormatInt(per, 10))
+	} else {
+		args = append(args, "-t", strconv.Itoa(o.Seconds))
 	}
 	if o.UDP {
 		// -b 0 is unlimited; iperf3's UDP default is a gentle 1 Mbit/s,

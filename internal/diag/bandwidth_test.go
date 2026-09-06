@@ -134,3 +134,15 @@ func TestParseUDP(t *testing.T) {
 		t.Errorf("loss = %v%%, want 76", r.LossPercent)
 	}
 }
+
+// Fixed-data mode uses -n (per-stream) instead of -t, for an equal-payload
+// comparison. With 8 streams a 80 MB target is 10 MB per stream.
+func TestArgsFixedBytes(t *testing.T) {
+	got := strings.Join(Options{Iface: "wg1", Server: "10.20.1.1", Port: 5201, Streams: 8, Bytes: 80_000_000}.Args(), " ")
+	if !strings.Contains(got, "-n 10000000") {
+		t.Errorf("args %q missing per-stream -n 10000000", got)
+	}
+	if strings.Contains(got, "-t ") {
+		t.Errorf("args %q has -t alongside -n", got)
+	}
+}

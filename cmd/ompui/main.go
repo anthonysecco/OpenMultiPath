@@ -188,6 +188,7 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 		Streams    int    `json:"streams"`
 		UDP        bool   `json:"udp"`
 		TargetMbps int    `json:"target_mbps"`
+		MBytes     int    `json:"mbytes"` // fixed-data mode: transfer this many MB instead of running for Seconds
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PathID == nil {
 		http.Error(w, "expected a JSON body with a path_id", http.StatusBadRequest)
@@ -214,6 +215,16 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 	// typo cannot ask for an absurd rate.
 	if req.TargetMbps < 0 || req.TargetMbps > 10000 {
 		req.TargetMbps = 0
+	}
+	// Fixed-data mode: transfer a set number of MB instead of running for a
+	// set time, for an equal-payload comparison against another tool. Clamped
+	// so a typo cannot ask to move gigabytes over a metered link.
+	var fixedBytes int64
+	if req.MBytes > 0 {
+		if req.MBytes > 2000 {
+			req.MBytes = 2000
+		}
+		fixedBytes = int64(req.MBytes) * 1_000_000
 	}
 
 	snap, err := state.Read(s.statePath)
@@ -260,7 +271,14 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.diagMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(req.Seconds+15)*time.Second)
+	// Fixed-data transfers can take much longer than the nominal seconds on a
+	// slow path, so give them a generous ceiling; the run ends when the bytes
+	// are sent.
+	timeout := time.Duration(req.Seconds+15) * time.Second
+	if fixedBytes > 0 {
+		timeout = 180 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
 	res, runErr := diag.Run(ctx, diag.Options{
@@ -271,6 +289,7 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 		Streams:    req.Streams,
 		UDP:        req.UDP,
 		TargetMbps: req.TargetMbps,
+		Bytes:      fixedBytes,
 	})
 
 	out := map[string]any{
