@@ -18,6 +18,7 @@ import (
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 	"github.com/anthonysecco/OpenMultiPath/internal/record"
 	"github.com/anthonysecco/OpenMultiPath/internal/state"
+	"github.com/anthonysecco/OpenMultiPath/internal/usage"
 )
 
 // The two ends run the same session code and differ only in role. The
@@ -27,6 +28,10 @@ const (
 	roleInitiator = "initiator"
 	roleResponder = "responder"
 )
+
+// usageSampleInterval is how often the kernel's byte counters are folded
+// into the billing-cycle totals and written to disk.
+const usageSampleInterval = 30 * time.Second
 
 // staleEcho is the age past which a recorded arrival is dropped rather
 // than echoed. A reading this old says nothing about current conditions,
@@ -293,9 +298,16 @@ type session struct {
 	// to talk us back down into sending unauthenticated headers.
 	peerVersion atomic.Uint32
 
-	mu         sync.Mutex
-	paths      map[uint8]*pathState
-	names      map[uint8]string
+	mu    sync.Mutex
+	paths map[uint8]*pathState
+	names map[uint8]string
+
+	// meter accounts for what each link has carried this billing cycle.
+	// Nil on the responder, which owns no interfaces and whose traffic is
+	// not billed to this vehicle - and nil is a working state, not a
+	// missing one: every path then reads unmetered and green, which is
+	// exactly right for a link with no allowance to spend.
+	meter      *usage.Meter
 	lastEcho   time.Duration
 	lastReport time.Duration
 }
@@ -898,6 +910,7 @@ func (s *session) metrics(now time.Duration) []pathMetric {
 			thin:           st.thin(),
 			unusable:       p.mtu.ceiling != 0 && p.mtu.confirmed < minUsablePathMTU,
 			bw:             p.bw.view(now, c),
+			budget:         s.budgetState(s.names[id], c),
 
 			haveTx:       p.peer.fresh(now),
 			txSpreadMs:   p.peer.spreadMs,
@@ -907,6 +920,72 @@ func (s *session) metrics(now time.Duration) []pathMetric {
 			txBurstRatio: p.peer.burst,
 			rttFloorMs:   ms(p.rttFloor.cur),
 		})
+	}
+	return out
+}
+
+// budgetFor turns the configured allowance for an interface into the form
+// the accounting wants.
+func budgetFor(iface string, c config.Config) usage.Budget {
+	l := c.LinkFor(iface)
+	return usage.Budget{
+		CapBytes:             uint64(l.CapMB) << 20,
+		CycleDay:             l.CycleDay,
+		GreenHeadroomPercent: c.BudgetGreenHeadroomPercent,
+	}
+}
+
+// cycleStartUnix is the billing cycle's start as a unix time, or zero
+// when nothing is being accounted for this link.
+func cycleStartUnix(u usage.State) float64 {
+	if u.CycleStart.IsZero() {
+		return 0
+	}
+	return float64(u.CycleStart.UnixNano()) / 1e9
+}
+
+// budgetState is what this link has spent, or the unmetered zero value
+// where nothing is being accounted.
+func (s *session) budgetState(iface string, c config.Config) usage.State {
+	if s.meter == nil || iface == "" {
+		return usage.State{}
+	}
+	return s.meter.State(iface, budgetFor(iface, c), time.Now())
+}
+
+// trackUsage folds the kernel's interface counters into each link's cycle
+// total, and persists them.
+//
+// Slow on purpose. The counters are monotonic, so nothing is lost by
+// reading them a minute apart, and the figure this feeds is a projection
+// across a month - a cadence that mattered to it would be a cadence that
+// could not survive the daemon being restarted. Persisting matters more
+// than sampling often: scope-v1.md is explicit that losing these on a
+// power cycle means relearning at exactly the moment the RV is moving.
+func (s *session) trackUsage() {
+	for range time.Tick(usageSampleInterval) {
+		c := s.cfg.Get()
+		now := time.Now()
+		for _, name := range s.pathNames() {
+			if name == "" {
+				continue
+			}
+			s.meter.Sample(name, budgetFor(name, c), now)
+		}
+		if err := s.meter.Save(); err != nil {
+			log.Printf("usage: saving cycle totals failed: %v", err)
+		}
+	}
+}
+
+// pathNames is the interfaces currently registered, copied out under the
+// lock so the sampling loop never holds it while reading /sys.
+func (s *session) pathNames() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.names))
+	for _, n := range s.names {
+		out = append(out, n)
 	}
 	return out
 }
@@ -1037,6 +1116,8 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 		d = s.sched.current()
 	}
 
+	c := s.cfg.Get()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1048,7 +1129,7 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 		TunnelMTU:            tunnelMTU,
 		RecommendedTunnelMTU: s.recommendedTunnelMTULocked(),
 		ManagesPaths:         s.role == roleInitiator,
-		Config:               s.cfg.Get(),
+		Config:               c,
 	}
 
 	ids := make([]uint8, 0, len(s.paths))
@@ -1069,9 +1150,16 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 			alive = now-p.seenAt < aliveWithin
 		}
 
+		budget := s.budgetState(s.names[id], c)
 		path := state.Path{
 			ID:                id,
 			Name:              s.names[id],
+			Budget:            budget.Band.String(),
+			BudgetMetered:     budget.Metered,
+			CapBytes:          budgetFor(s.names[id], c).CapBytes,
+			UsedBytes:         budget.Bytes,
+			ProjectedBytes:    budget.Projected,
+			CycleStartUnix:    cycleStartUnix(budget),
 			RTTMs:             ms(p.rtt),
 			P95SpreadMs:       msi(st.spread()),
 			JitterMs:          st.jitter / 1000,

@@ -152,6 +152,40 @@
 const $ = id => document.getElementById(id);
 const fmt = (n, d = 1) => (n === undefined || n === null) ? "—" : Number(n).toFixed(d);
 
+// Data volumes against a monthly cap. Always two significant figures at
+// the scale the cap is written in: somebody watching 94 GB of a 100 GB
+// allowance needs the fraction, and somebody at 3 MB does not.
+function bytes(n) {
+  if (n === undefined || n === null) return "\u2014";
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + " GB";
+  if (n >= 1e6) return (n / 1e6).toFixed(0) + " MB";
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + " kB";
+  return n + " B";
+}
+
+// The band names map onto the tag colours the rest of the page already
+// uses, so a red link reads the same as any other red thing here.
+const bandClass = { green: "good", yellow: "warn", red: "bad" };
+
+// What this link has spent, and against what.
+//
+// An unmetered link still shows its usage: knowing what a link carries is
+// what somebody needs in order to decide whether to cap it, and it is
+// useful long before anybody does. Only a configured cap gets a band,
+// because a band on an uncapped link would be reporting a judgement
+// nobody asked for.
+function budgetRow(p) {
+  if (p.used_bytes === undefined || p.used_bytes === null) return "";
+  if (!p.budget_metered) {
+    return `<div class="metric"><div class="k">This cycle</div>
+      <div class="v" title="no allowance configured for this link">${bytes(p.used_bytes)}</div></div>`;
+  }
+  const cls = bandClass[p.budget] || "good";
+  const pct = p.cap_bytes ? Math.round(p.used_bytes / p.cap_bytes * 100) : 0;
+  return `<div class="metric"><div class="k">This cycle <span class="tag ${cls}">${p.budget}</span></div>
+    <div class="v" title="${pct}% of the allowance used; on course for ${bytes(p.projected_bytes)} by the end of the cycle">${bytes(p.used_bytes)} / ${bytes(p.cap_bytes)}</div></div>`;
+}
+
 function duration(sec) {
   if (sec < 60) return Math.round(sec) + "s";
   if (sec < 3600) return Math.floor(sec / 60) + "m " + Math.round(sec % 60) + "s";
@@ -380,6 +414,7 @@ function renderPaths(s) {
         <div class="metric"><div class="k">Received</div><div class="v">${p.received.toLocaleString()}</div></div>
         <div class="metric"><div class="k">Sending</div>
           <div class="v" title="what is going onto this path right now; peak ${rate(p.peak_kbps)}">${rate(p.send_kbps)}</div></div>
+        ${budgetRow(p)}
         <div class="metric"><div class="k">Capacity</div>
           <div class="v" title="${capacityNote}">${capacity}</div></div>
         <div class="metric"><div class="k">Path MTU</div><div class="v">${p.path_mtu || "—"}</div></div>

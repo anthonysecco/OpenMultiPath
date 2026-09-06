@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 )
 
 // Nothing has to be configured for the daemon to run correctly, so a
@@ -13,7 +15,7 @@ func TestMissingFileYieldsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load of a missing file returned %v, want no error", err)
 	}
-	if c != Defaults() {
+	if !reflect.DeepEqual(c, Defaults()) {
 		t.Errorf("got %+v, want the defaults %+v", c, Defaults())
 	}
 }
@@ -62,7 +64,7 @@ func TestValidValuesSurviveUntouched(t *testing.T) {
 	c.RecordMaxMegabytes = 64
 	c.RecordKeepFiles = 4
 
-	if got := c.Sanitised(); got != c {
+	if got := c.Sanitised(); !reflect.DeepEqual(got, c) {
 		t.Errorf("got %+v, want it unchanged at %+v", got, c)
 	}
 }
@@ -125,7 +127,7 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %+v, want %+v", got, want)
 	}
 }
@@ -142,7 +144,7 @@ func TestCorruptFileFallsBackToDefaults(t *testing.T) {
 	if err == nil {
 		t.Error("Load of a corrupt file returned no error; the damage should be reported")
 	}
-	if c != Defaults() {
+	if !reflect.DeepEqual(c, Defaults()) {
 		t.Errorf("got %+v, want the defaults so the daemon can still run", c)
 	}
 }
@@ -173,4 +175,115 @@ func TestPartialFileKeepsWhatItNamesAndDefaultsTheRest(t *testing.T) {
 	if got.RecordMaxBytes() <= 0 {
 		t.Error("rotation threshold is not positive, so the recorder would rotate on every write")
 	}
+}
+
+// A cap nobody set has to mean "no opinion", not "no allowance". Reading
+// it the other way would have a fresh install refuse to carry bulk on
+// every link it has.
+func TestUnconfiguredLinkIsUnmetered(t *testing.T) {
+	c := Defaults()
+	l := c.LinkFor("enp1s0")
+	if l.CapMB != 0 {
+		t.Errorf("unconfigured link has cap %d MB, want 0 meaning unmetered", l.CapMB)
+	}
+	if l.CycleDay < 1 || l.CycleDay > 28 {
+		t.Errorf("unconfigured link cycle day is %d, want a usable default", l.CycleDay)
+	}
+}
+
+// There is no zeroth of the month, so a zero cycle day can only mean the
+// field was omitted - the one place in this file a zero is filled in
+// rather than taken literally.
+func TestOmittedCycleDayGetsTheDefault(t *testing.T) {
+	c := Defaults()
+	c.Links = map[string]LinkBudget{"enp1s0": {CapMB: 102400}}
+	c = c.Sanitised()
+
+	if got := c.Links["enp1s0"].CycleDay; got != Bounds["link_cycle_day"].Default {
+		t.Errorf("cycle day sanitised to %d, want the default %d", got, Bounds["link_cycle_day"].Default)
+	}
+	if got := c.LinkFor("enp1s0").CapMB; got != 102400 {
+		t.Errorf("cap came back as %d MB, want 102400", got)
+	}
+}
+
+func TestLinkBudgetsAreClamped(t *testing.T) {
+	c := Defaults()
+	c.Links = map[string]LinkBudget{
+		"low":  {CapMB: -5, CycleDay: 0},
+		"high": {CapMB: 51200, CycleDay: 31},
+	}
+	c = c.Sanitised()
+
+	if got := c.Links["low"].CapMB; got != 0 {
+		t.Errorf("negative cap sanitised to %d, want 0", got)
+	}
+	if got := c.Links["high"].CycleDay; got != 28 {
+		t.Errorf("cycle day 31 sanitised to %d, want 28; there is no 31st in February", got)
+	}
+}
+
+// Sanitised runs on configuration other goroutines are already reading
+// through the holder. Correcting the map in place would be a data race
+// that only appears under load on the box hardest to reach.
+func TestSanitisedDoesNotMutateTheCallersLinkMap(t *testing.T) {
+	c := Defaults()
+	c.Links = map[string]LinkBudget{"enp1s0": {CapMB: 102400, CycleDay: 31}}
+	original := c.Links["enp1s0"]
+
+	_ = c.Sanitised()
+
+	if c.Links["enp1s0"] != original {
+		t.Errorf("Sanitised edited the caller's map: %+v, want %+v", c.Links["enp1s0"], original)
+	}
+}
+
+// The watcher must react to any change, not merely to a newer timestamp.
+// Two things on a vehicle produce a config file that is different but not
+// newer: a restore from a `cp -a` backup, which preserves the older
+// mtime, and a write that happened before NTP stepped the clock backwards
+// on a box with no RTC. Testing for "newer" leaves the daemon running
+// settings nobody can see, with nothing in the log to say so.
+func TestWatchReloadsAConfigWithAnOlderTimestamp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+
+	first := Defaults()
+	first.EchoIntervalMs = 250
+	if err := Save(path, first); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Start from the defaults, not from `first`, so there is an
+	// observable transition proving the watcher has read the file and
+	// recorded its timestamp. Without that the first tick can land after
+	// the whole setup and the test passes without exercising anything.
+	h := NewHolder(Defaults())
+	go h.Watch(path)
+	waitFor(t, h, 250, "the watcher never made its first read")
+
+	// Now a restore that puts back different content with an older
+	// mtime, exactly as `cp -a` from yesterday's backup would.
+	second := Defaults()
+	second.EchoIntervalMs = 400
+	if err := Save(path, second); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	old := time.Now().Add(-24 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	waitFor(t, h, 400, "the watcher ignored a changed config with an older mtime")
+}
+
+func waitFor(t *testing.T, h *Holder, want int, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.Get().EchoIntervalMs == want {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("%s: echo interval is %d ms, want %d", msg, h.Get().EchoIntervalMs, want)
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
+	"github.com/anthonysecco/OpenMultiPath/internal/usage"
 )
 
 // A synthetic world of paths the scheduler can be driven through. The
@@ -1149,4 +1150,167 @@ func sameSet(a, b []uint8) bool {
 		}
 	}
 	return true
+}
+
+// budgeted marks a path's band, which is all the scheduler reads.
+func budgeted(w *world, id uint8, b usage.Band) {
+	w.set(id, func(p *pathMetric) { p.budget = usage.State{Band: b, Metered: true} })
+}
+
+// Sacrifice order, first rung. A duplicate is by definition redundant, so
+// cutting it costs resilience but not function - and it is the one traffic
+// that doubles a link's spend to buy insurance nobody has needed yet.
+func TestDuplicationStopsOnANonGreenLink(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.c.DuplicateMode = config.DuplicateAlways
+	w.s.cfg = config.NewHolder(w.c)
+
+	if d := w.tick(w.c.PromoteIntervals + 5); len(d.tx) != 2 {
+		t.Fatalf("real-time on %v before any budget pressure, want both paths", d.tx)
+	}
+
+	budgeted(w, 1, usage.Yellow)
+	d := w.tick(2)
+
+	if len(d.tx) != 1 {
+		t.Errorf("real-time on %v with the spare link yellow, want the primary alone", d.tx)
+	}
+	if d.tx[0] != d.primary {
+		t.Errorf("real-time on path %d, want the primary %d", d.tx[0], d.primary)
+	}
+}
+
+// Sacrifice order, second rung. Bulk prefers a green link when one is
+// free.
+func TestBulkPrefersAGreenLink(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 50), path(2, 60))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	// Make every spare yellow except one, so the choice is about the band
+	// rather than about the score.
+	d := w.tick(1)
+	for _, sc := range []uint8{0, 1, 2} {
+		if sc != d.primary {
+			budgeted(w, sc, usage.Yellow)
+		}
+	}
+	green := uint8(0)
+	for _, id := range []uint8{0, 1, 2} {
+		if id != d.primary {
+			green = id
+			break
+		}
+	}
+	w.set(green, func(p *pathMetric) { p.budget = usage.State{Band: usage.Green} })
+
+	if d := w.tick(2); d.txBulk[0] != green {
+		t.Errorf("bulk on path %d, want the green path %d", d.txBulk[0], green)
+	}
+}
+
+// Being on course to exceed a cap is not the same as having spent it.
+// Stalling every download for a projection would be acting on an estimate
+// as though it were a fact, so a yellow link still carries bulk when
+// nothing greener is free.
+func TestYellowLinkStillCarriesBulkWhenNothingGreenIsFree(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	budgeted(w, 0, usage.Yellow)
+	budgeted(w, 1, usage.Yellow)
+	d := w.tick(2)
+
+	if len(d.txBulk) != 1 {
+		t.Fatalf("bulk on %v, want exactly one path", d.txBulk)
+	}
+	if d.txBulk[0] == d.primary {
+		t.Errorf("bulk fell back to the call's path %d when a yellow spare was free", d.primary)
+	}
+}
+
+// Red is the allowance actually gone, and architecture.md reserves what
+// is left for a call. Bulk never rides it.
+func TestBulkNeverRidesARedLink(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	d := w.tick(1)
+	spare := uint8(0)
+	if d.primary == 0 {
+		spare = 1
+	}
+	budgeted(w, spare, usage.Red)
+
+	if d := w.tick(2); d.txBulk[0] == spare {
+		t.Errorf("bulk steered onto the red path %d", spare)
+	}
+}
+
+// Stickiness does not outrank a spent allowance: a link that turns red
+// while bulk is riding it is the case the band exists for.
+func TestBulkLeavesAPathThatTurnsRed(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 50), path(2, 60))
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	on := d.txBulk[0]
+	if on == d.primary {
+		t.Fatalf("bulk started on the call's path %d", d.primary)
+	}
+
+	budgeted(w, on, usage.Red)
+	if d := w.tick(2); d.txBulk[0] == on {
+		t.Errorf("bulk stayed on path %d after it went red", on)
+	}
+}
+
+// A penalty, not a veto. architecture.md wants a red link carrying
+// real-time when it is the only viable path, because a working call beats
+// an overage.
+func TestRedLinkStillCarriesTheCallWhenItIsAllThereIs(t *testing.T) {
+	w := newWorld(t, path(0, 40))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	budgeted(w, 0, usage.Red)
+	d := w.tick(3)
+
+	if !d.havePrimary || d.primary != 0 {
+		t.Fatalf("no primary with a red sole path; a working call beats an overage")
+	}
+	if len(d.tx) != 1 || d.tx[0] != 0 {
+		t.Errorf("real-time on %v, want the red sole path", d.tx)
+	}
+}
+
+// And the penalty is real: given a choice, the greener link wins even
+// when the metered one measures better.
+func TestTheGreenerLinkWinsTheCall(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	// Path 0 measures better but has spent its allowance.
+	budgeted(w, 0, usage.Red)
+	d := w.tick(w.c.SwitchHoldIntervals + 5)
+
+	if d.primary != 1 {
+		t.Errorf("primary is path %d, want the unmetered path 1 over the red one", d.primary)
+	}
+}
+
+// Stickiness holds against a better score but yields to a better band.
+// Scores cross many times an hour; a band changes a handful of times a
+// month and means real money.
+func TestBulkMovesFromAYellowLinkToAGreenOne(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 50), path(2, 60))
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	on := d.txBulk[0]
+	budgeted(w, on, usage.Yellow)
+
+	d = w.tick(2)
+	if d.txBulk[0] == on {
+		t.Errorf("bulk stayed on path %d after it went yellow while a green link was free", on)
+	}
+	if band := w.paths[d.txBulk[0]].budget.Band; band != usage.Green {
+		t.Errorf("bulk moved to a %s path, want the green one", band)
+	}
 }

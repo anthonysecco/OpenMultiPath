@@ -39,6 +39,7 @@ func main() {
 	public := flag.String("public", "0.0.0.0:48219", "responder only: the forwarded public port to listen on")
 	statePath := flag.String("state", "/var/lib/openmultipath/state.json", "where to write the snapshot the web interface reads")
 	recordPath := flag.String("record", "/var/lib/openmultipath/history.jsonl", "where to append the rotating telemetry history; empty disables recording")
+	usagePath := flag.String("usage", "/var/lib/openmultipath/usage.json", "initiator only: where to keep per-link billing-cycle totals; empty disables cost tracking")
 	configPath := flag.String("config", "/etc/openmultipath/config.json", "adjustable settings, reloaded when the file changes")
 	wgInterface := flag.String("wg-interface", "wg0", "tunnel interface, read for its current MTU")
 	node := flag.String("node", hostname(), "this box's name, shown in the web interface")
@@ -91,6 +92,7 @@ func main() {
 			Node:         *node,
 			StatePath:    *statePath,
 			RecordPath:   *recordPath,
+			UsagePath:    *usagePath,
 			WGInterface:  *wgInterface,
 			Settings:     holder,
 			AuthKey:      authKey,

@@ -122,6 +122,16 @@ of reasoning up front.
    Still to come here: shaping video down within real-time so audio survives while video
    shrinks, which needs audio and video distinguished inside the class.
 10. **Cost tracking and budget bands.**
+    **Built** (2026-09-06, D-034). Per-link billing-cycle accounting from the kernel's
+    own interface counters rather than vnstat, accumulated as deltas and persisted so a
+    power cycle does not lose the month. Three bands from projected burn drive a scoring
+    surcharge in R points, and the sacrifice order is architecture.md's: duplication
+    stops on any non-green link, bulk prefers a green one and never rides a red one, and
+    real-time is never blocked - a red link still carries the call when it is the only
+    one left, because a working call beats an overage. A link nobody has configured is
+    unmetered and green.
+    Still to come here: deferrable bulk, so backups and updates queue for an unmetered
+    link rather than merely preferring one.
 11. **Fallback, watchdog, rollback.**
 
 Steps 1–5 produce no cleverness and are the most valuable part of the project.

@@ -1240,3 +1240,80 @@ exercised on hardware: it needs a cutover, and both boxes' out-of-band Wi-Fi
 adapters are currently absent from the USB bus, so there is no lifeline to do one
 behind. What *is* verified on hardware is the guard - production below WireGuard
 keeps bulk on the primary and is unchanged by this.
+
+## D-034 · Cost tracking from the kernel's own counters, and a penalty rather than a veto
+
+Step 10. architecture.md already fixed the shape of this - burn rate, projection,
+three bands, and a sacrifice order of duplication first, bulk second, real-time
+last. Two things it left open, and one it named that has been changed.
+
+**Changed: the kernel's interface counters, not vnstat.** architecture.md says
+"`vnstat` provides the accounting". It is a fine tool and this is not a criticism
+of it, but three things argue against it here. It is a second daemon to install
+and keep alive on a box nobody visits for months, and principle 5 asks what
+happens when the component below you is broken - the answer for a missing vnstat
+is worse than the answer for a file that reads zero. It keeps its own
+per-interface configuration, which would make the billing day a second policy
+surface that can disagree with this one, against D-004's "one policy surface".
+And what it adds over `/sys/class/net/<iface>/statistics/{rx,tx}_bytes` is
+history and a database, neither of which this needs: the daemon wants one number
+per link per cycle, and it already has somewhere durable to keep it.
+
+What the counters do not give is persistence, so the meter accumulates deltas and
+writes them to `usage.json`. A counter that goes backwards - a reboot, a replugged
+modem, an interface the link watcher bounced - is read as a reset rather than as
+negative traffic, and the first reading of any run is a baseline rather than a
+charge, or every restart would bill the whole cycle again.
+
+**Open: what happens in the first hours of a cycle.** The projection is
+`used / elapsed * cycle_length`, which at six hours elapsed turns one overnight
+backup into several hundred gigabytes and red-lines a link on the first morning
+of every month - then quietly corrects itself over the following days. Inside the
+first day the raw usage is reported instead and no projection is made. A confident
+wrong answer costs more trust than an absent one.
+
+**Open: the gap between the two band definitions.** architecture.md defines green
+as more than 20% projected headroom and yellow as projected to exceed, which
+leaves the span between them unnamed. Yellow takes it. A link on course to land
+inside its cap with a sliver spare is not comfortable, and the cost of calling it
+yellow - duplication stops, bulk prefers another link - is cheap and reversible.
+
+**A penalty, not a veto.** The band costs a link R points off its E-model score,
+in the same currency as `UnstablePenaltyR` and `FlapPenaltyR`, which is exactly
+protocol.md's `penalty_i` "metered-link surcharge (from budget band)". Red's
+default of 60 R is larger than the usable range, so a red link loses to anything
+that still works - and wins by default when there is nothing else, which is
+architecture.md's "real-time allowed if it is the sole viable path; a working call
+beats an overage". A hard exclusion could not express that last part at all.
+
+**Bulk stickiness holds against scores and yields to bands.** D-033 made bulk
+sticky because moving it reorders every TCP flow on the link. A band is different
+in kind from a score: scores cross many times an hour, a band changes a handful of
+times a month and means real money. So bulk keeps its path against a better score,
+gives it up for a better band, and leaves a link that turns red at once.
+
+**A cap nobody set means no opinion, not no allowance.** The zero value of every
+link is unmetered and green. Reading an absent cap as zero would have a fresh
+install refuse to carry bulk on every link it has, which is the opposite of
+"every tunable needs a working default".
+
+**Rejected: excluding red links outright.** Simpler to state and wrong at the one
+moment it matters - a canyon with one link left and the allowance spent is exactly
+when the call needs it.
+
+**Rejected: keying budgets by path id.** Ids are an internal ordering. Keying by
+interface name means a link coming up in a different order cannot silently
+re-point a Starlink cap at a 5G modem.
+
+**Found while testing this, and fixed here.** The settings watcher reloaded only
+when the file's mtime was *newer* than the last one it saw. Two things on a
+vehicle produce a config that is different but not newer: a restore from a
+`cp -a` backup, which preserves yesterday's mtime, and a write that happened
+before NTP stepped the clock backwards on a box with no RTC. Either left the
+daemon running settings nobody could see, indefinitely, with nothing in the log
+to say so. It now reloads on any change to mtime or size. Caught by restoring a
+config backup on the RV and watching the band stay red.
+
+**Not done here.** architecture.md's deferrable bulk - queuing backups and updates
+until an unmetered link appears - is a larger capability than a band, needs
+somewhere to defer *to*, and is not part of this.

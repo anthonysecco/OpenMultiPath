@@ -193,6 +193,54 @@ type Config struct {
 	// as eagerly as it shut would oscillate, and every oscillation is
 	// another burst of standing queue through the call.
 	AdmissionRecoverIntervals int `json:"admission_recover_intervals"`
+
+	// Cost tracking, step 10. Links carries one entry per WAN interface
+	// that has an allowance worth respecting; an interface with no entry
+	// is unmetered, which is the default and the only sane one. A cap
+	// nobody has set must mean "no opinion" rather than "no allowance",
+	// or a fresh install would refuse to carry bulk on every link it has.
+	//
+	// Keyed by interface name because that is what the operator knows and
+	// what -paths already names. Path ids are an internal ordering and
+	// would silently re-point somebody's Starlink cap at their 5G modem
+	// the first time a link came up in a different order.
+	Links map[string]LinkBudget `json:"links,omitempty"`
+
+	// BudgetGreenHeadroomPercent is how much of a cap must still be
+	// projected spare for a link to count as green. architecture.md sets
+	// it at 20.
+	BudgetGreenHeadroomPercent int `json:"budget_green_headroom_percent"`
+
+	// The scoring surcharge for a link that is spending too fast, in R
+	// points off the E-model score - the same currency as
+	// UnstablePenaltyR and FlapPenaltyR, and protocol.md's `penalty_i`
+	// "metered-link surcharge (from budget band)".
+	//
+	// A penalty rather than a veto, and that distinction is the whole
+	// design. architecture.md wants a red link used for real-time when it
+	// is the only viable path, because a working call beats an overage;
+	// a hard exclusion could not express that, while a large penalty
+	// loses every comparison against a working path and wins by default
+	// when there is nothing to compare against.
+	BudgetYellowPenaltyR int `json:"budget_yellow_penalty_r"`
+	BudgetRedPenaltyR    int `json:"budget_red_penalty_r"`
+}
+
+// LinkBudget is one WAN link's allowance. The zero value is unmetered.
+type LinkBudget struct {
+	// CapMB is the billing-cycle allowance in megabytes. Zero means
+	// unmetered: no cap, no bands, no penalty, usage still counted.
+	//
+	// Megabytes rather than gigabytes because whole gigabytes cannot say
+	// what several real plans say. A 2.5 GB tier and a 500 MB travel SIM
+	// are both unrepresentable in integer GB, and the interface renders
+	// human units from this anyway, so the coarser unit bought nothing.
+	CapMB int `json:"cap_mb"`
+
+	// CycleDay is the day of the month the carrier's cycle starts.
+	// Carriers do not align, so this is per link. Restricted to 1-28: a
+	// cycle starting on the 31st does not exist in February.
+	CycleDay int `json:"cycle_day"`
 }
 
 // The duplication policies, in increasing order of cost.
@@ -243,6 +291,21 @@ type bound struct {
 // which a setting would do more harm than good rather than merely being
 // aggressive.
 var Bounds = map[string]bound{
+	// Cost tracking, step 10. See LinkBudget and the budget penalties.
+	"budget_green_headroom_percent": {Min: 0, Max: 90, Default: 20},
+
+	// Yellow costs a link roughly what being unstable does: enough to
+	// lose to any healthy alternative, not enough to look broken. Red is
+	// larger than the whole usable R range, so a red link loses to
+	// anything at all that still works and is chosen only when nothing
+	// else is - which is architecture.md's "real-time allowed if it is
+	// the sole viable path".
+	"budget_yellow_penalty_r": {Min: 0, Max: 100, Default: 15},
+	"budget_red_penalty_r":    {Min: 0, Max: 100, Default: 60},
+
+	"link_cap_mb":    {Min: 0, Max: 100_000_000, Default: 0},
+	"link_cycle_day": {Min: 1, Max: 28, Default: 1},
+
 	"echo_interval_ms":       {Min: 20, Max: 5_000, Default: 100},
 	"probe_interval_seconds": {Min: 5, Max: 3_600, Default: 15},
 	"state_interval_ms":      {Min: 200, Max: 60_000, Default: 1_000},
@@ -403,6 +466,10 @@ func Defaults() Config {
 		ClassifyFlowIdleSeconds: Bounds["classify_flow_idle_seconds"].Default,
 
 		DuplicateMode: DuplicateUnstable,
+
+		BudgetGreenHeadroomPercent: Bounds["budget_green_headroom_percent"].Default,
+		BudgetYellowPenaltyR:       Bounds["budget_yellow_penalty_r"].Default,
+		BudgetRedPenaltyR:          Bounds["budget_red_penalty_r"].Default,
 	}
 }
 
@@ -486,7 +553,56 @@ func (c Config) Sanitised() Config {
 		ClassifyFlowIdleSeconds: clamp(c.ClassifyFlowIdleSeconds, Bounds["classify_flow_idle_seconds"]),
 
 		DuplicateMode: duplicateMode(c.DuplicateMode),
+
+		Links:                      sanitisedLinks(c.Links),
+		BudgetGreenHeadroomPercent: clamp(c.BudgetGreenHeadroomPercent, Bounds["budget_green_headroom_percent"]),
+		BudgetYellowPenaltyR:       clamp(c.BudgetYellowPenaltyR, Bounds["budget_yellow_penalty_r"]),
+		BudgetRedPenaltyR:          clamp(c.BudgetRedPenaltyR, Bounds["budget_red_penalty_r"]),
 	}
+}
+
+// sanitisedLinks brings every per-link allowance inside its range.
+//
+// The map is copied rather than corrected in place: Sanitised is called on
+// configuration that other goroutines may already be reading through the
+// holder, and mutating a shared map under them would be a data race that
+// only shows up under load on the box hardest to reach.
+//
+// A cycle day of zero is the one place a zero is filled in with the
+// default rather than taken literally. Everywhere else in this file a zero
+// is a real value - it is how a penalty is switched off - but there is no
+// zeroth of the month, so it can only mean the field was omitted.
+func sanitisedLinks(in map[string]LinkBudget) map[string]LinkBudget {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]LinkBudget, len(in))
+	for name, l := range in {
+		if l.CycleDay == 0 {
+			l.CycleDay = Bounds["link_cycle_day"].Default
+		}
+		out[name] = LinkBudget{
+			CapMB:    clamp(l.CapMB, Bounds["link_cap_mb"]),
+			CycleDay: clamp(l.CycleDay, Bounds["link_cycle_day"]),
+		}
+	}
+	return out
+}
+
+// LinkFor returns the configured allowance for an interface, with the
+// default cycle day filled in for anything absent. An interface with no
+// entry comes back with a zero cap, which means unmetered - the only safe
+// reading of a cap nobody set.
+//
+// This deliberately returns config's own type rather than the accounting
+// package's. Keeping this package free of project imports is what lets
+// every other package depend on it without thinking about cycles.
+func (c Config) LinkFor(iface string) LinkBudget {
+	l := c.Links[iface]
+	if l.CycleDay <= 0 {
+		l.CycleDay = Bounds["link_cycle_day"].Default
+	}
+	return l
 }
 
 func (c Config) EchoInterval() time.Duration {
@@ -638,15 +754,28 @@ func (h *Holder) Set(c Config) {
 // has to be re-established every time the file is atomically replaced.
 func (h *Holder) Watch(path string) {
 	var last time.Time
+	var lastSize int64
+	var seen bool
 	for range time.Tick(2 * time.Second) {
 		fi, err := os.Stat(path)
 		if err != nil {
 			continue // a missing file just means the defaults still stand
 		}
-		if !fi.ModTime().After(last) {
+		// Any change, not merely a newer one. Testing for "newer" looks
+		// obviously right and silently ignores two things that happen on
+		// a vehicle: a config restored from a backup with `cp -a`, which
+		// preserves the older mtime, and a file written before NTP
+		// stepped the clock backwards on a box with no RTC. Either
+		// leaves the daemon running settings nobody can see, forever,
+		// with no way to tell from the log.
+		//
+		// Size is compared alongside mtime because a rewrite inside the
+		// same filesystem timestamp tick is possible, and the two
+		// together are a good deal harder to collide with than either.
+		if seen && fi.ModTime().Equal(last) && fi.Size() == lastSize {
 			continue
 		}
-		last = fi.ModTime()
+		last, lastSize, seen = fi.ModTime(), fi.Size(), true
 
 		c, err := Load(path)
 		if err != nil {

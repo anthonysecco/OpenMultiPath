@@ -8,6 +8,7 @@ import (
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 	"github.com/anthonysecco/OpenMultiPath/internal/record"
+	"github.com/anthonysecco/OpenMultiPath/internal/usage"
 )
 
 // PathConfig is one physical WAN link the initiator sends duplicate copies
@@ -30,6 +31,7 @@ type InitiatorConfig struct {
 
 	Node        string         // this box's name, for the web interface
 	StatePath   string         // where to write the snapshot the interface reads
+	UsagePath   string         // where to keep billing-cycle totals; empty disables cost tracking
 	RecordPath  string         // where to append the history log; empty disables it
 	WGInterface string         // tunnel interface, read for its current MTU
 	Settings    *config.Holder // adjustable settings, reloaded while running
@@ -85,6 +87,22 @@ func RunInitiator(cfg InitiatorConfig) error {
 		// missing from the interface entirely.
 		sess.registerPath(uint8(i))
 		sess.nameFor(uint8(i), p.Name)
+	}
+
+	// Cost tracking, step 10. Initiator only: the RV owns the metered
+	// links, and home's connection is not billed by the gigabyte.
+	//
+	// A meter that fails to load its history still runs. Losing the
+	// cycle's accounting means the bands read green until the totals
+	// rebuild, which is the same behaviour as an unconfigured link and
+	// costs at worst some allowance - while refusing to start over a
+	// bookkeeping file would cost the vehicle its connection.
+	if cfg.UsagePath != "" {
+		sess.meter = usage.NewMeter(cfg.UsagePath)
+		if err := sess.meter.Load(); err != nil {
+			log.Printf("usage: %v; starting this cycle's totals from zero", err)
+		}
+		go sess.trackUsage()
 	}
 
 	go sess.logStats()

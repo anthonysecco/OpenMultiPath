@@ -174,6 +174,22 @@ type Path struct {
 	LimitKbps         float64 `json:"limit_kbps"`
 	CeilingAgeSeconds float64 `json:"ceiling_age_seconds"`
 
+	// Cost tracking, step 10. Budget is green, yellow or red;
+	// BudgetMetered says whether a cap is configured at all, which is
+	// what distinguishes "spending slowly" from "nobody set an
+	// allowance". UsedBytes and ProjectedBytes are this billing cycle,
+	// counting both directions because carriers bill both.
+	//
+	// UsedBytes is reported for an unmetered link too. Knowing what a
+	// link has carried is useful well before anybody decides to cap it,
+	// and it is the number somebody needs in order to pick a cap at all.
+	Budget         string  `json:"budget,omitempty"`
+	BudgetMetered  bool    `json:"budget_metered"`
+	CapBytes       uint64  `json:"cap_bytes,omitempty"`
+	UsedBytes      uint64  `json:"used_bytes"`
+	ProjectedBytes uint64  `json:"projected_bytes,omitempty"`
+	CycleStartUnix float64 `json:"cycle_start_unix,omitempty"`
+
 	// State is stable, unstable or down, and StateReason says what put it
 	// there. The reason matters as much as the state: "unstable (jitter)"
 	// and "unstable (below the tunnel floor)" call for entirely different

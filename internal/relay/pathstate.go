@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
+	"github.com/anthonysecco/OpenMultiPath/internal/usage"
 )
 
 // The three-state path machine from protocol.md.
@@ -83,6 +84,13 @@ type pathMetric struct {
 	// unusable means the path has been probed and cannot carry the tunnel
 	// floor. Distinct from "not yet probed", which is not a fault.
 	unusable bool
+
+	// budget is what this link has spent against its allowance, and the
+	// band that puts it in. The zero value is green and unmetered, which
+	// is what every link is until somebody configures a cap and what the
+	// responder's learned paths always are - it owns no interfaces and
+	// nothing it carries is billed to this vehicle.
+	budget usage.State
 
 	// bw is how much this path can carry, as far as anything has been able
 	// to establish. Deliberately not part of the state machine: a small
@@ -278,5 +286,19 @@ func (m *machine) score(now time.Duration, p pathMetric, c config.Config) float6
 	if m.flapping(now, c) {
 		r -= float64(c.FlapPenaltyR)
 	}
+
+	// The metered-link surcharge protocol.md's `penalty_i` asks for. A
+	// penalty and not a veto: architecture.md wants a red link carrying
+	// real-time when it is the only viable path, because a working call
+	// beats an overage. Subtracting rather than excluding expresses that
+	// exactly - a red path loses every comparison against a link that
+	// works, and wins by default when there is nothing to compare it to.
+	switch p.budget.Band {
+	case usage.Yellow:
+		r -= float64(c.BudgetYellowPenaltyR)
+	case usage.Red:
+		r -= float64(c.BudgetRedPenaltyR)
+	}
+
 	return clampFloat(r, 0, 100)
 }

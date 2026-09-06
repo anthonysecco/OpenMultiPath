@@ -198,6 +198,16 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		{"omp_path_transitions", "State changes within the flap window.", "gauge", func(p state.Path) float64 { return float64(p.Transitions) }},
 		{"omp_path_sending", "Whether traffic is currently going out of this path.", "gauge", func(p state.Path) float64 { return b2f(p.Sending) }},
 		{"omp_path_primary", "Whether this is the chosen path.", "gauge", func(p state.Path) float64 { return b2f(p.Primary) }},
+
+		// Cost tracking, step 10. Bytes rather than a band name, because
+		// the useful alert is on the number approaching the cap rather
+		// than on the band having already changed - by then the
+		// duplication is off and the bulk has moved.
+		{"omp_path_used_bytes", "Bytes carried on this link so far in its billing cycle, both directions.", "gauge", func(p state.Path) float64 { return float64(p.UsedBytes) }},
+		{"omp_path_cap_bytes", "Configured billing-cycle allowance; zero means unmetered.", "gauge", func(p state.Path) float64 { return float64(p.CapBytes) }},
+		{"omp_path_projected_bytes", "Whole-cycle total the current burn rate implies.", "gauge", func(p state.Path) float64 { return float64(p.ProjectedBytes) }},
+		{"omp_path_budget_yellow", "Whether this link is projected to run short of its allowance.", "gauge", func(p state.Path) float64 { return b2f(p.Budget == "yellow") }},
+		{"omp_path_budget_red", "Whether this link has spent its allowance.", "gauge", func(p state.Path) float64 { return b2f(p.Budget == "red") }},
 	} {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", m.name, m.help, m.name, m.typ)
 		for _, p := range snap.Paths {

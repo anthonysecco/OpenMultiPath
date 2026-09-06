@@ -9,6 +9,7 @@ import (
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
+	"github.com/anthonysecco/OpenMultiPath/internal/usage"
 )
 
 // The scheduler decides which path or paths each packet goes out of.
@@ -276,28 +277,56 @@ func (s *scheduler) steerBulk(d *decision, c config.Config, eligible []scored) {
 		carrying[id] = true
 	}
 
-	// Stickiness before ranking. Moving bulk between links reorders every
-	// TCP flow in progress on it, and the receiver reads reordering as
-	// loss and retransmits - so a scheduler that chased the better link
-	// each time two scores crossed would pay for the move over and over
-	// in exactly the traffic it was trying to speed up. Keep what is
-	// working while it still works.
-	if s.haveBulkPath && !carrying[s.bulkPath] && s.stillEligible(s.bulkPath, eligible) {
-		d.txBulk = []uint8{s.bulkPath}
-		return
-	}
-
+	// Pick the cheapest band first and the ranking second. Bulk is the
+	// second thing a budget sacrifices, after duplication and well before
+	// the call, so where it can spend matters more than how fast.
+	//
+	// A red link is skipped outright: the allowance is gone, and
+	// architecture.md reserves what is left of it for a call. Yellow is
+	// not - being on course to exceed a cap is not the same as having
+	// spent it, and stalling every download over a projection would be
+	// acting on an estimate as though it were a fact.
+	best, haveBest := uint8(0), false
+	var bestBand usage.Band
 	for _, sc := range eligible {
-		if carrying[sc.m.id] {
+		if carrying[sc.m.id] || sc.m.budget.Band == usage.Red {
 			continue
 		}
-		s.setBulkPath(sc.m.id, true)
-		d.txBulk = []uint8{sc.m.id}
+		// eligible is sorted best-first, so the first path at a given
+		// band is also the best-scoring one at that band.
+		if !haveBest || sc.m.budget.Band < bestBand {
+			best, bestBand, haveBest = sc.m.id, sc.m.budget.Band, true
+		}
+	}
+
+	// Stickiness, against scores but not against bands. Moving bulk
+	// between links reorders every TCP flow in progress on it, and the
+	// receiver reads reordering as loss and retransmits - so chasing the
+	// better link each time two scores crossed would pay for the move
+	// over and over in exactly the traffic it was meant to speed up.
+	//
+	// A band is different in kind. Scores cross many times an hour; a
+	// band changes a handful of times a month and means real money. So
+	// bulk holds its path against a better score and gives it up for a
+	// better band, and a link that turns red loses it immediately.
+	if s.haveBulkPath && !carrying[s.bulkPath] {
+		if m, ok := s.metricOf(s.bulkPath, eligible); ok &&
+			m.budget.Band != usage.Red &&
+			(!haveBest || m.budget.Band <= bestBand) {
+			d.txBulk = []uint8{s.bulkPath}
+			return
+		}
+	}
+
+	if haveBest {
+		s.setBulkPath(best, true)
+		d.txBulk = []uint8{best}
 		return
 	}
 
-	// Real-time is on everything usable. Bulk shares the primary, as
-	// buildTx left it, and admission control decides whether it flows.
+	// Real-time is on everything usable, or everything else is red. Bulk
+	// shares the primary, as buildTx left it, and admission control
+	// decides whether it flows.
 	s.setBulkPath(0, false)
 }
 
@@ -672,6 +701,15 @@ func (s *scheduler) offeredKbps(eligible []scored) float64 {
 // is already doing. A path with no capacity estimate always may - the gate
 // refuses on evidence, never on ignorance.
 func (s *scheduler) canTake(sc scored, loadKbps float64, c config.Config) bool {
+	// Duplication is the first thing sacrificed to a budget, and by some
+	// distance the easiest: a second copy is by definition redundant, so
+	// cutting it costs resilience but not function. architecture.md puts
+	// it ahead of bulk and well ahead of real-time for exactly that
+	// reason, and a duplicate is the one traffic here that doubles a
+	// link's spend to buy insurance nobody has yet needed.
+	if sc.m.budget.Band != usage.Green {
+		return false
+	}
 	return sc.m.bw.canCarry(loadKbps, c)
 }
 
