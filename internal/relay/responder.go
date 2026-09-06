@@ -126,6 +126,13 @@ func RunResponder(cfg ResponderConfig) error {
 		if h.Type != protocol.TypeData {
 			return
 		}
+
+		// One delivery per packet, however many copies arrive. See
+		// dedup.go: WireGuard's replay window used to do this
+		// underneath, and D-020 moved the daemon above it.
+		if !sess.deliver(h.GlobalSeq) {
+			return
+		}
 		if err := local.write(payload); err != nil {
 			log.Printf("responder: write to local endpoint failed: %v", err)
 		}

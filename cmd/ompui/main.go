@@ -177,6 +177,11 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	// What the classifier decided, cumulative. The transactional split is
 	// the only place the field data can say whether its thresholds are
 	// right, so it is worth graphing before anything is tuned on it.
+	fmt.Fprintf(w, "# HELP omp_duplicates_dropped_total Redundant copies discarded on arrival.\n")
+	fmt.Fprintf(w, "# TYPE omp_duplicates_dropped_total counter\n")
+	fmt.Fprintf(w, "omp_duplicates_dropped_total{node=%q} %d\n",
+		escape(snap.Node), snap.Scheduler.DuplicatesDropped)
+
 	fmt.Fprintf(w, "# HELP omp_class_packets_total Packets carried, by traffic class.\n")
 	fmt.Fprintf(w, "# TYPE omp_class_packets_total counter\n")
 	for _, c := range []struct {

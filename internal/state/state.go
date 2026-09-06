@@ -90,6 +90,11 @@ type Scheduler struct {
 	ClassBulk          uint64 `json:"class_bulk"`
 	ClassUnknown       uint64 `json:"class_unknown"`
 
+	// DuplicatesDropped is how many redundant copies arrived and were
+	// discarded - the measured cost of duplication, rather than an
+	// inference from the policy setting.
+	DuplicatesDropped uint64 `json:"duplicates_dropped"`
+
 	// Reason is the scheduler's own one-line account of the current
 	// choice, which is the first thing worth reading when the choice looks
 	// wrong.

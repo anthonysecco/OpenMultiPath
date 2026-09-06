@@ -302,6 +302,17 @@ type session struct {
 	paths map[uint8]*pathState
 	names map[uint8]string
 
+	// dedup drops the second copy of a duplicated packet. See dedup.go:
+	// below WireGuard the replay window underneath did this for free, and
+	// D-020 took that away.
+	dedup *dedupWindow
+
+	// dropped counts the copies it discarded, which is how much
+	// duplication actually cost. Worth a number rather than an
+	// inference: it is the difference between "redundancy is protecting
+	// the call" and "redundancy is being paid for and thrown away".
+	dupDropped atomic.Uint64
+
 	// meter accounts for what each link has carried this billing cycle.
 	// Nil on the responder, which owns no interfaces and whose traffic is
 	// not billed to this vehicle - and nil is a working state, not a
@@ -323,6 +334,7 @@ func newSession(cfg *config.Holder, node, role string) *session {
 		role:  role,
 		paths: make(map[uint8]*pathState),
 		names: make(map[uint8]string),
+		dedup: newDedupWindow(),
 	}
 	s.peerVersion.Store(protocol.MinVersion)
 	return s
@@ -472,6 +484,16 @@ func (s *session) remotes() []pathRemote {
 // traffic was seen" and "classification is not running" produce identical
 // path statistics, and telling them apart from a campground otherwise
 // means reading source.
+// deliver reports whether an arriving data packet is the first copy, and
+// counts it when it is not.
+func (s *session) deliver(seq uint32) bool {
+	if s.dedup.accept(seq) {
+		return true
+	}
+	s.dupDropped.Add(1)
+	return false
+}
+
 // noteWithheld records a packet admission control refused to send.
 func (s *session) noteWithheld() { s.withheldBulk.Add(1) }
 
@@ -1036,6 +1058,9 @@ func (s *session) logStats() {
 			log.Printf("traffic: %d real-time, %d transactional, %d bulk, %d unclassified",
 				rt, tx, bulk, unk)
 		}
+		if n := s.dupDropped.Load(); n > 0 {
+			log.Printf("duplication: %d redundant copies discarded on arrival", n)
+		}
 		if w := s.withheldBulk.Load(); w > 0 {
 			log.Printf("admission: %d bulk packets withheld to protect the call", w)
 		}
@@ -1275,6 +1300,7 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 	}
 	snap.Scheduler.ClassRealtime, snap.Scheduler.ClassTransactional,
 		snap.Scheduler.ClassBulk, snap.Scheduler.ClassUnknown = s.classTotals()
+	snap.Scheduler.DuplicatesDropped = s.dupDropped.Load()
 	// Bulk rides exactly one path once it has been steered; more than one
 	// only happens in blind mode, where the distinction has stopped
 	// meaning anything.

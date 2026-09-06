@@ -1606,3 +1606,64 @@ duplication before fixing that would amplify a live defect rather than pay for
 insurance. See the note in D-022's neighbourhood; the fix is a dedup window keyed
 on the header's global sequence, and it should land before any new duplication
 does.
+
+## D-038 · Deduplicate on arrival, because D-020 removed the thing that was doing it
+
+**Measured, not suspected:** twenty packets sent with duplication on, forty
+delivered on the far end's TUN. Every duplicated packet was arriving twice, and
+the remote peer replied twice, so it was visible outside the system.
+
+D-022 duplicates real-time across two paths so that losing one costs nothing.
+Both copies were always meant to arrive and exactly one to be delivered. Below
+WireGuard that happened for free: the daemon relayed ciphertext into a WireGuard
+interface, and WireGuard's replay window discarded the second copy. `initiator.go`
+said so in a comment. **D-020 moved the daemon above WireGuard**, where it writes
+plaintext into a TUN with no replay window underneath, and nothing replaced it.
+
+The comment stayed true-looking and stopped being true, which is why this survived
+a cutover that was otherwise verified end to end.
+
+**The fix** is a sliding window over the header's `GlobalSeq`, checked before the
+payload reaches the local endpoint. The sender allocates that sequence once per
+packet and stamps every copy with it, which is what makes this possible at all.
+
+### Fail open, not closed
+
+This is deduplication, not replay protection, and the difference decides the only
+interesting case: a packet older than the window. A security filter drops it,
+because replayed old traffic is the threat it exists for. Here the threat is a
+wasted copy and the cost of being wrong is a **lost** packet, so anything the
+window can no longer speak to is delivered.
+
+The window is sized so that case stays rare rather than being relied on. Two
+copies are sent at the same instant and separated only by the difference in path
+latency - hundreds of milliseconds at worst - while 4096 packets is four seconds
+at a thousand packets a second. It costs 512 bytes.
+
+### Two things the tests only caught by being attacked
+
+Both were found by removing the behaviour and watching what failed, and neither
+was covered by the tests written first.
+
+**Slot clearing needs a skipped range.** When the window jumps forward it skips
+sequences that have not arrived, and those slots still hold the bits of sequences
+exactly one window earlier. A contiguous walk never reaches this. A packet from
+the skipped range arriving late - the ordinary consequence of two paths with
+different latency - would read as a duplicate of something long gone.
+
+**Wraparound needs more than a few packets.** A plain `>` comparison instead of
+serial arithmetic still delivers the packets immediately after the counter wraps.
+It simply stops advancing the top, the window quietly stops sliding, and the
+damage appears thousands of packets later. A test that stepped over the wrap and
+stopped passed against the broken version.
+
+### Counted, not inferred
+
+`duplicates_dropped` is in the log, the state file and Prometheus. The number is
+the measured cost of the duplication policy, and it is the difference between
+"redundancy is protecting the call" and "redundancy is being paid for twice and
+thrown away" - which matters directly to D-034's budget bands, since the kernel
+counters bill both copies.
+
+**Consequence for D-037.** Duplicating connection establishment was deferred
+pending this. It is now unblocked.

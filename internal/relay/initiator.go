@@ -118,8 +118,9 @@ func RunInitiator(cfg InitiatorConfig) error {
 		go sess.recordHistory(w, cfg.WGInterface)
 	}
 
-	// Each physical path -> local WireGuard. Duplicates land here too;
-	// WireGuard's replay protection drops the redundant copy.
+	// Each physical path -> the local endpoint. Duplicates land here too
+	// and are dropped by the dedup window; below WireGuard the interface
+	// underneath used to do it, and D-020 took that away. See dedup.go.
 	paths := newPathSet(specs, sess, remoteAddr, func(id uint8, buf []byte) {
 		h, payload, ver, err := protocol.Parse(buf, sess.authKey)
 		if err != nil {
@@ -132,6 +133,13 @@ func RunInitiator(cfg InitiatorConfig) error {
 		// Reports and probes carry no tunnel traffic; they exist only to
 		// keep measurement flowing when data is not.
 		if h.Type != protocol.TypeData {
+			return
+		}
+
+		// One delivery per packet, however many copies arrive. See
+		// dedup.go: WireGuard's replay window used to do this
+		// underneath, and D-020 moved the daemon above it.
+		if !sess.deliver(h.GlobalSeq) {
 			return
 		}
 		if err := local.write(payload); err != nil {
