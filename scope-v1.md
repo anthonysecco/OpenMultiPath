@@ -16,6 +16,8 @@
 - Real-time class: single path, duplication, make-before-break, heavy stickiness
 - Bulk class: **single best path** for v1 (multipath deferred, see below)
 - Classification: STUN watching → vendor prefixes → behavioral heuristic, with flow cache
+- Three classes: real-time, **transactional** (page loads, DNS, API calls) and bulk,
+  with transactional split from bulk by sustained rate over a dwell (D-037)
 - Global MTU at minimum across eligible paths, PLPMTUD probing, floor 1280
 - Admission control to starve bulk when down to one degraded path
 - Cost-aware penalties from projected billing-cycle burn rate

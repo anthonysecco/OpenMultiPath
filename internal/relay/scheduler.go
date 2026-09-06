@@ -56,6 +56,16 @@ type decision struct {
 	tx     []uint8
 	txBulk []uint8
 
+	// txTrans is the transactional set: the primary alone.
+	//
+	// It follows real-time's path but never real-time's duplication.
+	// Transactional wants the same link - shortest round trip, least loss
+	// - and none of the redundancy, because a second copy of a web
+	// request is unbounded cost for a flow TCP already recovers in one
+	// RTT, and above WireGuard a duplicate is delivered twice rather than
+	// dropped by a replay window.
+	txTrans []uint8
+
 	// withholdBulk is step 9. True means bulk is not being sent at all
 	// this evaluation - dropped at the ingress rather than queued into a
 	// link whose queue is already hurting the call. The zero value admits,
@@ -190,16 +200,36 @@ func (s *scheduler) current() *decision { return s.cur.Load() }
 // this packet should go out of.
 // txPaths is the set of paths one packet of the given class goes out of.
 //
-// Anything not positively identified as real-time is carried as bulk. That
-// is D-027's asymmetry applied at the point it costs something: treating a
-// download as a call duplicates it over a metered link, while treating a
-// call as bulk costs it the duplication it might not have needed.
+// Real-time and transactional take the same path, and only bulk is sent
+// somewhere else.
+//
+// That is the simplification the third class buys. Both of the first two
+// want the same thing from a link - the shortest round trip and the least
+// loss - and differ only in what happens when it is not available. Bulk
+// is the one class that wants a fat pipe instead and does not care about
+// round trips, so the placement question is not three-way: it is "keep
+// the transfer away from everything else".
+//
+// Anything the classifier could not place rides with them. With three
+// classes the middle is the safe default (see internal/classify), and the
+// cost of being wrong is bounded either way: an unplaced flow is never
+// duplicated, and it moves off within a dwell if it turns out to be a
+// transfer.
 func (s *scheduler) txPaths(class uint8) []uint8 {
 	d := s.cur.Load()
-	if class == protocol.ClassRealtime {
+	switch class {
+	case protocol.ClassBulk:
+		return d.txBulk
+	case protocol.ClassRealtime:
 		return d.tx
+	default:
+		// Transactional, and anything still unplaced, which the
+		// classifier treats as transactional too.
+		if len(d.txTrans) == 0 {
+			return d.tx
+		}
+		return d.txTrans
 	}
-	return d.txBulk
 }
 
 // admit reports whether a packet of this class should be sent at all.
@@ -220,6 +250,28 @@ func (s *scheduler) admit(class uint8) bool {
 	if class == protocol.ClassRealtime {
 		return true
 	}
+
+	// Transactional is never gated, and this is the correction the class
+	// was really for.
+	//
+	// The gate is right for a download: dropping it costs a stall, TCP
+	// backs off, and the queue re-forms in a LAN client where it is free.
+	// It is wrong for a web request, which is small enough to cost the
+	// call nothing and short enough that a drop means seconds of dead air
+	// and a retry. Withholding it was the daemon destroying the traffic
+	// the user is watching in order to protect the traffic they are
+	// listening to.
+	//
+	// Priority rather than a reservation, deliberately. Once bulk is
+	// withheld the uplink drains, and transactional is small enough to
+	// fit in what is left - so the cheap answer is simply not to gate it.
+	// A real reservation means a shaper, and a shaper means sizing a
+	// bucket from numbers nobody has measured yet. That is v2's job, with
+	// the field data D-031 and this both lack.
+	if class == protocol.ClassTransactional {
+		return true
+	}
+
 	if !s.classifying.Load() {
 		return true
 	}
@@ -794,14 +846,19 @@ func (s *scheduler) buildTx(d *decision, c config.Config, eligible []scored, sen
 		d.blind = len(d.tx) > 0
 		d.reason = "no usable path, sending on everything bound"
 
-		// Blind mode sprays both classes alike. There is no measurement
+		// Blind mode sprays every class alike. There is no measurement
 		// left to tell them apart with, so withholding bulk would be
 		// acting on a distinction nothing can currently support.
 		d.txBulk = append(d.txBulk, d.tx...)
+		d.txTrans = append(d.txTrans, d.tx...)
 		return
 	}
 
 	d.tx = append(d.tx, s.primary)
+
+	// Transactional takes the primary and stops there, whatever
+	// duplication the branches below add for real-time.
+	d.txTrans = []uint8{s.primary}
 
 	// Bulk rides the primary and stops there, whatever follows. Every
 	// branch below adds paths for redundancy, and redundancy is for the

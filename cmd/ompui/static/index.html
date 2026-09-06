@@ -294,7 +294,33 @@ function renderScheduler(s) {
      </div>
      <p class="muted">${sc.reason || ""}</p>
      ${order ? `<p class="muted">Ranked: ${order}</p>` : ""}
+     ${classSplit(sc)}
      </div>`;
+}
+
+// What the classifier has decided, since the daemon started.
+//
+// Worth showing next to the path choice rather than buried in the
+// metrics: the transactional thresholds are guesses, and this is the only
+// place somebody watching the box can see whether they are plausible. A
+// split reading zero transactional, or zero bulk, is the detector telling
+// you it is not working.
+function classSplit(sc) {
+  const parts = [
+    ["real-time", sc.class_realtime],
+    ["transactional", sc.class_transactional],
+    ["bulk", sc.class_bulk],
+    ["unclassified", sc.class_unknown],
+  ].filter(([, n]) => typeof n === "number");
+  if (!parts.length) return "";
+
+  const total = parts.reduce((a, [, n]) => a + n, 0);
+  if (!total) {
+    return `<p class="muted" title="the daemon is below WireGuard, or nothing has been carried yet">Classified: nothing yet</p>`;
+  }
+  const shown = parts.map(([name, n]) =>
+    `${name} ${Math.round(n / total * 100)}%`).join("&nbsp;·&nbsp;");
+  return `<p class="muted" title="${total.toLocaleString()} packets since start">Classified: ${shown}</p>`;
 }
 
 function renderPaths(s) {

@@ -1503,3 +1503,106 @@ earlier and read before the probe completed - said the opposite.
 on the real-time path of exactly 1240 while a bulk flood rode the other physical
 link; LAN egress, DNS and both web interfaces healthy; routes reinstall themselves
 on daemon restart; `wg1`/`wg2`/`wgm` enabled at boot and `wg0` disabled.
+
+## D-037 · Transactional, a third class between the call and the download
+
+**Decision.** Traffic is real-time, **transactional**, or bulk. Transactional is
+small, latency-bound request/response traffic - a page load, a DNS lookup, an API
+call.
+
+"Not a call" was two different things with opposite needs. A download wants a fat
+pipe and does not care about round trips; a web request wants the shortest round
+trip and moves almost nothing. Carrying both as bulk had two consequences that
+only became visible once D-033 and D-031 were live:
+
+- D-033 steers bulk onto a path of its own, so a page load could be exiled onto
+  the high-latency standby link.
+- D-031 withholds everything that is not real-time when the shared path queues,
+  so on one degraded link **web browsing stopped rather than slowed**. The daemon
+  destroyed the traffic the user was watching to protect the traffic they were
+  listening to.
+
+The second is the stronger argument and it is a correction, not a feature.
+
+**Free on the wire.** The class field is two bits and used three values.
+
+### Detection is volume over time, not a verdict taken once
+
+HTTP/2 and HTTP/3 multiplex a page load and a large download onto one connection,
+so cumulative bytes says almost nothing about whether the user is waiting on a
+flow. What separates them is **duration**: a page load is a burst of a second or
+two and then idle; a transfer is sustained.
+
+So a rate held above `classify_bulk_kbps` for `classify_bulk_dwell_ms` demotes a
+flow to bulk, and falling below `classify_bulk_clear_kbps` for
+`classify_bulk_clear_ms` promotes it back. The dwell is the load-bearing knob, not
+the rate. `classify_bulk_bytes` is a backstop for a transfer fast enough to move
+serious volume inside the dwell window.
+
+The clear threshold is deliberately lower than the demote threshold. One line for
+both directions would flap the class of a flow every time a download paused, and
+every flap moves it between paths, which reorders it - paying for the move twice.
+
+**The cost of the dwell, stated plainly:** for its duration a new download rides
+the low-latency path. That is the deliberate trade. Calling a download
+transactional costs a few seconds of the shared path; calling a page load bulk
+costs every page load, which is the thing this exists to fix.
+
+**Every threshold is adjustable, and every one is a guess.** Nothing has been
+measured, step 5's drive has not happened, and the class split is exported to the
+log, the state file, Prometheus and the interface precisely so the field data can
+settle them. A split reading zero transactional, or zero bulk, is the detector
+saying it is not working.
+
+**TCP now takes a flow cache entry**, which it deliberately did not before.
+"Nothing about a TCP flow needs remembering" stopped being true the moment
+transactional existed: web requests are almost all TCP. **DNS is named rather than
+inferred** - resolution latency is felt directly in every page load, and waiting
+for a behavioural sample to place a handful of 80-byte lookups is the wrong answer
+for the flow whose latency the user notices most.
+
+### This reverses D-027
+
+Unknown now defaults to transactional. With two classes the safe guess was bulk,
+because guessing real-time duplicates an unidentified download over a metered
+link. With three, the safe guess is the middle: a flow nobody has placed has by
+definition not moved much data, so treating it as small is both the accurate guess
+and the cheap one. It is never duplicated, and it leaves the low-latency path
+within a dwell if it turns out to be a transfer.
+
+### Scheduling: only bulk is exiled
+
+Real-time and transactional want the same link, and differ only in what happens
+when it is not available. So the placement question is not three-way - it is "keep
+the transfer away from everything else", and D-033 becomes correct by deletion.
+
+Transactional takes the primary **and none of real-time's duplication**. A second
+copy of a request is unbounded cost for a flow TCP recovers in one RTT.
+
+**Admission: priority, not a reservation.** Transactional is never withheld. Once
+bulk is gone the uplink drains and transactional fits in what is left, so not
+gating it is the cheap and correct answer. A reservation means a shaper, and a
+shaper means sizing a bucket from numbers nobody has measured - which is v2's job,
+with the data both this and D-031 lack. The sacrifice order becomes **duplication
+→ bulk → transactional → real-time**.
+
+**Budget: transactional is not sacrificed to one.** It moves almost nothing, and
+yellow is a projection rather than a spent allowance. Keeping it on the primary is
+what stops a metered month also being a slow one.
+
+### Deferred: duplicating connection establishment
+
+Proposed and not built. Losing a SYN costs a full initial RTO - about a second,
+which reads as "the site is down" - while losing a mid-flow packet costs roughly
+one RTT via fast retransmit. Duplicating a handful of packets per connection is
+nearly free and removes the worst of the tail.
+
+It is deferred because of what building it uncovered: **above WireGuard nothing
+deduplicates.** `initiator.go` says duplicates are dropped by "WireGuard's replay
+protection", which was true below WireGuard where the daemon relayed ciphertext
+into a WireGuard interface. D-020 moved the daemon above it, so a duplicated
+packet is now written into the TUN twice and delivered twice. Adding more
+duplication before fixing that would amplify a live defect rather than pay for
+insurance. See the note in D-022's neighbourhood; the fix is a dedup window keyed
+on the header's global sequence, and it should land before any new duplication
+does.

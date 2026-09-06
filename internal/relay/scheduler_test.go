@@ -798,23 +798,96 @@ func TestBlindModeSpraysBothClasses(t *testing.T) {
 	}
 }
 
-// Anything not positively identified as real-time is carried as bulk -
-// D-027's asymmetry applied where it costs something.
-func TestUnknownClassIsCarriedAsBulk(t *testing.T) {
+// Transactional takes the call's path and none of the call's redundancy.
+//
+// The first half is the point of the class: a web request wants the same
+// link real-time wants - shortest round trip, least loss - and exiling it
+// with the downloads is what made page loads slow. The second half is the
+// invariant the old two-class test was really defending: a second copy of
+// a request is unbounded cost for a flow TCP recovers in one RTT.
+func TestTransactionalRidesTheCallsPathWithoutItsDuplication(t *testing.T) {
 	w := newWorld(t, path(0, 40), path(1, 60))
 	w.c.DuplicateMode = config.DuplicateAlways
+	w.s.cfg = config.NewHolder(w.c)
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	if len(d.tx) != 2 {
+		t.Fatalf("setup: real-time on %v, want both paths in always mode", d.tx)
+	}
+
+	trans := w.s.txPaths(protocol.ClassTransactional)
+	bulk := w.s.txPaths(protocol.ClassBulk)
+
+	if len(trans) != 1 || trans[0] != d.primary {
+		t.Errorf("transactional took %v, want the primary %d alone", trans, d.primary)
+	}
+	if sameSet(trans, bulk) && len(bulk) > 0 && bulk[0] != d.primary {
+		t.Errorf("transactional took %v, the same as bulk's %v; it was exiled with the downloads", trans, bulk)
+	}
+}
+
+// Anything the classifier could not place rides with transactional, not
+// with bulk. That reverses D-027 on purpose: with three classes the safe
+// default is the middle, because an unplaced flow has by definition not
+// moved much data.
+func TestUnknownRidesWithTransactional(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
 	w.tick(w.c.PromoteIntervals + 5)
 
-	unknown := w.s.txPaths(protocol.ClassUnknown)
-	bulk := w.s.txPaths(protocol.ClassBulk)
-	realtime := w.s.txPaths(protocol.ClassRealtime)
-
-	if len(unknown) != len(bulk) {
-		t.Errorf("unclassified traffic took %v, bulk took %v; they must match", unknown, bulk)
+	if !sameSet(w.s.txPaths(protocol.ClassUnknown), w.s.txPaths(protocol.ClassTransactional)) {
+		t.Errorf("unclassified took %v but transactional took %v",
+			w.s.txPaths(protocol.ClassUnknown), w.s.txPaths(protocol.ClassTransactional))
 	}
-	if len(unknown) >= len(realtime) {
-		t.Errorf("unclassified traffic took %v, as many paths as real-time's %v;"+
-			" an unidentified download must not be duplicated", unknown, realtime)
+}
+
+// The correction the class was really for. Admission control exists to
+// stop a download adding hundreds of milliseconds to a call; withholding
+// a web request instead destroys the traffic the user is watching to
+// protect the traffic they are listening to.
+func TestTransactionalIsNeverWithheld(t *testing.T) {
+	w := newWorld(t, path(0, 40))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	w.set(0, func(p *pathMetric) {
+		p.haveTx = true
+		p.txQueueMs = float64(w.c.AdmissionQueueDelayMs) * 4
+	})
+	d := w.tick(1)
+
+	if !d.withholdBulk {
+		t.Fatal("setup: the gate did not shut on a queueing sole path")
+	}
+	if !w.s.admit(protocol.ClassTransactional) {
+		t.Error("a web request was withheld to protect the call")
+	}
+	if !w.s.admit(protocol.ClassRealtime) {
+		t.Error("real-time withheld; it has an absolute reservation")
+	}
+	if w.s.admit(protocol.ClassBulk) {
+		t.Error("bulk admitted while the gate is shut; it is still the sacrificial class")
+	}
+}
+
+// Blind mode sprays every class alike, transactional included: there is
+// no measurement left to tell them apart with.
+func TestBlindModeSpraysTransactionalToo(t *testing.T) {
+	w := newWorld(t, path(0, 40), path(1, 60))
+	w.tick(w.c.PromoteIntervals + 5)
+
+	for _, id := range []uint8{0, 1} {
+		w.set(id, func(p *pathMetric) {
+			p.silentFor = w.c.DownSilence() * 2
+			p.sentSinceHeard = uint64(w.c.DownProbePackets) * 2
+		})
+	}
+	d := w.tick(3)
+
+	if !d.blind {
+		t.Fatal("expected blind mode with every path down")
+	}
+	if !sameSet(w.s.txPaths(protocol.ClassTransactional), d.tx) {
+		t.Errorf("blind mode sent transactional on %v and real-time on %v",
+			w.s.txPaths(protocol.ClassTransactional), d.tx)
 	}
 }
 

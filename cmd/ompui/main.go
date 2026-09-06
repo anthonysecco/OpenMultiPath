@@ -174,6 +174,42 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE omp_state_age_seconds gauge\n")
 	fmt.Fprintf(w, "omp_state_age_seconds %.3f\n", snap.Age().Seconds())
 
+	// What the classifier decided, cumulative. The transactional split is
+	// the only place the field data can say whether its thresholds are
+	// right, so it is worth graphing before anything is tuned on it.
+	fmt.Fprintf(w, "# HELP omp_class_packets_total Packets carried, by traffic class.\n")
+	fmt.Fprintf(w, "# TYPE omp_class_packets_total counter\n")
+	for _, c := range []struct {
+		name string
+		n    uint64
+	}{
+		{"realtime", snap.Scheduler.ClassRealtime},
+		{"transactional", snap.Scheduler.ClassTransactional},
+		{"bulk", snap.Scheduler.ClassBulk},
+		{"unclassified", snap.Scheduler.ClassUnknown},
+	} {
+		fmt.Fprintf(w, "omp_class_packets_total{node=%q,class=%q} %d\n",
+			escape(snap.Node), c.name, c.n)
+	}
+
+	// What the classifier decided, cumulative. The transactional split is
+	// the only place the field data can say whether its thresholds are
+	// right, so it is worth graphing before anything is tuned on it.
+	fmt.Fprintf(w, "# HELP omp_class_packets_total Packets carried, by traffic class.\n")
+	fmt.Fprintf(w, "# TYPE omp_class_packets_total counter\n")
+	for _, c := range []struct {
+		name string
+		n    uint64
+	}{
+		{"realtime", snap.Scheduler.ClassRealtime},
+		{"transactional", snap.Scheduler.ClassTransactional},
+		{"bulk", snap.Scheduler.ClassBulk},
+		{"unclassified", snap.Scheduler.ClassUnknown},
+	} {
+		fmt.Fprintf(w, "omp_class_packets_total{node=%q,class=%q} %d\n",
+			escape(snap.Node), c.name, c.n)
+	}
+
 	node := escape(snap.Node)
 	for _, m := range []struct {
 		name, help, typ string
