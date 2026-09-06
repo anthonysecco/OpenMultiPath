@@ -13,10 +13,13 @@ package main
 import (
 	"flag"
 	"log"
+	"net"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
+	"github.com/anthonysecco/OpenMultiPath/internal/linkdisco"
 	"github.com/anthonysecco/OpenMultiPath/internal/relay"
 )
 
@@ -34,7 +37,8 @@ func main() {
 	role := flag.String("role", "", "initiator (RV) or responder (home)")
 	loopback := flag.String("loopback", "127.0.0.1:51900", "initiator only: local address WireGuard's peer Endpoint points at (this daemon listens here)")
 	wgTarget := flag.String("wg-target", "127.0.0.1:51821", "responder only: local address WireGuard itself is listening on (its ListenPort)")
-	paths := flag.String("paths", "", "initiator only: comma-separated interface names, e.g. enp1s0,enp2s0; each may be given as name=ip to pin a local address instead of discovering it")
+	paths := flag.String("paths", "", "initiator only: comma-separated interface names, e.g. enp1s0,enp2s0; each may be given as name=ip to pin a local address instead of discovering it. \"auto\" detects the WAN uplinks itself")
+	lan := flag.String("lan", "10.0.0.0/24", "initiator only: the vehicle's own LAN subnet, excluded from -paths auto so the LAN side and the Wi-Fi lifeline are never taken for uplinks")
 	remote := flag.String("remote", "", "initiator only: home's public endpoint, e.g. 162.231.243.253:48219")
 	public := flag.String("public", "0.0.0.0:48219", "responder only: the forwarded public port to listen on")
 	statePath := flag.String("state", "/var/lib/openmultipath/state.json", "where to write the snapshot the web interface reads")
@@ -88,7 +92,7 @@ func main() {
 		cfg := relay.InitiatorConfig{
 			LoopbackAddr: *loopback,
 			RemoteAddr:   *remote,
-			Paths:        parsePaths(*paths),
+			Paths:        resolvePaths(*paths, *lan, *wgInterface),
 			Node:         *node,
 			StatePath:    *statePath,
 			RecordPath:   *recordPath,
@@ -119,6 +123,59 @@ func main() {
 	default:
 		log.Fatalf("ompd: -role must be \"initiator\" or \"responder\", got %q", *role)
 	}
+}
+
+// resolvePaths turns the -paths flag into a link list, auto-detecting the
+// WAN uplinks when it is "auto" and parsing the names otherwise.
+//
+// Auto-detection is a starting-gun, not a running watch: it enumerates once,
+// here, so a link that is genuinely down at boot is not detected this run.
+// That is the same trade the manual list makes - a named link that is down
+// is a path that is down, not an error - and once the daemon is up, linkwatch
+// rediscovers addresses on the links it already knows. A link that appears
+// for the first time after boot still has to be named; picking that up live
+// is a larger change than this.
+func resolvePaths(spec, lan, wg string) []relay.PathConfig {
+	if strings.TrimSpace(spec) != "auto" {
+		return parsePaths(spec)
+	}
+
+	var lanNet *net.IPNet
+	if lan != "" {
+		_, n, err := net.ParseCIDR(lan)
+		if err != nil {
+			log.Fatalf("ompd: invalid -lan %q: %v", lan, err)
+		}
+		lanNet = n
+	}
+
+	picked, reasons, err := linkdisco.Discover(lanNet, wg)
+	if err != nil {
+		log.Fatalf("ompd: -paths auto: %v", err)
+	}
+
+	// Say what was seen and why, both for the links taken and the ones
+	// passed over, so "it did not use my modem" is answerable from the log
+	// rather than by guessing at the heuristic.
+	names := make([]string, 0, len(reasons))
+	for name := range reasons {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		log.Printf("ompd: -paths auto: %s: %s", name, reasons[name])
+	}
+
+	if len(picked) == 0 {
+		log.Fatalf("ompd: -paths auto found no WAN uplinks; name them with -paths instead")
+	}
+	log.Printf("ompd: -paths auto selected %s", strings.Join(picked, ", "))
+
+	out := make([]relay.PathConfig, len(picked))
+	for i, name := range picked {
+		out[i] = relay.PathConfig{Name: name}
+	}
+	return out
 }
 
 // parsePaths reads the configured links. An entry is an interface name on

@@ -73,15 +73,19 @@ const probeTimeout = 2 * time.Second
 const probeMisses = 3
 
 // mtuCeilingRetryAfter is how long a ceiling holds before the search tries
-// again from scratch.
+// again from scratch - but only for a path that has never confirmed a
+// usable size (see buildProbe). A path that has found its MTU does not
+// re-probe on this timer at all; the one thing that can change its MTU is a
+// reconnect, which arrives as a down/up transition and restarts the search
+// through rearmMTU.
 //
 // Three misses at the default cadence is ~45s, which a real dead zone
 // clears easily - the scenario walkthrough in scope-v1.md has these running
 // to minutes. Without a retry, a ceiling set during an ordinary outage
-// would never be reconsidered: confirmed stays 0 forever, the path reads as
-// unable to carry the tunnel floor, and only a daemon restart clears it.
-// That is exactly backwards for a project whose premise is that links come
-// back.
+// would never be reconsidered on a path that never came up cleanly:
+// confirmed stays 0 forever, the path reads as unable to carry the tunnel
+// floor, and only a daemon restart clears it. That is exactly backwards for
+// a project whose premise is that links come back.
 const mtuCeilingRetryAfter = 3 * time.Minute
 
 // mtuProbe tracks the path MTU search for one path. Sizes are physical
@@ -714,9 +718,22 @@ func (s *session) buildProbe(pathID uint8, buf []byte) []byte {
 		}
 		p.mtu.probing = 0
 	}
-	if p.mtu.ceiling != 0 && now-p.mtu.ceilingAt >= mtuCeilingRetryAfter {
-		// Give the search another chance rather than trusting a ceiling
-		// that may only ever have meant "the path was down at the time."
+	if p.mtu.ceiling != 0 && p.mtu.confirmed < minUsablePathMTU &&
+		now-p.mtu.ceilingAt >= mtuCeilingRetryAfter {
+		// Retry only while the path has never found a size it can carry.
+		//
+		// A path that has confirmed a usable MTU is done: re-probing a
+		// stable link on a timer is management traffic on an idle path,
+		// spent on a number that does not change (D-039). What can change
+		// it - a reconnect onto a different bearer with a smaller MTU - comes
+		// back as a down/up transition, and rearmMTU restarts the search
+		// from scratch then.
+		//
+		// A path still stuck below the floor is the case the retry exists
+		// for: giving up permanently would strand a link that an outage,
+		// not a small MTU, put here - confirmed would sit at 0 forever and
+		// only a restart would clear it. That is the one place a timer is
+		// still worth its packets.
 		p.mtu.ceiling = 0
 	}
 	size := p.mtu.next()
@@ -744,6 +761,25 @@ func (s *session) buildProbe(pathID uint8, buf []byte) []byte {
 		s.mu.Unlock()
 	}
 	return out
+}
+
+// rearmMTU restarts a path's MTU search from scratch. The scheduler calls
+// it when a path comes up from down, which is the one moment its MTU can
+// have changed without anyone probing for it: a link that dropped and
+// reconnected may have come back on a different bearer - 5G to LTE, one
+// tower to the next - with a smaller MTU, and a packet still sized for the
+// old one would black-hole (D-039).
+//
+// confirmed is reset to zero rather than kept, precisely so a shrink is
+// caught: keeping the old, larger value would be the black hole. The path
+// is coming up from down, so it was carrying nothing to lose in the
+// meantime, and recommendedTunnelMTU already excludes a path whose
+// confirmed size is below the floor - so a path mid-re-search does not drag
+// the tunnel MTU down with it.
+func (s *session) rearmMTU(id uint8) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pathLocked(id).mtu = mtuProbe{}
 }
 
 // zeroPad is the filler MTU probes are padded with.

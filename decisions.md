@@ -1667,3 +1667,71 @@ counters bill both copies.
 
 **Consequence for D-037.** Duplicating connection establishment was deferred
 pending this. It is now unblocked.
+
+## D-039 · Probe MTU once when a link comes up, and auto-detect the uplinks
+
+Two changes to how the initiator treats its physical links, both aimed at the
+same thing: the RV should carry its own weight without an operator naming
+interfaces or paying for management traffic that measures a number that does
+not move.
+
+### MTU is probed on bring-up, not on a timer
+
+Path MTU was re-probed on `ProbeIntervalSeconds` (15s) forever. The search
+itself settles - once a size is confirmed and the next rung retires, `next()`
+returns 0 and no probe goes out - so a link that tops out at 1500 was already
+quiet. The waste was the other case: a cellular link whose real MTU is ~1420
+sets a ceiling at 1440, and a timer cleared that ceiling every three minutes and
+reached for 1440 again, forever, on every metered link. A padded probe burst
+every three minutes per link, spent on a number that changes only on a bearer
+change.
+
+**The change:** the ceiling-retry timer now fires only while a path has *never*
+confirmed a usable size (`confirmed < minUsablePathMTU`). A path that has found
+its MTU is done. The one thing that can change a settled path's MTU unseen is a
+reconnect onto a different bearer - 5G to LTE, one tower to the next - and that
+arrives as a down/up transition, so the scheduler calls `rearmMTU` on exactly
+that edge, resetting the search from scratch. `confirmed` is reset to zero
+rather than kept, precisely so a *shrink* is caught; keeping the old larger
+value would be the black hole.
+
+**What this gives up, on purpose.** An MTU that shrinks without the link ever
+going down - a pure bearer handover while staying associated - is not caught
+until the next down/up. The old timer did not catch that either: it only ever
+probed *upward* from `confirmed` and never rechecked whether `confirmed` still
+held. So this is not a regression, and the owner's call was explicit: MTU does
+not change much, and the perpetual probe was not worth its packets. The path
+still stranded below the floor by an outage keeps retrying, because there the
+timer is buying recovery, not re-measuring a constant.
+
+### The vehicle detects its own uplinks
+
+`-paths` still takes an explicit list, but `-paths auto` now enumerates the
+interfaces and picks the WAN uplinks itself (`internal/linkdisco`). A uplink is
+an interface that is up, carries a routable IPv4 address, and is neither the LAN
+side (excluded by `-lan`, default `10.0.0.0/24`) nor virtual (loopback, `wg*`,
+`omp*`, bridges, veths, `tailscale*`, and friends by name).
+
+The LAN exclusion is load-bearing for more than tidiness: the out-of-band Wi-Fi
+lifeline lives in the LAN subnet by design, so excluding the LAN also keeps
+project traffic off the one link that has to stay clear for recovery.
+
+**Deliberately blunt.** scope-v1.md's install design asks for type-aware
+classification - ModemManager for cellular, the dish's address for Starlink.
+This is the enumeration half only; type is a refinement on top of a working
+list, not a prerequisite for one. And it is a starting-gun, not a running watch:
+it enumerates once at startup, so a link genuinely down at boot is not picked up
+this run - the same trade the manual list already makes - and an operator can
+still name links explicitly. Picking up a brand-new interface live is a larger
+change than this.
+
+The selection is a pure function of a description of the interfaces, so "picks
+both modems, ignores the LAN and the tunnels" is a bench test rather than
+something only the vehicle can prove. The running RV's exact interface list is
+pinned as a regression test, validated against the vehicle on 2026-09-06: the
+same `enp1s0, enp2s0` it was being run with by hand.
+
+Path ids are indices into the selected list, and they carry a path's whole
+measurement history across restarts, so the list is sorted by name - a link
+keeps its identity from one boot to the next rather than being shuffled by
+whatever order the kernel enumerated.

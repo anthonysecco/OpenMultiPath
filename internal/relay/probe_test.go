@@ -283,3 +283,86 @@ func TestBusyPathDoesNotSuppressReportsOnIdlePaths(t *testing.T) {
 		t.Error("the idle path is not due for a report; it would never be measured again")
 	}
 }
+
+// A path that has found a usable MTU stops probing and stays stopped. The
+// old behaviour cleared any ceiling every few minutes and reached for the
+// next rung again forever, which on a cellular link that tops out below
+// 1500 is a probe burst every retry interval for a number that does not
+// change - management traffic on an otherwise idle path (D-039).
+func TestConvergedPathStopsProbing(t *testing.T) {
+	s := newTestSession()
+	s.registerPath(0)
+
+	// Confirm a usable size, then retire the next rung as unreachable, so
+	// the search has settled with a ceiling above a usable floor.
+	s.mu.Lock()
+	s.paths[0].mtu.confirmed = mtuLadder[1]
+	s.paths[0].mtu.ceiling = mtuLadder[2]
+	s.paths[0].mtu.ceilingAt = s.elapsed()
+	s.mu.Unlock()
+
+	if s.paths[0].mtu.confirmed < minUsablePathMTU {
+		t.Fatalf("test setup: confirmed %d is below the floor %d",
+			s.paths[0].mtu.confirmed, minUsablePathMTU)
+	}
+	if pkt := s.buildProbe(0, nil); pkt != nil {
+		t.Fatalf("a settled path probed at %d bytes", len(pkt))
+	}
+
+	// Age well past the retry window: a converged path must not reopen.
+	s.mu.Lock()
+	s.paths[0].mtu.ceilingAt = s.elapsed() - 10*mtuCeilingRetryAfter
+	s.mu.Unlock()
+	if pkt := s.buildProbe(0, nil); pkt != nil {
+		t.Fatalf("a converged path reopened its search after %v and probed at %d bytes",
+			mtuCeilingRetryAfter, len(pkt))
+	}
+}
+
+// A path stranded below the floor - every size failed, so confirmed is
+// still 0 - is the one case the timer still fires for. Giving up there
+// permanently would strand a link an outage, not a small MTU, put here.
+func TestStrandedPathStillRetries(t *testing.T) {
+	s := newTestSession()
+	s.registerPath(0)
+
+	s.mu.Lock()
+	s.paths[0].mtu.ceiling = mtuLadder[0] // even the floor rung failed
+	s.paths[0].mtu.ceilingAt = s.elapsed() - 2*mtuCeilingRetryAfter
+	s.mu.Unlock()
+
+	if pkt := s.buildProbe(0, nil); pkt == nil {
+		t.Fatal("a path stuck below the floor gave up instead of retrying")
+	}
+}
+
+// Coming up from down restarts the search, because a reconnect may have
+// landed on a bearer with a smaller MTU and the old confirmed size would
+// black-hole. rearmMTU is what the scheduler calls on that transition.
+func TestRearmRestartsTheSearchAfterRecovery(t *testing.T) {
+	s := newTestSession()
+	s.registerPath(0)
+
+	s.mu.Lock()
+	s.paths[0].mtu.confirmed = 1500
+	s.paths[0].mtu.ceiling = 0
+	s.mu.Unlock()
+
+	// A settled path at the top of the ladder produces no probe.
+	if pkt := s.buildProbe(0, nil); pkt != nil {
+		t.Fatalf("a path confirmed at 1500 probed at %d bytes", len(pkt))
+	}
+
+	s.rearmMTU(0)
+
+	if got := s.paths[0].mtu.confirmed; got != 0 {
+		t.Fatalf("confirmed = %d after rearm, want 0 so a smaller MTU is caught", got)
+	}
+	pkt := s.buildProbe(0, nil)
+	if pkt == nil {
+		t.Fatal("no probe after rearm; the search did not restart")
+	}
+	if want := mtuLadder[0] - ipUDPOverhead; len(pkt) != want {
+		t.Errorf("first probe after rearm is %d bytes, want the floor rung %d", len(pkt), want)
+	}
+}

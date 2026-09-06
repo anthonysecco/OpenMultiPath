@@ -524,7 +524,15 @@ func (s *scheduler) evaluate(now time.Duration, c config.Config) {
 			mach = &machine{reason: "not yet measured"}
 			s.machines[p.id] = mach
 		}
+		prev := mach.state
 		if mach.evaluate(now, p, c) {
+			// A path coming up from down is the one moment its MTU can
+			// have changed unseen - a reconnect onto a different bearer -
+			// so restart its MTU search here rather than re-probing every
+			// path on a timer forever (D-039).
+			if s.sess != nil && prev == stateDown && mach.state != stateDown {
+				s.sess.rearmMTU(p.id)
+			}
 			log.Printf("path %d (%s): %s (%s)", p.id, p.name, mach.state, mach.reason)
 		}
 		all = append(all, scored{
