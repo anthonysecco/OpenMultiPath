@@ -185,6 +185,7 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PathID  *uint8 `json:"path_id"`
 		Seconds int    `json:"seconds"`
+		Streams int    `json:"streams"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PathID == nil {
 		http.Error(w, "expected a JSON body with a path_id", http.StatusBadRequest)
@@ -195,6 +196,12 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 	// minutes.
 	if req.Seconds < 1 || req.Seconds > 30 {
 		req.Seconds = 10
+	}
+	// Parallel streams by default: a single stream over the tunnel is
+	// window-limited and reads far below the real capacity. Clamp so a bad
+	// value cannot open hundreds of connections.
+	if req.Streams < 1 || req.Streams > 32 {
+		req.Streams = 8
 	}
 
 	snap, err := state.Read(s.statePath)
@@ -249,6 +256,7 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 		Server:  host,
 		Port:    port,
 		Seconds: req.Seconds,
+		Streams: req.Streams,
 	})
 
 	out := map[string]any{

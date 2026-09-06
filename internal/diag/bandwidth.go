@@ -31,18 +31,29 @@ type Options struct {
 	Server  string // iperf3 server address, e.g. "10.20.1.1"
 	Port    int    // iperf3 server port
 	Seconds int    // test duration
+	Streams int    // parallel TCP streams; <=1 runs a single stream
 }
 
 // Args is the iperf3 command line for these options. Split out from the run
 // so the invocation can be asserted in a test without a server to talk to.
+//
+// Parallel streams matter here: a single TCP stream over the tunnel's RTT and
+// smaller MSS is window-limited and reads far below the link's real capacity -
+// on the vehicle a single stream measured 5 Mbps where eight measured 30 on
+// the same path. The scheduler carries many flows at once, so the aggregate a
+// handful of streams reveals is the honest figure to compare against.
 func (o Options) Args() []string {
-	return []string{
+	args := []string{
 		"-c", o.Server,
 		"-p", strconv.Itoa(o.Port),
 		"-t", strconv.Itoa(o.Seconds),
 		"--bind-dev", o.Iface,
 		"-J",
 	}
+	if o.Streams > 1 {
+		args = append(args, "-P", strconv.Itoa(o.Streams))
+	}
+	return args
 }
 
 // Result is the outcome of a run, in the units the interface shows.

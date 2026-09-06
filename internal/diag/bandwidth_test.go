@@ -15,6 +15,19 @@ func TestArgsPinToInterface(t *testing.T) {
 			t.Errorf("args %q missing %q", got, want)
 		}
 	}
+	// No -P when streams is unset: that is a single stream.
+	if strings.Contains(got, "-P") {
+		t.Errorf("args %q has -P with no streams set", got)
+	}
+}
+
+// Parallel streams are what make the tunnel test read the real capacity
+// rather than a single stream's window-limited floor.
+func TestArgsParallelStreams(t *testing.T) {
+	got := strings.Join(Options{Iface: "wg1", Server: "10.20.1.1", Port: 5201, Seconds: 5, Streams: 8}.Args(), " ")
+	if !strings.Contains(got, "-P 8") {
+		t.Errorf("args %q missing -P 8", got)
+	}
 }
 
 // A normal client report yields the uplink (sum_sent) rate in Mbps.

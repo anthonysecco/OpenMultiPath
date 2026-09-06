@@ -486,7 +486,7 @@ function diagBlock(owns, p) {
     <div class="diag-row">
       <button class="diag-btn" ${d.iperf && d.iperf.running ? "disabled" : ""} onclick="runBandwidthTest(${p.id})">
         ${d.iperf && d.iperf.running ? "Testing…" : "Test uplink (iperf)"}</button>
-      <span class="muted" title="A real saturating upload over the tunnel to home, to check the passive estimate. Spends uplink data - a diagnostic, not something to leave running on a metered link.">tunnel uplink to home · spends uplink data</span>
+      <span class="muted" title="A real saturating upload over the tunnel to home, in parallel streams so it reads the tunnel's actual capacity rather than a single stream's window-limited floor. Spends uplink data - a diagnostic, not something to leave running on a metered link.">tunnel uplink to home, parallel · spends uplink data</span>
       <div class="diag-result">${iperfResultHTML(d.iperf)}</div>
     </div>
     <div class="diag-row">
@@ -506,7 +506,7 @@ function iperfResultHTML(d) {
   const est = d.est || {};
   const estStr = est.ceiling_known ? rate(est.ceiling_kbps)
     : (est.ceiling_age_seconds >= 0 ? "≥ " + rate(est.proven_kbps) : "unmeasured");
-  return `<strong>${d.mbps.toFixed(1)} Mbps</strong> up to home`
+  return `<strong>${d.mbps.toFixed(1)} Mbps</strong> up to home (aggregate)`
     + (d.retransmits ? ` · ${d.retransmits} retransmits` : "")
     + ` · estimator says ${estStr}`;
 }
