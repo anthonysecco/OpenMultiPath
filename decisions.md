@@ -1317,3 +1317,118 @@ config backup on the RV and watching the band stay red.
 **Not done here.** architecture.md's deferrable bulk - queuing backups and updates
 until an unmetered link appears - is a larger capability than a band, needs
 somewhere to defer *to*, and is not part of this.
+
+## D-035 · The watchdog is shell, and the fallback leaves the tunnel up
+
+Step 11, and scope-v1.md calls it the highest-value reliability investment in the
+project: "a bad update that breaks the tunnel from 800 miles away is
+unrecoverable without fallback working."
+
+**Shell, not Go.** The watchdog exists to notice that the Go binary is broken, so
+it shares nothing with it - not a library, not a toolchain, not a config parser.
+A watchdog that fails to build, or that panics on the same malformed state file
+that took the daemon down, is not a watchdog. It reads two files and runs `ping`,
+and every decision in it can be followed at 2am in a campground without a
+compiler.
+
+**Three components, deliberately separate.** `omp-fallback` changes routing and
+nothing else. `omp-watchdog` decides and calls it. `omp-deploy` installs a
+version and starts its probation. Each is runnable by hand, which matters because
+the first thing an operator wants at 2am is to do one of these steps without the
+other two.
+
+### Health is two signals, and both must hold
+
+A state file that has stopped advancing catches the one failure systemd cannot
+see: a process that is running and has stopped doing anything. `Restart=always`
+handles a daemon that exits; nothing in systemd handles a daemon that is wedged.
+
+A ping over the tunnel catches the opposite: a daemon that is perfectly healthy
+while the far end is unreachable. Requiring both is what separates "working" from
+"looks working", and either alone has a large blind spot.
+
+### The fallback leaves the tunnel interface up
+
+This is the design's one non-obvious decision and it was originally got wrong.
+
+Taking `wg0` down is the obvious way to stop using it. It is also a trap: the
+watchdog decides the tunnel has recovered by probing it, so a fallback that
+removes the interface removes the only evidence that could ever end the fallback.
+The vehicle would egress directly - which works - and stay that way until somebody
+drove out to it. Fallback would have been a one-way door.
+
+So what moves is one `ip rule`. wg-quick's catch-all at priority 2000 sends
+default traffic into the tunnel; in fallback that priority holds ours instead,
+pointing at a table with a single default route out the chosen link. Everything
+more specific - the LAN, the tunnel's own subnet, connected routes - is matched by
+wg-quick's rule at 1999 before either is reached, so `wg0` stays configured and
+reachable and the watchdog can keep asking whether the tunnel is back.
+
+Leaving restores wg-quick's rules by cycling the interface with the tool that owns
+them, rather than reconstructing a rule from a string scraped out of `ip rule
+show`. That costs a second of tunnel downtime at the moment the tunnel is being
+restored anyway, and it cannot drift as wg-quick changes.
+
+### Sustained in, longer out
+
+Four failing checks at a 5 s cadence to enter, twelve good ones to leave: D-011's
+15-30 s in and ~60 s out. Every transition breaks NAT state and kills in-flight
+sessions, so flapping between tunnel and fallback is worse than sitting in either.
+A canyon is not a fault.
+
+### Rollback is a probation window, not a crash counter
+
+`omp-deploy` keeps the previous binary and writes a **deadline**. The watchdog
+promotes the new version when the tunnel has been healthy past that deadline, and
+rolls back when the tunnel has been unhealthy while the marker still exists.
+
+A deadline rather than a countdown because it survives the watchdog restarting,
+the daemon restarting, and the box rebooting mid-window - and a binary that
+crashes the box on boot is exactly the one that most needs undoing.
+
+Gated on the marker rather than on failure alone, because otherwise a watchdog
+would eventually "roll back" a perfectly good version because the vehicle drove
+into a dead zone, which is a far more common event than a bad binary. And rollback
+is tried *before* fallback, because it restores a working tunnel rather than a
+working workaround.
+
+The failed binary is kept as `ompd.failed`. Whatever it did wrong is worth
+reading, and out here it is the only copy of it.
+
+**Rejected: systemd's own `WatchdogSec`.** It restarts a process that stops
+pinging its supervisor, which is a subset of what is needed here - it cannot
+notice an unreachable far end, cannot change routing, and cannot undo a version.
+It would also have to be implemented inside the daemon, which is the component
+assumed to be broken.
+
+**Rejected: falling back by metric on the existing default routes.** wg-quick's
+rule at 1999 suppresses default routes in the main table, so a metric change there
+is simply ignored. It looks like it should work, which is worse than not working.
+
+**Not enabled for fallback on the responder.** Home has one connection and nothing
+to route around; a tunnel that is not working is the vehicle's problem to solve.
+Its watchdog runs for the rollback half only, because home is the end nobody can
+power-cycle by hand.
+
+### What the live test found that the fake vehicle could not
+
+The rollback restored the correct binary and the daemon still did not come up.
+
+A bad build crash-loops - that is the whole reason the rollback is running - and a
+few restarts inside `StartLimitIntervalSec` latch the unit into
+`start-limit-hit`. systemd then refuses `restart` outright. So the rollback would
+have failed this way **every single time it was needed**, which is the worst
+possible shape for a bug in a recovery path: invisible until the recovery matters,
+and then guaranteed.
+
+The watchdog now clears the limit before restarting. The fake vehicle could not
+have found this, because its fake `systemctl` had no start limit to hit - a
+recording fake tells you what was asked for, never what the real thing would have
+refused. That is the argument for running the thing against a genuinely broken
+binary on real hardware, and it is the reason scope-v1.md says to test the
+rollback before needing it rather than merely to write one.
+
+Verified by a fake vehicle for the decisions - every external command replaced with
+a recording fake, so a canyon, a wedged daemon and a bad upgrade can be produced on
+demand, and each behaviour named above confirmed to fail when it is removed - and
+then on the real RV for the parts only hardware can answer.

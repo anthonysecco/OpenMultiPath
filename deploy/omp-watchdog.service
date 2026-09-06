@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenMultiPath watchdog: tunnel health, fallback, and upgrade rollback
+Documentation=file:///opt/openmultipath/decisions.md
+
+# Deliberately not Requires= or After= ompd. The watchdog exists to
+# notice that ompd is broken, so binding its lifecycle to ompd's is
+# exactly backwards: a dependency would take the watchdog down at the
+# moment it is needed.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/omp-watchdog
+
+# A watchdog that hangs is a watchdog that is not watching. The timer
+# fires again regardless, so a stuck run is cut rather than accumulated.
+TimeoutStartSec=20

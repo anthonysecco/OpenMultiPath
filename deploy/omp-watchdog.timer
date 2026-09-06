@@ -1,0 +1,17 @@
+[Unit]
+Description=Run the OpenMultiPath watchdog every few seconds
+
+[Timer]
+# From boot rather than from a wall clock: the vehicle's clock is not
+# believable until NTP completes, which on a cold boot in a campground
+# can be minutes.
+OnBootSec=30
+OnUnitActiveSec=5
+AccuracySec=1
+
+# The watchdog must run even while the box is busy recovering, which is
+# the only time it matters.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

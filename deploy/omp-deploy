@@ -1,0 +1,59 @@
+#!/bin/bash
+# Install a new ompd, keeping the old one and putting the new one on
+# probation so the watchdog can undo this without anybody driving out to
+# the vehicle.
+#
+#     omp-deploy /path/to/new/ompd [probation-seconds]
+#
+# scope-v1.md: "A bad update that breaks the tunnel from 800 miles away
+# is unrecoverable without fallback working. Keep the previous version,
+# boot into it on watchdog failure, and test the rollback before needing
+# it." This is the first half; omp-watchdog is the second.
+#
+# The probation window is a deadline, not a countdown, so it survives the
+# watchdog restarting, the daemon restarting, and the box rebooting in
+# the middle of it. A countdown that resets on reboot would confirm a
+# binary that crashes the box on boot, which is precisely the binary that
+# most needs undoing.
+set -e
+
+NEW="$1"
+SECONDS_ON_PROBATION="${2:-${OMP_PROBATION_SECONDS:-300}}"
+
+BINDIR="${OMP_BIN:-/usr/local/bin}"
+RUNDIR="${OMP_RUN:-/run/openmultipath}"
+
+if [ -z "$NEW" ] || [ ! -f "$NEW" ]; then
+	echo "usage: omp-deploy /path/to/new/ompd [probation-seconds]" >&2
+	exit 2
+fi
+
+# Refuse to deploy something that cannot run. A binary for the wrong
+# architecture, or a truncated copy off a marginal Wi-Fi link, would
+# otherwise be installed, fail to start, and have to be undone by the
+# watchdog - which works, but takes the tunnel down for the whole
+# probation window to learn something checkable in advance.
+if ! "$NEW" -role 2>&1 | head -1 | grep -qiE "role|flag|usage"; then
+	echo "omp-deploy: $NEW does not run on this box; refusing to install it" >&2
+	exit 1
+fi
+
+mkdir -p "$RUNDIR"
+
+# Keep exactly one previous version. More would be a version history
+# nobody curates, and the useful question out here is only ever "the one
+# before this one".
+if [ -f "$BINDIR/ompd" ]; then
+	cp -a "$BINDIR/ompd" "$BINDIR/ompd.prev"
+fi
+
+install -m 0755 "$NEW" "$BINDIR/ompd"
+
+# The deadline the watchdog compares against.
+echo $(( $(date +%s) + SECONDS_ON_PROBATION )) > "$RUNDIR/probation"
+
+systemctl restart ompd
+
+echo "omp-deploy: installed, on probation for ${SECONDS_ON_PROBATION}s"
+echo "omp-deploy: previous version kept at $BINDIR/ompd.prev"
+echo "omp-deploy: the watchdog will roll back on its own if the tunnel does not come back"

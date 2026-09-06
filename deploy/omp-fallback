@@ -1,0 +1,215 @@
+#!/bin/bash
+# Fallback: dump traffic straight onto the best physical link when the
+# tunnel is unrecoverable. D-011 and architecture.md's "Fallback".
+#
+#     omp-fallback on|off|status
+#
+# This is the dumb working state of principle 5. Everything the daemon
+# does - sequencing, scheduling, duplication, classification - is gone,
+# and the vehicle has a plain unencrypted default route out one WAN link.
+# That is a deliberate trade: not a corporate scenario, so unencrypted
+# direct egress beats no connectivity at all.
+#
+# Nothing here reconstructs wg-quick's internals, and the tunnel is
+# deliberately left *up*.
+#
+# Taking it down looks like the obvious way to stop using it, and it is a
+# trap: the watchdog decides the tunnel has recovered by probing it, so a
+# fallback that removes the interface removes the only evidence that
+# could ever end the fallback. The vehicle would egress directly, which
+# works, and stay that way until somebody drove out to it.
+#
+# So what moves is one ip rule. wg-quick's own rule at priority 2000 is
+# the catch-all that sends default traffic into the tunnel; while in
+# fallback that priority holds ours instead, pointing at a table with a
+# single default route out the chosen link. Everything more specific -
+# the LAN, the tunnel's own subnet, connected routes - is matched by
+# wg-quick's rule at 1999 before either of them is reached, so the
+# interface stays reachable and the watchdog can keep asking it whether
+# the tunnel is back.
+#
+# Leaving restores wg-quick's rules by cycling the interface with the
+# tool that owns them, rather than by reconstructing a rule from a string
+# scraped out of `ip rule show`. That costs a second of tunnel downtime
+# at the exact moment the tunnel is being restored anyway.
+
+set +e
+
+STATE="${OMP_STATE:-/var/lib/openmultipath/state.json}"
+RUNDIR="${OMP_RUN:-/run/openmultipath}"
+MARKER="$RUNDIR/fallback"
+ORDER_FILE="${OMP_FALLBACK_ORDER:-/etc/openmultipath/fallback.order}"
+WG="${OMP_WG_INTERFACE:-wg0}"
+LAN="${OMP_LAN:-10.0.0.0/24}"
+
+# The routing table holding our single default route, and the rule
+# priority wg-quick uses for its tunnel catch-all - which is the one we
+# borrow while in fallback.
+TABLE="${OMP_FALLBACK_TABLE:-2500}"
+RULE_PRIO="${OMP_FALLBACK_PRIO:-2000}"
+NFT_TABLE="omp_fallback"
+
+# state_age_seconds is how stale the scheduler's opinion is. A dead
+# scheduler is the normal case here - it is why we are in fallback - so
+# its file is treated as evidence only while it is fresh.
+state_age_seconds() {
+	local mtime now
+	mtime=$(stat -c %Y "$STATE" 2>/dev/null) || return 1
+	now=$(date +%s)
+	echo $(( now - mtime ))
+}
+
+# ranked_links prints interface names best first, from whichever source
+# can still be trusted.
+#
+# architecture.md is explicit that the choice must never be undefined:
+# the scheduler is the thing that died, so it cannot be asked, and it
+# therefore writes its ranking down continuously for exactly this moment.
+# Three sources in descending order of authority - the scheduler's last
+# opinion, an operator's static order, and finally whatever has a default
+# route - because the one unacceptable outcome is picking nothing.
+ranked_links() {
+	local age
+	age=$(state_age_seconds)
+	if [ -n "$age" ] && [ "$age" -le "${OMP_STATE_MAX_AGE:-120}" ] && command -v python3 >/dev/null 2>&1; then
+		# python3 rather than grep because a wrong answer here is worse
+		# than no answer, and if it is missing the static order below is
+		# a perfectly good fallback for the fallback.
+		python3 - "$STATE" <<-'PY' && return 0
+			import json, sys
+			try:
+			    d = json.load(open(sys.argv[1]))
+			except Exception:
+			    sys.exit(1)
+			names = {p["id"]: p.get("name", "") for p in d.get("paths", [])}
+			out = [names.get(i, "") for i in d.get("scheduler", {}).get("ranking", [])]
+			out = [n for n in out if n]
+			if not out:
+			    sys.exit(1)
+			print("\n".join(out))
+		PY
+	fi
+
+	if [ -r "$ORDER_FILE" ]; then
+		grep -vE '^\s*(#|$)' "$ORDER_FILE" && return 0
+	fi
+
+	# Last resort: whatever currently has a default route, in the
+	# kernel's own preference order. Never leave the choice undefined.
+	ip -o route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'
+}
+
+# gateway_for prints the next hop for an interface's default route.
+gateway_for() {
+	ip -o route show default dev "$1" 2>/dev/null |
+		awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}'
+}
+
+# usable_link prints the first ranked interface that is up and has a
+# gateway. A ranking entry for a modem that has since dropped off is not
+# a reason to give up; it is a reason to take the next one.
+usable_link() {
+	local dev gw
+	while read -r dev; do
+		[ -z "$dev" ] && continue
+		[ "$dev" = "$WG" ] && continue
+		ip link show "$dev" 2>/dev/null | grep -q "state UP" || continue
+		gw=$(gateway_for "$dev")
+		[ -z "$gw" ] && continue
+		echo "$dev $gw"
+		return 0
+	done < <(ranked_links)
+	return 1
+}
+
+enter() {
+	local dev gw pick
+	pick=$(usable_link)
+	if [ -z "$pick" ]; then
+		echo "omp-fallback: no link has a usable default route; leaving the tunnel alone" >&2
+		return 1
+	fi
+	dev=${pick%% *}
+	gw=${pick##* }
+
+	mkdir -p "$RUNDIR"
+	echo "omp-fallback: entering fallback, direct egress via $dev ($gw)"
+
+	# One default route, in a table of its own. Only default-destined
+	# traffic ever reaches it: anything with a more specific route has
+	# already been matched by wg-quick's rule at 1999.
+	ip route replace default via "$gw" dev "$dev" table "$TABLE" 2>/dev/null
+
+	# Take over the catch-all priority. The tunnel interface stays up so
+	# the watchdog can keep probing it - see the header.
+	ip rule del priority "$RULE_PRIO" 2>/dev/null
+	ip rule add from all lookup "$TABLE" priority "$RULE_PRIO" 2>/dev/null
+
+	# LAN clients have private addresses and are about to egress
+	# directly rather than through home, so they need translating. Its
+	# own table, so removing it later cannot disturb anything else's
+	# rules.
+	if command -v nft >/dev/null 2>&1; then
+		nft delete table ip "$NFT_TABLE" 2>/dev/null
+		nft add table ip "$NFT_TABLE" 2>/dev/null
+		nft add chain ip "$NFT_TABLE" postrouting \
+			'{ type nat hook postrouting priority 100 ; }' 2>/dev/null
+		nft add rule ip "$NFT_TABLE" postrouting \
+			ip saddr "$LAN" oifname "$dev" masquerade 2>/dev/null
+	fi
+
+	printf '%s %s\n' "$dev" "$gw" > "$MARKER"
+	return 0
+}
+
+leave() {
+	local dev gw
+	if [ -r "$MARKER" ]; then
+		read -r dev gw < "$MARKER"
+	fi
+	echo "omp-fallback: leaving fallback, restoring the tunnel"
+
+	if command -v nft >/dev/null 2>&1; then
+		nft delete table ip "$NFT_TABLE" 2>/dev/null
+	fi
+
+	ip rule del priority "$RULE_PRIO" 2>/dev/null
+	ip route flush table "$TABLE" 2>/dev/null
+
+	# Cycle the interface so wg-quick puts its own rules back exactly as
+	# it wrote them. Reconstructing that rule by hand from `ip rule show`
+	# is one wg-quick release away from stranding the vehicle.
+	wg-quick down "$WG" 2>/dev/null
+	wg-quick up "$WG" 2>/dev/null
+	rm -f "$MARKER"
+	return 0
+}
+
+case "${1:-status}" in
+on)
+	[ -e "$MARKER" ] && { echo "omp-fallback: already in fallback"; exit 0; }
+	enter
+	;;
+off)
+	[ -e "$MARKER" ] || { echo "omp-fallback: not in fallback"; exit 0; }
+	leave
+	;;
+status)
+	if [ -r "$MARKER" ]; then
+		echo "fallback active: $(cat "$MARKER")"
+		exit 0
+	fi
+	echo "fallback inactive"
+	exit 1
+	;;
+links)
+	# Exposed so an operator can see what the fallback would pick
+	# without triggering it, and so the tests can check the choice
+	# without touching any routing.
+	usable_link
+	;;
+*)
+	echo "usage: omp-fallback on|off|status|links" >&2
+	exit 2
+	;;
+esac

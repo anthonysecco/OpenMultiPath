@@ -133,6 +133,15 @@ of reasoning up front.
     Still to come here: deferrable bulk, so backups and updates queue for an unmetered
     link rather than merely preferring one.
 11. **Fallback, watchdog, rollback.**
+    **Built** (2026-09-06, D-035). Three shell tools sharing nothing with the daemon
+    they watch: `omp-watchdog` decides, `omp-fallback` changes routing, `omp-deploy`
+    installs a version on probation. Health needs both a state file that is still
+    advancing - the one failure systemd cannot see - and a tunnel that answers.
+    Fallback moves one ip rule and deliberately leaves the tunnel interface up, so the
+    watchdog can still tell when it recovers; taking it down would make fallback a
+    one-way door. A bad upgrade is rolled back by the vehicle itself against a deadline
+    written at deploy time, and rollback is tried before fallback because it restores a
+    working tunnel rather than a working workaround.
 
 Steps 1–5 produce no cleverness and are the most valuable part of the project.
 

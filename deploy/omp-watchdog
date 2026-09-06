@@ -1,0 +1,186 @@
+#!/bin/bash
+# Watchdog: notice when the tunnel has genuinely stopped working, fall
+# back to a direct link, and undo a bad upgrade on its own.
+#
+# Run from omp-watchdog.timer every few seconds. Everything it needs is
+# in shell and coreutils: the whole point is to still work when the Go
+# binary is the broken thing, so it shares nothing with it - not a
+# library, not a toolchain, not a config parser.
+#
+# It answers three questions, in order.
+#
+#   1. Is the daemon alive? systemd already restarts a process that
+#      exits, so what matters here is the case systemd cannot see - a
+#      process that is running and has stopped doing anything. A state
+#      file that has stopped advancing says that precisely.
+#
+#   2. Is the tunnel carrying traffic? A daemon can be perfectly healthy
+#      while the far end is unreachable, and that is still a vehicle with
+#      no connectivity.
+#
+#   3. Is the version we are running the problem? Probation, below.
+#
+# Sustained on the way in and longer on the way out, per D-011: every
+# transition breaks NAT state and kills in-flight sessions, so flapping
+# between tunnel and fallback is worse than sitting in either.
+set +e
+
+RUNDIR="${OMP_RUN:-/run/openmultipath}"
+STATE="${OMP_STATE:-/var/lib/openmultipath/state.json}"
+BINDIR="${OMP_BIN:-/usr/local/bin}"
+FALLBACK="${OMP_FALLBACK_CMD:-/usr/local/sbin/omp-fallback}"
+
+PEER="${OMP_PEER:-10.20.0.1}"
+WG="${OMP_WG_INTERFACE:-wg0}"
+
+# Consecutive failing checks before falling back, and consecutive good
+# ones before coming out. At the timer's 5 s cadence these are the 15-30 s
+# in and ~60 s out that D-011 asks for.
+# Whether this box has anywhere to fall back to. The responder does not:
+# it has one connection, and a tunnel that is not working is the
+# vehicle's problem to solve, not something home can route around. Its
+# watchdog still runs, because rolling back a bad upgrade matters at both
+# ends and home is the end that cannot be power-cycled by hand.
+FALLBACK_ENABLED="${OMP_FALLBACK_ENABLED:-1}"
+
+FAIL_CHECKS="${OMP_FAIL_CHECKS:-4}"
+OK_CHECKS="${OMP_OK_CHECKS:-12}"
+
+# How stale the state file may be before the daemon counts as wedged.
+# Comfortably longer than its 1 s write cadence, because a box under load
+# is not a box in trouble.
+STATE_MAX_AGE="${OMP_STATE_MAX_AGE:-20}"
+
+FAILS="$RUNDIR/watchdog.fails"
+OKS="$RUNDIR/watchdog.oks"
+PROBATION="$RUNDIR/probation"
+
+mkdir -p "$RUNDIR"
+
+counter() { cat "$1" 2>/dev/null || echo 0; }
+bump() { echo $(( $(counter "$1") + 1 )) > "$1"; }
+reset() { echo 0 > "$1"; }
+
+# healthy answers "is this vehicle actually connected".
+#
+# Two independent signals, and both have to hold. The state file alone
+# would call a wedged tunnel healthy as long as the daemon kept writing;
+# a ping alone would call a daemon that had silently stopped scheduling
+# healthy as long as packets happened to flow. Requiring both is what
+# separates "working" from "looks working".
+healthy() {
+	local age now mtime
+	mtime=$(stat -c %Y "$STATE" 2>/dev/null) || return 1
+	now=$(date +%s)
+	age=$(( now - mtime ))
+	[ "$age" -le "$STATE_MAX_AGE" ] || return 1
+
+	ip link show "$WG" >/dev/null 2>&1 || return 1
+	ping -c 1 -W "${OMP_PING_TIMEOUT:-2}" -I "$WG" "$PEER" >/dev/null 2>&1
+}
+
+# promote accepts the running version. Called once the new binary has
+# held a working tunnel for the whole probation window: the previous
+# binary stays on disk as the thing to go back to, and the marker goes
+# away so a later failure is treated as a fault rather than as a bad
+# upgrade.
+promote() {
+	rm -f "$PROBATION"
+	logger -t omp-watchdog "new version confirmed working; probation over" 2>/dev/null
+	echo "omp-watchdog: version confirmed, probation over"
+}
+
+# roll_back undoes an upgrade that never worked.
+#
+# This is scope-v1.md's "keep the previous version, boot into it on
+# watchdog failure". It only ever fires while a probation marker exists,
+# which means somebody deployed recently and the tunnel has not been
+# healthy since. Without that condition a watchdog would eventually
+# "roll back" a perfectly good version because the vehicle drove into a
+# dead zone, which is a far more common event than a bad binary.
+roll_back() {
+	if [ ! -f "$BINDIR/ompd.prev" ]; then
+		logger -t omp-watchdog "would roll back, but no previous version was kept" 2>/dev/null
+		rm -f "$PROBATION"
+		return 1
+	fi
+	logger -t omp-watchdog "rolling back to the previous ompd after a failed probation" 2>/dev/null
+	echo "omp-watchdog: rolling back to the previous version"
+
+	# The failed binary is kept, not deleted. Whatever it did wrong is
+	# worth reading afterwards, and it is the only copy of it out here.
+	cp -a "$BINDIR/ompd" "$BINDIR/ompd.failed" 2>/dev/null
+	install -m 0755 "$BINDIR/ompd.prev" "$BINDIR/ompd" 2>/dev/null
+	rm -f "$PROBATION"
+
+	# Clear the start limit before restarting, or the rollback restores
+	# the right binary and the daemon still does not come up.
+	#
+	# A bad build crash-loops, which is the whole reason we are here, and
+	# a few restarts inside StartLimitIntervalSec latch the unit into
+	# start-limit-hit. systemd then refuses `restart` outright, so the
+	# rollback would have failed this way every single time it was
+	# needed. Nothing but running it against a genuinely broken binary
+	# would have shown that.
+	systemctl reset-failed ompd 2>/dev/null
+	systemctl restart ompd 2>/dev/null
+	reset "$FAILS"
+	return 0
+}
+
+if healthy; then
+	reset "$FAILS"
+	bump "$OKS"
+
+	if [ "$FALLBACK_ENABLED" = "1" ] && [ -e "$RUNDIR/fallback" ] && [ "$(counter "$OKS")" -ge "$OK_CHECKS" ]; then
+		"$FALLBACK" off
+		reset "$OKS"
+	fi
+
+	# A version on probation earns its place by holding a working tunnel,
+	# not by staying resident. Reusing OK_CHECKS would confirm a bad
+	# build during one lucky minute, so probation carries its own
+	# deadline written at deploy time.
+	if [ -f "$PROBATION" ]; then
+		deadline=$(cat "$PROBATION" 2>/dev/null)
+		now=$(date +%s)
+		if [ -n "$deadline" ] && [ "$now" -ge "$deadline" ]; then
+			promote
+		fi
+	fi
+	exit 0
+fi
+
+reset "$OKS"
+bump "$FAILS"
+fails=$(counter "$FAILS")
+
+if [ "$fails" -lt "$FAIL_CHECKS" ]; then
+	# Not yet sustained. A canyon is not a fault, and scope-v1.md is
+	# explicit that intermittent connectivity is the normal case.
+	exit 0
+fi
+
+# Sustained failure. A bad upgrade is the first thing to rule out,
+# because it is the one cause the vehicle can fix by itself - and doing
+# it before falling back means a working tunnel comes back rather than a
+# working workaround.
+if [ -f "$PROBATION" ]; then
+	roll_back
+	exit 0
+fi
+
+if [ "$FALLBACK_ENABLED" != "1" ]; then
+	# Nothing to route around. Say so on a slow cadence rather than every
+	# tick, because on the responder this is the ordinary state whenever
+	# the vehicle is in a dead zone.
+	[ $(( fails % 60 )) -eq 0 ] &&
+		logger -t omp-watchdog "tunnel down for $fails checks; no fallback configured on this box" 2>/dev/null
+	exit 0
+fi
+
+if [ ! -e "$RUNDIR/fallback" ]; then
+	logger -t omp-watchdog "tunnel down for $fails checks; falling back to a direct link" 2>/dev/null
+	"$FALLBACK" on
+fi
+exit 0
