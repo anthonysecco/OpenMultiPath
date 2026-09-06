@@ -722,6 +722,25 @@ tracks demand as much as capacity, and reads low until something real loads the 
 That is the safe direction to be wrong in, and worth remembering before trusting the
 number as a capacity figure rather than as a floor.
 
+**Revision** (2026-09-06). The ceiling backed down too readily in the field: a single
+busy report interval - one transient spike of outbound queueing - was enough to pin the
+ceiling to whatever happened to be in flight at that instant, and the confidence-aging
+meant that low number then lingered. Onset is now confirmed against a dwell
+(`bw_onset_dwell_ms`, default 1 s) before the ceiling is recorded or lowered: the send
+rate is latched the moment queueing first appears - so the *onset* rate is still what
+gets recorded, not a rate read after the buffer has been filling for a second - but it is
+only committed if the queueing holds for the dwell, and a clean reading in between
+forgets it as the blip it was.
+
+The dwell is deliberately asymmetric and applies only to a *fresh* onset. Once a path is
+confirmed congested, a lower rate that is still queueing is the wall moving in, not a
+blip, and is trusted at once as before - so a genuine collapse is still tracked promptly.
+The estimate is a soft gate for placement and duplication, not real-time protection: the
+health state machine demotes a dying link on its own fast timeline regardless, so a ~1 s
+confirmation lag on the capacity number costs at most a little over-placement on a
+duplication target, which self-corrects. `bw_onset_dwell_ms: 0` restores the old instant
+behaviour.
+
 ---
 
 ## D-024 · Score the send direction, from what the peer reports
@@ -1751,3 +1770,42 @@ Path ids are indices into the selected list, and they carry a path's whole
 measurement history across restarts, so the list is sorted by name - a link
 keeps its identity from one boot to the next rather than being shuffled by
 whatever order the kernel enumerated.
+
+## D-040 · An operator-triggered iperf uplink test, kept out of the estimator
+
+**Decision.** Add a per-path uplink bandwidth test, triggered from the web
+interface, that runs a real iperf3 transfer over one path and shows the result
+beside the passive estimate (D-023). It is diagnostic only: nothing in
+scheduling reads it, and it never runs on its own.
+
+**Why a separate mechanism at all.** The estimator is passive by design - it
+never spends the link to measure it - which is right for a metered link on the
+road but means the number is only ever as good as the load that happened to
+flow, with no way to check it against ground truth. This is that check, and
+keeping it a deliberate, operator-initiated action is what lets the estimator
+stay honest about never probing: the one thing that does spend uplink data to
+measure capacity is a button a person presses, not a cadence.
+
+**Pinned with `--bind-dev`, not a source address.** iperf3 has to egress the
+same path the daemon would, and on this box source-IP binding does not achieve
+that: every transport address routes out the first tunnel regardless
+(`ip route get 10.20.1.1 from 10.20.1.3` still says `dev wg1`). So the test
+uses `SO_BINDTODEVICE`, exactly as the daemon pins its own per-path sockets
+(`paths.go`). Above WireGuard the path names are the wg transports, so the test
+binds to `wg1`/`wg2` and the load rides the same tunnel the estimate describes.
+
+**It does not corrupt the live estimate, for a reason already in the code.**
+The obvious worry is that flooding the link from outside the daemon makes the
+estimator read the queueing it causes as its own send direction hitting a wall,
+and record a low ceiling. It does not, because the estimator ignores any period
+where the daemon itself is sending below `BWMinLoadKbps` (300 kbps): during an
+isolated test the daemon's own traffic is just probes and reports, well under
+that floor, so the whole period is disregarded. The caveat is only that a test
+run while real traffic is also loading the path would mix the two - which is why
+it is a diagnostic a person runs deliberately, not a background sweep.
+
+**Home runs a plain iperf3 server** (`omp-iperf.service`) bound to the
+transport hub `10.20.1.1`, reachable only through the tunnels, one client at a
+time. The interface makes the test single-flight for the same reason. The
+result is shown next to the estimator's ceiling/floor so the two can be read
+against each other, and the UI says plainly that the test spends uplink data.

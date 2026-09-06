@@ -104,6 +104,14 @@ type bwEstimate struct {
 	// is what separates the onset of congestion from its continuation.
 	queueing bool
 
+	// onsetSince is when the current run of queueing began, or 0 when the
+	// path is not queueing. candidateKbps is the send rate latched at that
+	// moment - the last honest reading before the buffer started to fill.
+	// Together they hold a suspected onset while it is confirmed against
+	// BWOnsetDwell, so a single spike does not collapse the estimate.
+	onsetSince    time.Duration
+	candidateKbps float64
+
 	// confirmedAt is when load last told us anything - either direction of
 	// evidence. It is what ages, and the only thing that does.
 	confirmedAt time.Duration
@@ -164,22 +172,45 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx p
 		// the far side: a sender that keeps shoving 8 Mbps into a link that
 		// collapsed to 2 would otherwise have that 8 recorded as the
 		// ceiling, which is the opposite of the truth.
-		//
-		// So the estimate is taken on the transition, and afterwards may
-		// only ratchet down. A lower rate that is still queueing is direct
-		// evidence the wall moved in.
-		measured := b.sendKbps * bwSafety
-		switch {
-		case !b.queueing, measured < b.ceilingKbps:
-			b.ceilingKbps = measured
-			b.haveCeiling = true
+		if b.queueing {
+			// Already in confirmed congestion. A lower rate that is still
+			// queueing is direct evidence the wall moved in, and is trusted
+			// at once - this is long past a transient blip. (D-023)
+			measured := b.sendKbps * bwSafety
+			if measured < b.ceilingKbps {
+				b.ceilingKbps = measured
+				if b.provenKbps > b.ceilingKbps {
+					b.provenKbps = b.ceilingKbps
+				}
+			}
+			return
 		}
-		b.queueing = true
-		if b.provenKbps > b.ceilingKbps {
-			b.provenKbps = b.ceilingKbps
+
+		// A fresh onset. Latch the send rate now, while it still means
+		// something, but do not act on it until the queueing has held for
+		// BWOnsetDwell. A single spike - one busy report interval - would
+		// otherwise collapse a good estimate to whatever happened to be in
+		// flight at that instant (D-023 revision, 2026-09-06).
+		if b.onsetSince == 0 {
+			b.onsetSince = now
+			b.candidateKbps = b.sendKbps * bwSafety
+		}
+		if now-b.onsetSince >= c.BWOnsetDwell() {
+			if !b.haveCeiling || b.candidateKbps < b.ceilingKbps {
+				b.ceilingKbps = b.candidateKbps
+				b.haveCeiling = true
+			}
+			b.queueing = true
+			b.onsetSince = 0
+			if b.provenKbps > b.ceilingKbps {
+				b.provenKbps = b.ceilingKbps
+			}
 		}
 		return
 	}
+	// A clean reading breaks the streak: a suspected onset that did not
+	// hold was a blip, and is forgotten.
+	b.onsetSince = 0
 	b.queueing = false
 
 	// Carrying this much with the link underneath still empty proves the

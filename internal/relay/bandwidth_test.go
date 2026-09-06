@@ -244,3 +244,49 @@ func TestBandwidthCountsWhatIsAlreadyFlowing(t *testing.T) {
 		t.Fatal("400 accepted on a path already doing 700 of 1000")
 	}
 }
+
+// A single spike of congestion - one busy report interval, then clear -
+// must not collapse the estimate. Before the dwell (D-023 revision) the
+// first queueing reading pinned the ceiling; now the congestion has to hold
+// for BWOnsetDwell before it counts.
+func TestBandwidthOnsetSpikeIgnored(t *testing.T) {
+	d := newBWDriver()
+	d.run(20*time.Second, 8000, 40, 0) // establish the floor at ~40 ms
+	// A spike well shorter than the dwell, at a queue depth that would
+	// otherwise set a ceiling immediately.
+	spike := d.c.BWOnsetDwell() - 200*time.Millisecond
+	d.run(spike, 8000, 120, 0)
+
+	if d.b.haveCeiling {
+		t.Fatalf("a %v spike set a ceiling of %.0f kbps; it should have been ridden out",
+			spike, d.b.ceilingKbps)
+	}
+
+	// And it recovers cleanly: the streak is forgotten, not merely deferred.
+	d.run(10*time.Second, 8000, 40, 0)
+	if d.b.haveCeiling {
+		t.Fatalf("a ceiling appeared after the spike cleared: %.0f kbps", d.b.ceilingKbps)
+	}
+}
+
+// Congestion that persists past the dwell does set the ceiling, and at the
+// rate latched when the onset began - not whatever was in flight once the
+// buffer had been filling for a second.
+func TestBandwidthSustainedOnsetCommitsAtOnsetRate(t *testing.T) {
+	d := newBWDriver()
+	d.run(20*time.Second, 2000, 40, 0) // floor, carrying ~2 Mbps cleanly
+	// Onset held well past the dwell.
+	d.run(d.c.BWOnsetDwell()+3*time.Second, 2000, 120, 0)
+
+	if !d.b.haveCeiling {
+		t.Fatal("sustained congestion past the dwell set no ceiling")
+	}
+	// The onset rate was ~2 Mbps, so the ceiling is that less the margin,
+	// not something read mid-congestion.
+	if d.b.ceilingKbps > 2000 {
+		t.Fatalf("ceiling = %.0f kbps, above the onset rate", d.b.ceilingKbps)
+	}
+	if d.b.ceilingKbps < 1000 {
+		t.Fatalf("ceiling = %.0f kbps, far below the ~1700 the onset rate implies", d.b.ceilingKbps)
+	}
+}

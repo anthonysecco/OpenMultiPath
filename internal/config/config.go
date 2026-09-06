@@ -131,7 +131,16 @@ type Config struct {
 	// nothing is concluded from it either way. BWHeadroomPercent is the
 	// margin a path must have spare before traffic is steered onto it, since
 	// arriving exactly at the estimated ceiling is arriving at the wall.
+	//
+	// BWOnsetDwellMs is how long queueing must persist before the ceiling
+	// is recorded or lowered on a fresh onset. Without it a single spike -
+	// one busy report interval - collapses a good estimate to whatever was
+	// being sent at that instant; requiring the congestion to hold filters
+	// the blip out. It applies only to the first onset; once a path is
+	// confirmed congested a lower still-queueing rate is the wall moving in
+	// and is trusted at once. Zero restores the old instant behaviour.
 	BWOnsetMs         int `json:"bw_onset_ms"`
+	BWOnsetDwellMs    int `json:"bw_onset_dwell_ms"`
 	BWMinLoadKbps     int `json:"bw_min_load_kbps"`
 	BWHeadroomPercent int `json:"bw_headroom_percent"`
 
@@ -407,6 +416,10 @@ var Bounds = map[string]bound{
 	// The ceiling is meant to be found before the path is called degraded.
 	"bw_onset_ms": {Min: 2, Max: 2_000, Default: 20},
 
+	// 1 s is about five report intervals: long enough to ride out a single
+	// spike, short enough to catch a link that has genuinely squeezed down.
+	"bw_onset_dwell_ms": {Min: 0, Max: 60_000, Default: 1_000},
+
 	// 300 kbps is above anything the measurement traffic itself produces
 	// and below a single video call, so an idle path never sets a ceiling
 	// and a real flow always can.
@@ -490,6 +503,7 @@ func Defaults() Config {
 		MBBMaxMs:                  Bounds["mbb_max_ms"].Default,
 
 		BWOnsetMs:         Bounds["bw_onset_ms"].Default,
+		BWOnsetDwellMs:    Bounds["bw_onset_dwell_ms"].Default,
 		BWMinLoadKbps:     Bounds["bw_min_load_kbps"].Default,
 		BWHeadroomPercent: Bounds["bw_headroom_percent"].Default,
 		BWFallbackKbps:    Bounds["bw_fallback_kbps"].Default,
@@ -582,6 +596,7 @@ func (c Config) Sanitised() Config {
 		MBBMaxMs:                  clamp(c.MBBMaxMs, Bounds["mbb_max_ms"]),
 
 		BWOnsetMs:         clamp(c.BWOnsetMs, Bounds["bw_onset_ms"]),
+		BWOnsetDwellMs:    clamp(c.BWOnsetDwellMs, Bounds["bw_onset_dwell_ms"]),
 		BWMinLoadKbps:     clamp(c.BWMinLoadKbps, Bounds["bw_min_load_kbps"]),
 		BWHeadroomPercent: clamp(c.BWHeadroomPercent, Bounds["bw_headroom_percent"]),
 		BWFallbackKbps:    clamp(c.BWFallbackKbps, Bounds["bw_fallback_kbps"]),
@@ -686,6 +701,12 @@ func (c Config) EvalInterval() time.Duration {
 
 func (c Config) DownSilence() time.Duration {
 	return time.Duration(c.DownSilenceMs) * time.Millisecond
+}
+
+// BWOnsetDwell is how long queueing must persist before a fresh onset sets
+// the bandwidth ceiling. See BWOnsetDwellMs.
+func (c Config) BWOnsetDwell() time.Duration {
+	return time.Duration(c.BWOnsetDwellMs) * time.Millisecond
 }
 
 func (c Config) FlapWindow() time.Duration {
