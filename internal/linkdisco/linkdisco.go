@@ -27,10 +27,11 @@ import (
 
 // Iface is the slice of an interface the selection reasons about.
 type Iface struct {
-	Name     string
-	Up       bool
-	Loopback bool
-	Addrs    []net.IPNet
+	Name         string
+	Up           bool
+	Loopback     bool
+	PointToPoint bool
+	Addrs        []net.IPNet
 }
 
 // virtualPrefixes name interfaces that are never a WAN uplink: tunnels the
@@ -112,15 +113,50 @@ func Select(ifaces []Iface, lan *net.IPNet, wg string) (picked []string, reasons
 	return picked, reasons
 }
 
-// Discover reads the machine's interfaces and selects the WAN uplinks among
-// them. lan is the subnet home routes to the vehicle - the RV's own LAN -
-// whose interfaces are never uplinks; pass nil to skip that exclusion. wg is
-// the tunnel interface's name, excluded so a re-run after the tunnel is up
-// does not try to build a path over the tunnel.
-func Discover(lan *net.IPNet, wg string) (picked []string, reasons map[string]string, err error) {
+// SelectTransports picks the WireGuard transport interfaces the daemon rides
+// when it runs above WireGuard (D-020), where its paths are not the physical
+// NICs at all.
+//
+// Above WireGuard the daemon writes plaintext into a TUN and sends over the
+// wg interfaces, each of which is a tunnel to home pinned to one physical NIC
+// by fwmark a layer below. So the thing to detect here is the set of wg
+// transports - point-to-point interfaces whose name marks them WireGuard -
+// and pointing the daemon at the NICs instead would be sending its packets to
+// home's inner address over a link that cannot reach it. own is the daemon's
+// own tun / -wg-interface, excluded so it does not try to ride over itself.
+func SelectTransports(ifaces []Iface, own string) (picked []string, reasons map[string]string) {
+	reasons = make(map[string]string, len(ifaces))
+	for _, i := range ifaces {
+		ok, why := classifyTransport(i, own)
+		reasons[i.Name] = why
+		if ok {
+			picked = append(picked, i.Name)
+		}
+	}
+	sort.Strings(picked)
+	return picked, reasons
+}
+
+func classifyTransport(i Iface, own string) (ok bool, reason string) {
+	switch {
+	case i.Name == own:
+		return false, "the daemon's own tunnel device"
+	case !strings.HasPrefix(i.Name, "wg"):
+		return false, "not a WireGuard transport"
+	case !i.PointToPoint:
+		return false, "not point-to-point"
+	case !i.Up:
+		return false, "down"
+	}
+	return true, "WireGuard transport tunnel"
+}
+
+// readInterfaces gathers the machine's real interfaces into the description
+// the selectors work on.
+func readInterfaces() ([]Iface, error) {
 	sys, err := net.Interfaces()
 	if err != nil {
-		return nil, nil, fmt.Errorf("linkdisco: read interfaces: %w", err)
+		return nil, fmt.Errorf("linkdisco: read interfaces: %w", err)
 	}
 	ifaces := make([]Iface, 0, len(sys))
 	for _, s := range sys {
@@ -132,13 +168,39 @@ func Discover(lan *net.IPNet, wg string) (picked []string, reasons map[string]st
 			}
 		}
 		ifaces = append(ifaces, Iface{
-			Name:     s.Name,
-			Up:       s.Flags&net.FlagUp != 0,
-			Loopback: s.Flags&net.FlagLoopback != 0,
-			Addrs:    nets,
+			Name:         s.Name,
+			Up:           s.Flags&net.FlagUp != 0,
+			Loopback:     s.Flags&net.FlagLoopback != 0,
+			PointToPoint: s.Flags&net.FlagPointToPoint != 0,
+			Addrs:        nets,
 		})
 	}
+	return ifaces, nil
+}
+
+// Discover reads the machine's interfaces and selects the WAN uplinks among
+// them. lan is the subnet home routes to the vehicle - the RV's own LAN -
+// whose interfaces are never uplinks; pass nil to skip that exclusion. wg is
+// the tunnel interface's name, excluded so a re-run after the tunnel is up
+// does not try to build a path over the tunnel.
+func Discover(lan *net.IPNet, wg string) (picked []string, reasons map[string]string, err error) {
+	ifaces, err := readInterfaces()
+	if err != nil {
+		return nil, nil, err
+	}
 	picked, reasons = Select(ifaces, lan, wg)
+	return picked, reasons, nil
+}
+
+// DiscoverTransports reads the machine's interfaces and selects the
+// WireGuard transports (see SelectTransports), for a daemon running above
+// WireGuard. own is the daemon's own tun / -wg-interface.
+func DiscoverTransports(own string) (picked []string, reasons map[string]string, err error) {
+	ifaces, err := readInterfaces()
+	if err != nil {
+		return nil, nil, err
+	}
+	picked, reasons = SelectTransports(ifaces, own)
 	return picked, reasons, nil
 }
 

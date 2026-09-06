@@ -1707,10 +1707,26 @@ timer is buying recovery, not re-measuring a constant.
 ### The vehicle detects its own uplinks
 
 `-paths` still takes an explicit list, but `-paths auto` now enumerates the
-interfaces and picks the WAN uplinks itself (`internal/linkdisco`). A uplink is
-an interface that is up, carries a routable IPv4 address, and is neither the LAN
-side (excluded by `-lan`, default `10.0.0.0/24`) nor virtual (loopback, `wg*`,
-`omp*`, bridges, veths, `tailscale*`, and friends by name).
+interfaces and picks the links itself (`internal/linkdisco`).
+
+**It has to be mode-aware, and getting that wrong strands the vehicle.** "The
+links to build tunnels over" means two different things at the two layers this
+daemon runs at. In the loopback-relay shape the daemon's paths are the physical
+WAN uplinks. Above WireGuard - the deployed D-020 shape, `-tun` set - the paths
+are the *wg transport tunnels* (`wg1`, `wg2`); the physical NICs are a layer
+below, carrying the encryption, and the daemon sends to home's inner address
+(`10.20.1.1`), which is reachable only *through* those tunnels. Point the
+above-WireGuard daemon at `enp1s0, enp2s0` and every packet goes to an address
+the raw NIC cannot reach - the tunnel never comes up. So `auto` selects wg
+transports when `-tun` is set and physical uplinks otherwise. This was caught at
+deploy time, reading the live unit, not by reasoning: the running RV's drop-in
+was `-paths wg1,wg2`, and the first cut of `auto` would have picked the modems.
+
+A physical uplink is an interface that is up, carries a routable IPv4 address,
+and is neither the LAN side (excluded by `-lan`, default `10.0.0.0/24`) nor
+virtual (loopback, `wg*`, `omp*`, bridges, veths, `tailscale*`, and friends by
+name). A transport is an up, point-to-point `wg*` interface that is not the
+daemon's own tun.
 
 The LAN exclusion is load-bearing for more than tidiness: the out-of-band Wi-Fi
 lifeline lives in the LAN subnet by design, so excluding the LAN also keeps

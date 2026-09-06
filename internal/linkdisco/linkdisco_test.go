@@ -140,3 +140,49 @@ func TestRealVehicleShape(t *testing.T) {
 		t.Fatalf("selected %v, want %v\nreasons: %v", got, want, reasons)
 	}
 }
+
+// Above WireGuard (D-020) the daemon's paths are the wg transports, not the
+// physical NICs. Selecting the NICs there would point the daemon at home's
+// inner address over a link that cannot reach it - the stranding this split
+// exists to prevent. On the real RV that is exactly wg1, wg2, and never the
+// modems, the LAN, or the daemon's own omp0 TUN.
+func TestTransportsPickWireGuardNotNICs(t *testing.T) {
+	ifaces := []Iface{
+		{Name: "lo", Loopback: true, Up: true, Addrs: []net.IPNet{cidr(t, "127.0.0.1/8")}},
+		{Name: "eth0", Up: true, Addrs: []net.IPNet{cidr(t, "10.0.0.1/24")}},
+		{Name: "enp1s0", Up: true, Addrs: []net.IPNet{cidr(t, "100.110.247.30/10")}},
+		{Name: "enp2s0", Up: true, Addrs: []net.IPNet{cidr(t, "192.168.225.3/22")}},
+		{Name: "wg1", Up: true, PointToPoint: true, Addrs: []net.IPNet{cidr(t, "10.20.1.2/32")}},
+		{Name: "wg2", Up: true, PointToPoint: true, Addrs: []net.IPNet{cidr(t, "10.20.1.3/32")}},
+		{Name: "omp0", Up: true, PointToPoint: true, Addrs: []net.IPNet{cidr(t, "10.30.0.2/24")}},
+	}
+	got, reasons := SelectTransports(ifaces, "omp0")
+	if want := []string{"wg1", "wg2"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("selected %v, want %v\nreasons: %v", got, want, reasons)
+	}
+}
+
+// The daemon's own TUN is a point-to-point device with a wg-ish role but must
+// never be selected as one of its own transports.
+func TestTransportsExcludeOwnTun(t *testing.T) {
+	ifaces := []Iface{
+		{Name: "wg1", Up: true, PointToPoint: true},
+		{Name: "wg0", Up: true, PointToPoint: true}, // if it were the daemon's own
+	}
+	got, _ := SelectTransports(ifaces, "wg0")
+	if want := []string{"wg1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("selected %v, want %v", got, want)
+	}
+}
+
+// A down transport is left out, the same as a down uplink: a path that is
+// down from birth is worse than one an operator meant to leave off.
+func TestTransportsExcludeDown(t *testing.T) {
+	ifaces := []Iface{
+		{Name: "wg1", Up: true, PointToPoint: true},
+		{Name: "wg2", Up: false, PointToPoint: true},
+	}
+	if got, _ := SelectTransports(ifaces, "omp0"); !reflect.DeepEqual(got, []string{"wg1"}) {
+		t.Fatalf("selected %v, want [wg1]", got)
+	}
+}

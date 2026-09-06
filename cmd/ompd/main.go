@@ -92,7 +92,7 @@ func main() {
 		cfg := relay.InitiatorConfig{
 			LoopbackAddr: *loopback,
 			RemoteAddr:   *remote,
-			Paths:        resolvePaths(*paths, *lan, *wgInterface),
+			Paths:        resolvePaths(*paths, *lan, *wgInterface, *tunName),
 			Node:         *node,
 			StatePath:    *statePath,
 			RecordPath:   *recordPath,
@@ -126,30 +126,48 @@ func main() {
 }
 
 // resolvePaths turns the -paths flag into a link list, auto-detecting the
-// WAN uplinks when it is "auto" and parsing the names otherwise.
+// links when it is "auto" and parsing the names otherwise.
 //
-// Auto-detection is a starting-gun, not a running watch: it enumerates once,
+// Auto-detection is mode-aware, because "the links to build tunnels over"
+// means two different things at the two layers this daemon can run at. Above
+// WireGuard (D-020, -tun set) the daemon's paths are the wg transport tunnels
+// - the physical NICs are a layer below, carrying the encryption - so auto
+// selects those. In the loopback-relay shape the paths are the physical WAN
+// uplinks, so auto selects those instead. Pointing one layer's daemon at the
+// other layer's interfaces is how you strand the vehicle.
+//
+// Either way it is a starting-gun, not a running watch: it enumerates once,
 // here, so a link that is genuinely down at boot is not detected this run.
-// That is the same trade the manual list makes - a named link that is down
-// is a path that is down, not an error - and once the daemon is up, linkwatch
+// That is the same trade the manual list makes - a named link that is down is
+// a path that is down, not an error - and once the daemon is up, linkwatch
 // rediscovers addresses on the links it already knows. A link that appears
 // for the first time after boot still has to be named; picking that up live
 // is a larger change than this.
-func resolvePaths(spec, lan, wg string) []relay.PathConfig {
+func resolvePaths(spec, lan, wg, tun string) []relay.PathConfig {
 	if strings.TrimSpace(spec) != "auto" {
 		return parsePaths(spec)
 	}
 
-	var lanNet *net.IPNet
-	if lan != "" {
-		_, n, err := net.ParseCIDR(lan)
-		if err != nil {
-			log.Fatalf("ompd: invalid -lan %q: %v", lan, err)
+	var (
+		picked  []string
+		reasons map[string]string
+		err     error
+	)
+	if tun != "" {
+		// Above WireGuard: the paths are the wg transports, and the
+		// daemon's own tun is excluded so it cannot ride over itself.
+		picked, reasons, err = linkdisco.DiscoverTransports(tun)
+	} else {
+		var lanNet *net.IPNet
+		if lan != "" {
+			_, n, e := net.ParseCIDR(lan)
+			if e != nil {
+				log.Fatalf("ompd: invalid -lan %q: %v", lan, e)
+			}
+			lanNet = n
 		}
-		lanNet = n
+		picked, reasons, err = linkdisco.Discover(lanNet, wg)
 	}
-
-	picked, reasons, err := linkdisco.Discover(lanNet, wg)
 	if err != nil {
 		log.Fatalf("ompd: -paths auto: %v", err)
 	}
