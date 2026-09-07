@@ -1860,3 +1860,28 @@ daemon's own data path (`omp0`) tops out around 55-60 Mbps with both CPUs idle,
 where the raw WireGuard transport now does 68 up and 113 down. That is the
 single-threaded, unbatched relay loop, not congestion control - a data-plane
 project (batched TUN/UDP I/O, or segmentation offload) for later.
+
+## D-042 · The daemon data path is not the throughput bottleneck (profiled)
+
+**Finding.** A tunnel throughput of ~56 Mbps with both CPUs idle looked like a
+daemon data-plane limit worth a batching/pipelining rewrite. Profiling - all on
+one box, zero WAN data - showed it is not, and the rewrite would buy nothing.
+
+- **Per-packet processing is free.** `internal/relay/bench_test.go`: stamp 139
+  ns, parse 12 ns, dedup 17 ns, the whole receive path 101 ns, **zero
+  allocations**. At 1300-byte packets that is 9-13 GB/s per core.
+- **The daemon itself does 600-865 Mbps.** Running both roles in network
+  namespaces over a veth: 865 Mbps on a fast path, 610 Mbps single-stream over a
+  clean 24 ms netem path, 543 across two asymmetric paths. Far above anything the
+  cellular link delivers.
+- **Congestion control was the whole story.** The same 24 ms netns path did 40
+  Mbps under cubic and 610 under BBR - a 15x swing that mirrors the real link's
+  5.5 -> 68 (D-041). The ~56 Mbps over the real tunnel is the cellular path's
+  loss and jitter interacting with TCP, which the netns has none of.
+
+**Decision.** Do not batch/pipeline the data path for throughput. The lift was a
+week-plus with real-time-latency risk for no gain: the daemon already pushes an
+order of magnitude more than the link. The only real levers are congestion
+control (BBR, D-041) and, for forwarded clients that keep their own CC, masking
+path loss in the tunnel (FEC/duplication, D-007). The benchmarks stay in the
+tree so this stays a measured conclusion, not a remembered one.
