@@ -174,7 +174,7 @@ func RunResponder(cfg ResponderConfig) error {
 
 		globalSeq := sess.nextGlobalSeq()
 
-		tx := sched.txPaths(class)
+		tx := sched.txFor(class, flowHash(payload))
 		if len(tx) == 0 {
 			tx = known()
 		}

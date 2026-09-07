@@ -193,7 +193,7 @@ func RunInitiator(cfg InitiatorConfig) error {
 		// Before the first evaluation the scheduler has no opinion, so
 		// fall back to every bound path. Coming up sending nothing would
 		// leave the tunnel dead until the first tick.
-		tx := sched.txPaths(class)
+		tx := sched.txFor(class, flowHash(payload))
 		if len(tx) == 0 {
 			tx = paths.active()
 		}
