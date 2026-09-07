@@ -1931,3 +1931,40 @@ proved and adds no per-byte overhead. FEC stays deferred.
 Two units so interception is opt-in and survives reboot: `omp-pep.service` (the
 proxy, unprivileged, always safe to run) and `omp-pep-rules.service` (the
 redirect, root, enable to intercept).
+
+## D-044 · Per-flow load balancing, so a multi-flow transfer uses every link
+
+**Problem.** A single flow was never split across paths, and every bulk and
+transactional flow was pinned to one path (bulk to its steered path, D-033;
+transactional to the primary, D-037). So a multi-flow download or upload sat on
+one link while the other was idle: measured on the vehicle, a download stuck
+near single-path throughput while a second uplink went unused, and the daemon's
+own data path was never the limit (D-042 - it does 600+ Mbps in a lab).
+
+**Decision.** Load-balance bulk and transactional across paths per flow: each
+flow is hashed on its 5-tuple onto one of a "spread set" of paths, so many
+flows fill many links while any one flow still rides a single path and never
+reorders. Real-time is untouched - it still duplicates across its whole set and
+is never hashed onto one path.
+
+The spread set is the **stable, non-red** paths, and it excludes the call's
+path only while a call is actually flowing (a 2 s window on the last real-time
+packet). Three properties, each learned the hard way:
+- **Stable-only.** An unstable link - a cellular uplink spiking to 20-46% loss -
+  is left out, so it cannot drag the aggregate below a single good path. Tested
+  live with a path at 46% loss: no collapse, traffic stayed on the good link.
+- **Off the call only during a call.** D-033 reserves the primary for real-time,
+  but with no call live there is nothing to protect and reserving it would
+  strand a whole uplink. So bulk gets every link when idle of calls and yields
+  the call's path the moment one starts.
+- **Ordered by path id, not score.** The hash maps a flow to a slice index, so
+  the slice order must be stable. Two links of near-equal score swap best-first
+  order every evaluation; a score-ordered slice bounced each flow between links
+  tick to tick - reordering by another name, and it collapsed the download to
+  4 Mbps in the first live test. Sorting by id pins a flow to one path.
+
+**Result.** On the vehicle, with an unchanged cubic client behind the PEP
+(D-043): upload aggregated to ~166 Mbps across both uplinks (from ~90 on one),
+and download improved where the second link was healthy, with no regression
+when it was not. The remaining download ceiling is one weak cellular link's own
+loss, not the scheduler.

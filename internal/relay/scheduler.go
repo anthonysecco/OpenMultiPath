@@ -56,6 +56,17 @@ type decision struct {
 	tx     []uint8
 	txBulk []uint8
 
+	// txBulkSpread is the set of paths a bulk flow may be load-balanced
+	// across, one flow to one path by a hash of its 5-tuple (D-044). It is
+	// the stable, off-call, non-red paths - so two healthy links aggregate
+	// for a multi-flow download that would otherwise sit on one, while a
+	// link that is only unstable (a cellular link spiking to 20% loss) is
+	// left out and cannot drag the others down. Empty falls back to txBulk,
+	// which keeps D-033's single-best choice for the forest-canopy case
+	// where the only bulk-worthy link is an unstable one. Per flow, not per
+	// packet: a single flow still rides a single path, so nothing reorders.
+	txBulkSpread []uint8
+
 	// txTrans is the transactional set: the primary alone.
 	//
 	// It follows real-time's path but never real-time's duplication.
@@ -232,6 +243,68 @@ func (s *scheduler) txPaths(class uint8) []uint8 {
 	}
 }
 
+// txFor is txPaths for a specific flow: it is what the data path calls, and it
+// differs from txPaths only for bulk, where a flow is hashed onto one of the
+// load-balancing paths (D-044) so several flows fill several links without any
+// single flow being split across paths. Real-time and transactional are
+// identical to txPaths - real-time still duplicates across its whole set, and
+// transactional still rides the primary alone.
+func (s *scheduler) txFor(class uint8, flow uint32) []uint8 {
+	// Real-time is duplicated across its whole set, never hashed onto one
+	// path - redundancy is the point, and it is the one class that must not
+	// be load-balanced.
+	if class == protocol.ClassRealtime {
+		return s.txPaths(class)
+	}
+	// Bulk and transactional both load-balance per flow across the healthy
+	// set. Transactional joins bulk here because pinning it to the primary
+	// leaves a second link idle for exactly the multi-connection traffic -
+	// a page's many requests, or a download the classifier has not yet
+	// called an elephant - that a second link would speed up; each flow
+	// still rides one stable path, so a request's ordering is untouched.
+	d := s.cur.Load()
+	if n := len(d.txBulkSpread); n > 0 {
+		i := flow % uint32(n)
+		return d.txBulkSpread[i : i+1]
+	}
+	// Nothing to spread across (a call holds the only healthy paths, or one
+	// is left): fall back to the class's default - bulk to its steered path,
+	// transactional to the primary.
+	if class == protocol.ClassBulk {
+		return d.txBulk
+	}
+	if len(d.txTrans) == 0 {
+		return d.tx
+	}
+	return d.txTrans
+}
+
+// flowHash is a stable hash of an inner IPv4 packet's 5-tuple, used to pin a
+// bulk flow to one load-balancing path. Same flow, same path, every packet -
+// which is what keeps load balancing from turning into reordering. FNV-1a over
+// the addresses, protocol, and (for TCP/UDP) ports; a packet too short or not
+// IPv4 hashes to zero, which simply lands it on the first path.
+func flowHash(p []byte) uint32 {
+	if len(p) < 20 || p[0]>>4 != 4 {
+		return 0
+	}
+	const (
+		offset = 2166136261
+		prime  = 16777619
+	)
+	h := uint32(offset)
+	for _, b := range p[12:20] { // source and destination address
+		h = (h ^ uint32(b)) * prime
+	}
+	h = (h ^ uint32(p[9])) * prime // protocol
+	if ihl := int(p[0]&0x0f) * 4; (p[9] == 6 || p[9] == 17) && len(p) >= ihl+4 {
+		for _, b := range p[ihl : ihl+4] { // source and destination port
+			h = (h ^ uint32(b)) * prime
+		}
+	}
+	return h
+}
+
 // admit reports whether a packet of this class should be sent at all.
 //
 // This is the one place the daemon deliberately destroys traffic, and
@@ -302,7 +375,7 @@ func (s *scheduler) admit(class uint8) bool {
 // taken from the eligible ranking, so once step 10 puts a billing penalty
 // into the score, bulk stops being steered onto an expensive link without
 // this code changing.
-func (s *scheduler) steerBulk(d *decision, c config.Config, eligible []scored) {
+func (s *scheduler) steerBulk(now time.Duration, d *decision, c config.Config, eligible []scored) {
 	// Blind mode has no opinion worth acting on - see buildTx, which
 	// sprays both classes alike because the measurements have stopped
 	// being able to tell them apart.
@@ -328,6 +401,39 @@ func (s *scheduler) steerBulk(d *decision, c config.Config, eligible []scored) {
 	for _, id := range d.tx {
 		carrying[id] = true
 	}
+
+	// The load-balancing set (D-044): stable, non-red paths, best first.
+	// Bulk flows are hashed across these so a multi-flow download uses every
+	// healthy link rather than one. Stable-only on purpose: an unstable link
+	// (cellular loss spiking) stays out, so it cannot drag the aggregate
+	// below a single good path - the exact failure that made a two-link
+	// download slower than one. eligible is already sorted best-first.
+	//
+	// The call's path is reserved only while a call is actually flowing.
+	// D-033 keeps bulk off the primary to protect real-time, but with no
+	// call live there is nothing to protect and reserving it would strand a
+	// whole uplink - so an idle-of-calls tunnel lets bulk have every link,
+	// and a call starting pulls bulk back off its path within the window.
+	rtActive := s.sess != nil && s.sess.realtimeActive(now)
+	d.txBulkSpread = d.txBulkSpread[:0]
+	for _, sc := range eligible {
+		if sc.m.budget.Band == usage.Red || sc.mach.state != stateStable {
+			continue
+		}
+		if rtActive && carrying[sc.m.id] {
+			continue
+		}
+		d.txBulkSpread = append(d.txBulkSpread, sc.m.id)
+	}
+	// Order by path id, not by score. The hash maps a flow to an index in
+	// this slice, so the order has to be stable: two links of nearly equal
+	// score swap best-first order from one evaluation to the next, and if
+	// the slice reordered under it a flow's index would point at a different
+	// path each tick - bouncing the flow between links, which is reordering
+	// by another name and collapses the very TCP flow it was meant to speed
+	// up. Sorting by id pins a flow to one path as long as the membership
+	// holds, and membership changes only on a state transition, rarely.
+	sort.Slice(d.txBulkSpread, func(i, j int) bool { return d.txBulkSpread[i] < d.txBulkSpread[j] })
 
 	// Pick the cheapest band first and the ranking second. Bulk is the
 	// second thing a budget sacrifices, after duplication and well before
@@ -564,7 +670,7 @@ func (s *scheduler) evaluate(now time.Duration, c config.Config) {
 
 	s.choose(now, c, eligible)
 	s.buildTx(d, c, eligible, sendable)
-	s.steerBulk(d, c, eligible)
+	s.steerBulk(now, d, c, eligible)
 	s.applyAdmission(d, c, eligible)
 
 	for _, sc := range all {

@@ -1387,3 +1387,60 @@ func TestBulkMovesFromAYellowLinkToAGreenOne(t *testing.T) {
 		t.Errorf("bulk moved to a %s path, want the green one", band)
 	}
 }
+
+// flowHash must be stable per flow (so a flow never splits across paths) and
+// differ across flows (so flows actually spread).
+func TestFlowHashStableAndDistinct(t *testing.T) {
+	// minimal IPv4+TCP header: version/IHL, ..proto@9.., src@12, dst@16, ports@20
+	pkt := func(sp, dp byte) []byte {
+		p := make([]byte, 24)
+		p[0] = 0x45 // IPv4, IHL 5
+		p[9] = 6    // TCP
+		copy(p[12:16], []byte{10, 0, 0, 5})
+		copy(p[16:20], []byte{1, 1, 1, 1})
+		p[20], p[21], p[22], p[23] = 0, sp, 0, dp
+		return p
+	}
+	a1, a2 := flowHash(pkt(1, 80)), flowHash(pkt(1, 80))
+	if a1 != a2 {
+		t.Fatalf("same flow hashed differently: %d vs %d", a1, a2)
+	}
+	if flowHash(pkt(2, 80)) == a1 && flowHash(pkt(1, 81)) == a1 {
+		t.Fatal("different flows all hash identically; no spread")
+	}
+	if flowHash([]byte{0x60}) != 0 { // too short / not IPv4
+		t.Error("malformed packet should hash to 0")
+	}
+}
+
+// txFor is what the data path actually calls: real-time duplicates across its
+// whole set, while bulk and transactional each land on exactly one of the
+// load-balancing paths chosen by the flow hash, and different flows use
+// different paths. An empty spread set falls back to the class default.
+func TestTxForSpreadsButNeverRealtime(t *testing.T) {
+	s := &scheduler{}
+	s.cur.Store(&decision{
+		tx: []uint8{0, 1}, txBulk: []uint8{1}, txTrans: []uint8{0},
+		txBulkSpread: []uint8{0, 1},
+	})
+	if got := s.txFor(protocol.ClassRealtime, 999); !sameSet(got, []uint8{0, 1}) {
+		t.Fatalf("real-time = %v, want the full duplication set [0 1]", got)
+	}
+	for _, class := range []uint8{protocol.ClassBulk, protocol.ClassTransactional} {
+		seen := map[uint8]bool{}
+		for f := uint32(0); f < 16; f++ {
+			got := s.txFor(class, f)
+			if len(got) != 1 {
+				t.Fatalf("class %d flow %d spread to %v, want one path", class, f, got)
+			}
+			seen[got[0]] = true
+		}
+		if len(seen) < 2 {
+			t.Fatalf("class %d never used both paths: %v", class, seen)
+		}
+	}
+	s.cur.Store(&decision{tx: []uint8{0}, txBulk: []uint8{0}, txTrans: []uint8{0}})
+	if got := s.txFor(protocol.ClassBulk, 3); !sameSet(got, []uint8{0}) {
+		t.Fatalf("empty spread, bulk = %v, want fallback [0]", got)
+	}
+}

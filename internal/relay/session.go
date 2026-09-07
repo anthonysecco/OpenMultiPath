@@ -268,6 +268,11 @@ type session struct {
 	// its own counter's index. Sized to the three that exist.
 	classCounts [4]atomic.Uint64
 
+	// lastRealtime is the session clock, in nanoseconds, at the last
+	// real-time packet - what realtimeActive reads to tell a live call from
+	// an idle tunnel.
+	lastRealtime atomic.Int64
+
 	// withheldBulk counts packets admission control dropped. Without it a
 	// starved link and an idle one read identically from a campground, the
 	// same trap the class counters exist for.
@@ -505,6 +510,24 @@ func (s *session) noteClass(class uint8) {
 	if int(class) < len(s.classCounts) {
 		s.classCounts[class].Add(1)
 	}
+	if class == protocol.ClassRealtime {
+		s.lastRealtime.Store(int64(s.elapsed()))
+	}
+}
+
+// realtimeActiveWindow is how long after the last real-time packet the call is
+// still treated as live. A call sends continuously, tens of packets a second,
+// so a couple of seconds of silence is a real gap, not a pause between frames.
+const realtimeActiveWindow = 2 * time.Second
+
+// realtimeActive reports whether a call is currently flowing. Bulk keeps off
+// the call's path while it is (D-033), but when no call has been seen for a
+// while there is nothing to protect, so bulk may spread across every link
+// including the primary (D-044) - which is what lets an idle-of-calls tunnel
+// put a multi-flow download on both uplinks at once.
+func (s *session) realtimeActive(now time.Duration) bool {
+	last := time.Duration(s.lastRealtime.Load())
+	return last > 0 && now-last < realtimeActiveWindow
 }
 
 // classTotals reads the counters back for the log and the interface.
