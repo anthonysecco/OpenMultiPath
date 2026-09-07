@@ -1885,3 +1885,49 @@ order of magnitude more than the link. The only real levers are congestion
 control (BBR, D-041) and, for forwarded clients that keep their own CC, masking
 path loss in the tunnel (FEC/duplication, D-007). The benchmarks stay in the
 tree so this stays a measured conclusion, not a remembered one.
+
+## D-043 · A split-TCP proxy on the vehicle, so cubic clients get the uplink
+
+**Problem.** A LAN client's TCP is end to end, so its congestion control is the
+client's, not ours. Cubic - still the default on many machines, and unchangeable
+on some (the test box was an LXC container that would not let its CC be set) -
+collapses on the cellular uplink's non-congestive loss: measured ~27 Mbps upload
+where the link carries ~90. BBR fixes this for traffic that originates on the
+vehicle or home (D-041), but it cannot reach a forwarded client's own TCP. We
+needed a fix that touches nothing on the client.
+
+**Decision.** Run a single-sided split-TCP performance-enhancing proxy on the
+vehicle (`internal/pep`, `cmd/omp-pep`). nat PREROUTING redirects LAN clients'
+internet-bound TCP into it (`omp-pep-rules`); it recovers the original
+destination with SO_ORIGINAL_DST and re-opens the connection from the vehicle,
+where BBR carries it across the lossy WAN. The client's cubic now runs only over
+the clean LAN; the WAN leg is the vehicle's BBR.
+
+**Prototyped before building, live on the vehicle.** With the client (cubic,
+untouched) redirected, upload went **27 -> 91-105 Mbps**, the proxy handling the
+connections. Confirmed again through the shipped service: 27 -> 87. It is
+single-sided - home is not involved - because the re-opened connection is the
+vehicle's and rides its BBR all the way to the server.
+
+**Scope and costs, honestly.**
+- **TCP only.** QUIC and other UDP are not redirected; they keep their own,
+  already loss-tolerant, congestion control, so they do not need it.
+- **Upload is what it fixes.** Download was unchanged (~23) because that is a
+  separate vehicle-side limit (the vehicle's own download-through-the-tunnel
+  rate), not cubic - the proxy cannot pull faster than the vehicle can.
+- **It breaks strict end-to-end TCP.** The client is acked by the vehicle before
+  the far end has the data - the accepted trade of any PEP, fine for the bulk
+  traffic this speeds up, and not used for real-time (which is UDP and is left
+  alone).
+- **No loop, no privilege.** The redirect is in PREROUTING, which never sees the
+  proxy's own locally generated dials, so there is nothing to exclude. The proxy
+  needs no capability; only the rules unit is root.
+
+**Why this and not FEC (D-007).** FEC would help cubic clients too, but at a
+constant bandwidth cost on a metered link, and building a correct tunnel
+resequencer is the hardest deferred component. The PEP reuses the BBR we already
+proved and adds no per-byte overhead. FEC stays deferred.
+
+Two units so interception is opt-in and survives reboot: `omp-pep.service` (the
+proxy, unprivileged, always safe to run) and `omp-pep-rules.service` (the
+redirect, root, enable to intercept).

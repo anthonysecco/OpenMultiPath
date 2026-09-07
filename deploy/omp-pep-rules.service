@@ -1,0 +1,18 @@
+# Applies the PEP redirect at boot and removes it on stop (D-043). Kept a
+# separate unit from omp-pep.service so the proxy can run without intercepting:
+# enable this one to turn interception on across reboots, disable it to leave
+# the proxy idle. Runs as root because it edits nat rules.
+[Unit]
+Description=OpenMultiPath PEP interception rules
+After=omp-pep.service network-online.target
+Wants=network-online.target
+Requires=omp-pep.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/omp-pep-rules on
+ExecStop=/usr/local/sbin/omp-pep-rules off
+
+[Install]
+WantedBy=multi-user.target

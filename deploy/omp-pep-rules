@@ -1,0 +1,40 @@
+#!/bin/bash
+# Redirect LAN clients' internet-bound TCP into the local PEP (omp-pep), D-043.
+#
+#     omp-pep-rules on|off|status
+#
+# The redirect lives in nat PREROUTING, which sees forwarded and incoming
+# packets but never this host's own outbound - so the proxy's re-opened
+# connections (locally generated, OUTPUT chain) are not caught and there is no
+# loop, even though the match includes this host's own LAN address. Traffic
+# staying on the LAN is returned before the redirect so client-to-client and
+# client-to-vehicle connections are left alone. Only TCP is touched; UDP and
+# QUIC pass through to their own, already loss-tolerant, congestion control.
+set -e
+LAN="${OMP_LAN:-10.0.0.0/24}"
+PORT="${OMP_PEP_PORT:-9050}"
+
+add() { iptables -t nat -C PREROUTING "$@" 2>/dev/null || iptables -t nat -A PREROUTING "$@"; }
+del() { iptables -t nat -D PREROUTING "$@" 2>/dev/null || true; }
+
+case "${1:-status}" in
+on)
+	add -s "$LAN" -d "$LAN" -p tcp -j RETURN
+	add -s "$LAN" -p tcp -j REDIRECT --to-ports "$PORT"
+	echo "omp-pep-rules: interception on for $LAN -> :$PORT"
+	;;
+off)
+	del -s "$LAN" -p tcp -j REDIRECT --to-ports "$PORT"
+	del -s "$LAN" -d "$LAN" -p tcp -j RETURN
+	echo "omp-pep-rules: interception off"
+	;;
+status)
+	if iptables -t nat -S PREROUTING | grep -q "REDIRECT --to-ports $PORT"; then
+		echo "on"; iptables -t nat -S PREROUTING | grep -E "RETURN|REDIRECT" | grep "$LAN"
+	else
+		echo "off"
+	fi
+	;;
+*)
+	echo "usage: omp-pep-rules on|off|status" >&2; exit 2 ;;
+esac

@@ -1,0 +1,29 @@
+# Split-TCP accelerator (PEP), D-043. The vehicle side only.
+#
+# Terminates LAN clients' TCP here so their (often cubic) congestion control
+# runs over the clean LAN, and re-opens the connection from this host, whose
+# BBR (D-041) tolerates the cellular uplink's loss. A cubic client's upload
+# went 27 -> ~100 Mbps in prototype with no client change.
+#
+# It needs no special privilege: it accepts connections netfilter redirected
+# to it and reads SO_ORIGINAL_DST, neither of which requires a capability, and
+# its own dials are ordinary outbound sockets. The redirect rules are separate
+# (omp-pep-rules) so the proxy can run without intercepting anything until an
+# operator turns interception on.
+[Unit]
+Description=OpenMultiPath split-TCP accelerator (PEP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/omp-pep -listen 0.0.0.0:9050
+Restart=always
+RestartSec=2
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
