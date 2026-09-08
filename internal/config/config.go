@@ -159,6 +159,18 @@ type Config struct {
 	// case this exists for.
 	BWFallbackKbps int `json:"bw_fallback_kbps"`
 
+	// BulkSpreadMinSharePercent is the smallest share of the best
+	// candidate's measured ceiling a path may have and still join the
+	// per-flow load-balancing set of D-044. Below it the path is left out
+	// of the spread, though it stays eligible for everything else.
+	//
+	// The spread is a set of peers: txFor hashes flows across it uniformly,
+	// so a member takes its share of the flows whatever it can carry. That
+	// is right between links of comparable size and ruinous between links
+	// an order of magnitude apart, which is the normal case here. See
+	// D-045.
+	BulkSpreadMinSharePercent int `json:"bulk_spread_min_share_percent"`
+
 	// The classification thresholds of step 7. The two that matter are
 	// ClassifyRTPMaxBytes and ClassifyGapVarianceMs: protocol.md's claim
 	// is that mean packet size and inter-packet-gap variance separate RTP
@@ -434,6 +446,17 @@ var Bounds = map[string]bound{
 	// Zero means unknown, and unknown means no gate. See BWFallbackKbps.
 	"bw_fallback_kbps": {Min: 0, Max: 10_000_000, Default: 0},
 
+	// An eighth, near enough. A link worth load-balancing onto has to be
+	// able to carry a real fraction of what the best one does: at 12% a
+	// 5 Mbps link still joins a 30 Mbps one, which is right - it is worth
+	// having - while the 512k standby tier of D-022 and the 636 kbps
+	// cellular link that produced D-045 do not, which is also right.
+	//
+	// Max is 100 on purpose, and it is an invariant rather than a taste:
+	// the best candidate is always 100% of itself, so no setting inside
+	// the bounds can empty a non-empty spread. Zero disables the gate.
+	"bulk_spread_min_share_percent": {Min: 0, Max: 100, Default: 12},
+
 	// Twenty-four packets is under half a second of an RTP flow at its
 	// 20 ms cadence. Long enough for a gap variance to mean something,
 	// short enough that a native conferencing client nobody has a prefix
@@ -507,7 +530,9 @@ func Defaults() Config {
 		BWMinLoadKbps:     Bounds["bw_min_load_kbps"].Default,
 		BWHeadroomPercent: Bounds["bw_headroom_percent"].Default,
 		BWFallbackKbps:    Bounds["bw_fallback_kbps"].Default,
-		ReportIntervalMs:  Bounds["report_interval_ms"].Default,
+
+		BulkSpreadMinSharePercent: Bounds["bulk_spread_min_share_percent"].Default,
+		ReportIntervalMs:          Bounds["report_interval_ms"].Default,
 
 		ClassifySamplePackets:   Bounds["classify_sample_packets"].Default,
 		ClassifyRTPMaxBytes:     Bounds["classify_rtp_max_bytes"].Default,
@@ -600,7 +625,9 @@ func (c Config) Sanitised() Config {
 		BWMinLoadKbps:     clamp(c.BWMinLoadKbps, Bounds["bw_min_load_kbps"]),
 		BWHeadroomPercent: clamp(c.BWHeadroomPercent, Bounds["bw_headroom_percent"]),
 		BWFallbackKbps:    clamp(c.BWFallbackKbps, Bounds["bw_fallback_kbps"]),
-		ReportIntervalMs:  clamp(c.ReportIntervalMs, Bounds["report_interval_ms"]),
+
+		BulkSpreadMinSharePercent: clamp(c.BulkSpreadMinSharePercent, Bounds["bulk_spread_min_share_percent"]),
+		ReportIntervalMs:          clamp(c.ReportIntervalMs, Bounds["report_interval_ms"]),
 
 		ClassifySamplePackets:   clamp(c.ClassifySamplePackets, Bounds["classify_sample_packets"]),
 		ClassifyRTPMaxBytes:     clamp(c.ClassifyRTPMaxBytes, Bounds["classify_rtp_max_bytes"]),

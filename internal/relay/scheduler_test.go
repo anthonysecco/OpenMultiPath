@@ -1444,3 +1444,128 @@ func TestTxForSpreadsButNeverRealtime(t *testing.T) {
 		t.Fatalf("empty spread, bulk = %v, want fallback [0]", got)
 	}
 }
+
+// spreadSet is the load-balancing membership as a set, for the D-045 tests.
+func spreadSet(d *decision) map[uint8]bool {
+	out := map[uint8]bool{}
+	for _, id := range d.txBulkSpread {
+		out[id] = true
+	}
+	return out
+}
+
+// The regression that produced D-045, measured on a real box before it was
+// written. Two links: one confirmed at 30 Mbps, one that has squeezed down to
+// 636 kbps but is not losing packets and has fine jitter - so the state
+// machine calls it stable, correctly, and D-044's filter let it into the
+// spread as a full peer. The hash then handed it half of every download.
+//
+// The observed symptom was an iperf3 run that came back either 121 Mbit/s or
+// 0.35 Mbit/s depending on nothing but the source port, 50/50 across eight
+// flows. Stability was never the missing test; size was.
+func TestSpreadExcludesAStableButTinyPath(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 40))
+	w.s.setClassifying(true)
+
+	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 800, limitKbps: 30000, haveCeiling: true} })
+	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 600, limitKbps: 636, haveCeiling: true} })
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	// The premise: both links are healthy. If the state machine had called
+	// path 1 unstable, D-044 would already have excluded it and this test
+	// would be proving nothing.
+	if w.s.machines[1].state != stateStable {
+		t.Fatalf("path 1 is %v, want stable - the point is that it is healthy and small",
+			w.s.machines[1].state)
+	}
+
+	if spreadSet(d)[1] {
+		t.Errorf("spread %v includes the 636 kbps path beside a 30 Mbps one", d.txBulkSpread)
+	}
+	if !spreadSet(d)[0] {
+		t.Errorf("spread %v dropped the good path too", d.txBulkSpread)
+	}
+}
+
+// The other half of the gate: links of comparable size must still aggregate.
+// A 5 Mbps link beside a 30 Mbps one is worth having, and a fix that quietly
+// turned load balancing off would pass the test above and be useless.
+func TestSpreadKeepsAPathWorthAggregating(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 40))
+	w.s.setClassifying(true)
+
+	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 800, limitKbps: 30000, haveCeiling: true} })
+	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 600, limitKbps: 5000, haveCeiling: true} })
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	if !spreadSet(d)[0] || !spreadSet(d)[1] {
+		t.Errorf("spread = %v, want both links: 5 Mbps beside 30 is worth aggregating",
+			d.txBulkSpread)
+	}
+}
+
+// Unknown capacity is permission, as it is everywhere else a limit is read
+// (D-023). A link nobody has watched fill up must not be excluded for having
+// been quiet - on a box whose links are quiet most of the time that would
+// disable the spread rather than size it.
+func TestSpreadAdmitsAPathWithNoMeasuredCeiling(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 40))
+	w.s.setClassifying(true)
+
+	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 800, limitKbps: 30000, haveCeiling: true} })
+	w.set(1, func(p *pathMetric) { p.bw = bwView{} }) // never loaded, no opinion
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	if !spreadSet(d)[1] {
+		t.Errorf("spread = %v, want the unmeasured path included: unknown is not small",
+			d.txBulkSpread)
+	}
+}
+
+// The invariant behind capping the share bound at 100: the best candidate is
+// always 100% of itself, so no setting inside the bounds can turn a non-empty
+// spread into an empty one and strand bulk on the txBulk fallback.
+func TestSpreadIsNeverEmptiedByTheGate(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 40))
+	w.c.BulkSpreadMinSharePercent = config.Bounds["bulk_spread_min_share_percent"].Max
+	w.s.cfg = config.NewHolder(w.c)
+	w.s.setClassifying(true)
+
+	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 800, limitKbps: 30000, haveCeiling: true} })
+	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 600, limitKbps: 29999, haveCeiling: true} })
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	if len(d.txBulkSpread) == 0 {
+		t.Fatal("the strictest legal share emptied the spread")
+	}
+	if !spreadSet(d)[0] {
+		t.Errorf("spread = %v, want at least the largest path to survive any share",
+			d.txBulkSpread)
+	}
+}
+
+// The gate in isolation, including the two readings of zero that keep it from
+// refusing on ignorance.
+func TestUndersizedForSpread(t *testing.T) {
+	c := config.Defaults() // 12%
+	cases := []struct {
+		name        string
+		limit, best float64
+		want        bool
+	}{
+		{"the D-045 case: 636 kbps against 30 Mbps", 636, 30000, true},
+		{"a 512k standby tier against 30 Mbps", 512, 30000, true},
+		{"5 Mbps against 30 Mbps is worth having", 5000, 30000, false},
+		{"the best path is always 100% of itself", 30000, 30000, false},
+		{"exactly at the share is not below it", 3600, 30000, false},
+		{"a hair under the share is below it", 3599, 30000, true},
+		{"no measured ceiling is permission", 0, 30000, false},
+		{"no opinion anywhere disables the gate", 636, 0, false},
+	}
+	for _, tc := range cases {
+		if got := undersizedForSpread(tc.limit, tc.best, c); got != tc.want {
+			t.Errorf("%s: undersizedForSpread(%.0f, %.0f) = %v, want %v",
+				tc.name, tc.limit, tc.best, got, tc.want)
+		}
+	}
+}

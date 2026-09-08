@@ -1968,3 +1968,73 @@ packet). Three properties, each learned the hard way:
 and download improved where the second link was healthy, with no regression
 when it was not. The remaining download ceiling is one weak cellular link's own
 loss, not the scheduler.
+
+## D-045 · Size is a membership test for load balancing, not just stability
+
+**Problem.** D-044 admits the **stable, non-red** paths to the spread set and
+hashes flows across it uniformly. Stability turned out not to be the whole
+test. A link can be perfectly stable - no current loss, jitter fine, and so
+correctly called `stable (clean)` by the state machine - and still be fifty
+times smaller than the path beside it. The hash does not care: it hands that
+link its half of the flows anyway, and each flow sits there at the small link's
+rate for its entire life.
+
+Measured on the vehicle with a LAN client behind the PEP. The two paths were:
+
+| path | state | MOS | measured ceiling | loss |
+|---|---|---|---|---|
+| 0 | `stable (clean)` PRIMARY | 4.4 | 30,079 → 60,249 kbps | 0.31% |
+| 1 | `stable (clean)` | 1.0 | 1922 → 636 kbps, decaying | 3.6%, historical, not growing |
+
+Path 1's loss counter was frozen - the damage was old - so nothing in the
+stability test fired. Eight single-stream iperf3 runs that varied **only the
+source port** came back:
+
+```
+41001   0.35 Mbit/s     41005   125 Mbit/s
+41002    121 Mbit/s     41006   0.52 Mbit/s
+41003    122 Mbit/s     41007   0.52 Mbit/s
+41004   0.52 Mbit/s     41008   114 Mbit/s
+```
+
+A clean 50/50 split, 230x apart, decided by the flow hash. `speedtest-cli` from
+the same box showed the same thing as bimodal, anti-correlated results (34/4,
+33/4, 37/4, then 2.9/18.6) - the anti-correlation being the tell that this is
+per-flow, not per-direction.
+
+This is the exact failure D-044's stable-only rule was written to prevent,
+arriving through a different door.
+
+**Decision.** Add capacity to the membership test. A path joins the spread only
+if its measured ceiling is at least `bulk_spread_min_share_percent` of the best
+candidate's, defaulting to **12%** - about an eighth.
+
+- **Unknown is permission**, as everywhere a limit is read (D-023). A path with
+  no measured ceiling is never excluded: never having watched a link fill up is
+  not evidence that it is small, and on a box whose links are quiet most of the
+  time the opposite reading would disable the spread rather than size it. A
+  zero best - no candidate has an opinion - switches the gate off entirely.
+- **The bar is taken over the candidates, not over all eligible paths.** A path
+  real-time is holding is not in the running for bulk, so its capacity must not
+  set a bar that knocks out the links that are.
+- **The gate can never empty the spread.** The best candidate is 100% of
+  itself, and the share bound is capped at 100, so no legal setting strands
+  bulk on the txBulk fallback. The cap is an invariant, not a taste, and there
+  is a test asserting the bound itself.
+
+12% is chosen so a 5 Mbps link still aggregates with a 30 Mbps one - it is
+worth having - while the 512k standby tier of D-022 and the 636 kbps cellular
+link above do not.
+
+**Rejected: weighting the hash by capacity** instead of excluding. More correct
+in principle, and it keeps the small link earning its fraction. But it makes
+the slice occupancy a function of a continuously-moving estimate, and D-044's
+stable-ordering argument - the one that cost a live test to learn - depends on
+membership changing rarely. Re-weighting on every evaluation bounces flows
+between links, which is reordering by another name. A gate changes membership
+only on a state transition, which is the property that argument needs.
+
+**Not addressed.** This is still one-sided in the sense D-043 describes: it
+stops flows being pinned to a link that cannot carry them, which is a real
+download fix, but it does not make the download direction faster than the
+paths themselves allow.

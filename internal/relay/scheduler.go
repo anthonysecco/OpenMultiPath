@@ -279,6 +279,35 @@ func (s *scheduler) txFor(class uint8, flow uint32) []uint8 {
 	return d.txTrans
 }
 
+// undersizedForSpread reports whether a path is too small a share of the best
+// candidate to be worth hashing bulk flows onto (D-045).
+//
+// The load-balancing set is a set of peers. txFor spreads flows across it with
+// a uniform hash, so every member takes its share of the flows no matter what
+// it can carry, and a flow that lands on a member stays there for its whole
+// life. Between links of comparable size that is exactly right. Between links
+// an order of magnitude apart it means half the transfers on the box run at
+// the speed of the worst link - which on this project is the normal case, not
+// a corner: a 636 kbps cellular link beside a 30 Mbps one is what D-045 was
+// written from.
+//
+// D-044's stability filter cannot catch this. The small link is not unstable;
+// it is not losing packets and its jitter is fine. It is simply small, and
+// stability has no term for size.
+//
+// Unknown is permission, as everywhere a limit is read (D-023): a path with no
+// measured ceiling is never excluded, because never having watched a link fill
+// up is not evidence that it is small. A zero best means no candidate has an
+// opinion and the gate is off entirely. Between them these two cases are also
+// what keeps the gate from ever emptying a non-empty spread - the best
+// candidate is 100% of itself, and the share bound tops out at 100.
+func undersizedForSpread(limitKbps, bestKbps float64, c config.Config) bool {
+	if limitKbps <= 0 || bestKbps <= 0 {
+		return false
+	}
+	return limitKbps*100 < bestKbps*float64(c.BulkSpreadMinSharePercent)
+}
+
 // flowHash is a stable hash of an inner IPv4 packet's 5-tuple, used to pin a
 // bulk flow to one load-balancing path. Same flow, same path, every packet -
 // which is what keeps load balancing from turning into reordering. FNV-1a over
@@ -402,12 +431,20 @@ func (s *scheduler) steerBulk(now time.Duration, d *decision, c config.Config, e
 		carrying[id] = true
 	}
 
-	// The load-balancing set (D-044): stable, non-red paths, best first.
+	// The load-balancing set (D-044): stable, non-red, big-enough paths.
 	// Bulk flows are hashed across these so a multi-flow download uses every
 	// healthy link rather than one. Stable-only on purpose: an unstable link
 	// (cellular loss spiking) stays out, so it cannot drag the aggregate
 	// below a single good path - the exact failure that made a two-link
 	// download slower than one. eligible is already sorted best-first.
+	//
+	// Stability alone turned out not to be enough (D-045). A link can be
+	// perfectly stable - no current loss, low jitter, and so correctly
+	// called clean - and still be fifty times smaller than the path beside
+	// it. The hash does not care: it hands that link its half of the flows
+	// anyway, and each one sits there at a fraction of the rate for its
+	// whole life. So size is now a membership test too, and the failure the
+	// paragraph above describes stops arriving through the other door.
 	//
 	// The call's path is reserved only while a call is actually flowing.
 	// D-033 keeps bulk off the primary to protect real-time, but with no
@@ -415,12 +452,28 @@ func (s *scheduler) steerBulk(now time.Duration, d *decision, c config.Config, e
 	// whole uplink - so an idle-of-calls tunnel lets bulk have every link,
 	// and a call starting pulls bulk back off its path within the window.
 	rtActive := s.sess != nil && s.sess.realtimeActive(now)
+	spreadable := func(sc scored) bool {
+		if sc.m.budget.Band == usage.Red || sc.mach.state != stateStable {
+			return false
+		}
+		return !(rtActive && carrying[sc.m.id])
+	}
+
+	// The best measured ceiling among the candidates, which is the bar the
+	// others have to be worth a fraction of (D-045). Taken over the
+	// candidates and not over eligible: a path real-time is holding is not
+	// in the running for bulk, so its capacity must not set a bar that
+	// knocks out the links that are.
+	var bestKbps float64
+	for _, sc := range eligible {
+		if spreadable(sc) && sc.m.bw.limitKbps > bestKbps {
+			bestKbps = sc.m.bw.limitKbps
+		}
+	}
+
 	d.txBulkSpread = d.txBulkSpread[:0]
 	for _, sc := range eligible {
-		if sc.m.budget.Band == usage.Red || sc.mach.state != stateStable {
-			continue
-		}
-		if rtActive && carrying[sc.m.id] {
+		if !spreadable(sc) || undersizedForSpread(sc.m.bw.limitKbps, bestKbps, c) {
 			continue
 		}
 		d.txBulkSpread = append(d.txBulkSpread, sc.m.id)

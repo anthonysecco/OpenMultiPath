@@ -78,6 +78,7 @@ func TestExplicitZeroIsKeptWhereZeroIsValid(t *testing.T) {
 	c.FlapPenaltyR = 0
 	c.SwitchMarginR = 0
 	c.BaseDelayMs = 0
+	c.BulkSpreadMinSharePercent = 0
 
 	got := c.Sanitised()
 	if got.FlapPenaltyR != 0 {
@@ -88,6 +89,31 @@ func TestExplicitZeroIsKeptWhereZeroIsValid(t *testing.T) {
 	}
 	if got.BaseDelayMs != 0 {
 		t.Errorf("base delay = %d, want 0", got.BaseDelayMs)
+	}
+	if got.BulkSpreadMinSharePercent != 0 {
+		t.Errorf("bulk spread share = %d, want the 0 that restores D-044's ungated spread",
+			got.BulkSpreadMinSharePercent)
+	}
+}
+
+// The share is a percentage and nothing outside 0-100 means anything. The
+// ceiling in particular is load-bearing: above 100 a path could fail to be a
+// large enough share of itself, and the spread could come back empty.
+func TestBulkSpreadShareIsClampedToAPercentage(t *testing.T) {
+	over := Defaults()
+	over.BulkSpreadMinSharePercent = 400
+	if got, want := over.Sanitised().BulkSpreadMinSharePercent, Bounds["bulk_spread_min_share_percent"].Max; got != want {
+		t.Errorf("share = %d from 400, want the maximum %d", got, want)
+	}
+	if want := 100; Bounds["bulk_spread_min_share_percent"].Max != want {
+		t.Errorf("share maximum = %d, want %d: above it the gate can empty the spread",
+			Bounds["bulk_spread_min_share_percent"].Max, want)
+	}
+
+	under := Defaults()
+	under.BulkSpreadMinSharePercent = -5
+	if got, want := under.Sanitised().BulkSpreadMinSharePercent, Bounds["bulk_spread_min_share_percent"].Min; got != want {
+		t.Errorf("share = %d from a negative, want the minimum %d", got, want)
 	}
 }
 
