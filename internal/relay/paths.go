@@ -195,7 +195,7 @@ func (ps *pathSet) reconcile() (pending bool) {
 			// The lease moved under us. The old socket is bound to an
 			// address that no longer exists and will never deliver
 			// another packet, so it has to be replaced rather than kept.
-			log.Printf("path %d (%s): address changed %s -> %s, rebinding", spec.id, spec.name, have.local, want)
+			log.Printf("%s: address changed %s -> %s, rebinding", ps.name(spec.id), have.local, want)
 			ps.drop(spec, "address changed")
 			ps.bind(spec, want)
 		}
@@ -284,7 +284,7 @@ func addrPresent(name, ip string) bool {
 func (ps *pathSet) bind(spec pathSpec, local string) {
 	conn, err := listenOnDevice(spec.name, local)
 	if err != nil {
-		log.Printf("path %d (%s): bind to %s failed: %v", spec.id, spec.name, local, err)
+		log.Printf("%s: bind to %s failed: %v", ps.name(spec.id), local, err)
 		return
 	}
 
@@ -293,7 +293,7 @@ func (ps *pathSet) bind(spec pathSpec, local string) {
 	ps.mu.Unlock()
 
 	ps.sess.setBound(spec.id, local)
-	log.Printf("path %d (%s): up, bound to %s, sending to %s", spec.id, spec.name, local, ps.dialing)
+	log.Printf("%s: up, bound to %s, sending to %s", ps.name(spec.id), local, ps.dialing)
 
 	go readLoop(conn, fmt.Sprintf("initiator-path-%s", spec.name), func(buf []byte, _ *net.UDPAddr) {
 		ps.onData(spec.id, buf)
@@ -312,7 +312,7 @@ func (ps *pathSet) drop(spec pathSpec, why string) {
 	}
 	bp.conn.Close()
 	ps.sess.setUnbound(spec.id)
-	log.Printf("path %d (%s): down (%s)", spec.id, spec.name, why)
+	log.Printf("%s: down (%s)", ps.name(spec.id), why)
 }
 
 // send writes one packet out a path, if that path is currently bound.
@@ -330,7 +330,7 @@ func (ps *pathSet) send(id uint8, pkt []byte) {
 	switch {
 	case err == nil:
 		if bp.failing.CompareAndSwap(true, false) {
-			log.Printf("path %d: writing again", id)
+			log.Printf("%s: writing again", ps.name(id))
 		}
 	case errors.Is(err, net.ErrClosed):
 		// The path was retired underneath this write, which the caller
@@ -342,7 +342,7 @@ func (ps *pathSet) send(id uint8, pkt []byte) {
 		// silent, which the measurement layer reports as a path
 		// delivering nothing. Nothing here can do better than say so once.
 		if bp.failing.CompareAndSwap(false, true) {
-			log.Printf("path %d: write failed, suppressing until it recovers: %v%s", id, err, ps.misroutedHint(id, err))
+			log.Printf("%s: write failed, suppressing until it recovers: %v%s", ps.name(id), err, ps.misroutedHint(id, err))
 			// Only on the transition, so a path failing every write asks
 			// once rather than continuously.
 			ps.poke()
@@ -358,6 +358,26 @@ func (ps *pathSet) send(id uint8, pkt []byte) {
 // paths are WireGuard interfaces there, so -remote has to name home's
 // address inside the tunnel rather than the public endpoint the loopback
 // relay dials.
+// name renders a path the way the rest of the daemon does: the link's label
+// where one is configured, the bare id where none is. Kept on pathSet rather
+// than reaching for spec.name at each site so a message here matches one from
+// the scheduler about the same link.
+func (ps *pathSet) name(id uint8) string {
+	label := ""
+	for _, spec := range ps.specs {
+		if spec.id == id {
+			if ps.sess != nil && ps.sess.cfg != nil {
+				label = labelOrEmpty(ps.sess.cfg.Get(), spec.name)
+			}
+			if label == "" {
+				label = spec.name
+			}
+			break
+		}
+	}
+	return pathLabel(id, label)
+}
+
 func (ps *pathSet) misroutedHint(id uint8, err error) string {
 	if !errors.Is(err, syscall.ENOKEY) {
 		return ""
