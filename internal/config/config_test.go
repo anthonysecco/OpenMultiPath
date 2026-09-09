@@ -79,6 +79,7 @@ func TestExplicitZeroIsKeptWhereZeroIsValid(t *testing.T) {
 	c.SwitchMarginR = 0
 	c.BaseDelayMs = 0
 	c.BulkSpreadMinSharePercent = 0
+	c.SpreadMinR = 0
 
 	got := c.Sanitised()
 	if got.FlapPenaltyR != 0 {
@@ -93,6 +94,10 @@ func TestExplicitZeroIsKeptWhereZeroIsValid(t *testing.T) {
 	if got.BulkSpreadMinSharePercent != 0 {
 		t.Errorf("bulk spread share = %d, want the 0 that restores D-044's ungated spread",
 			got.BulkSpreadMinSharePercent)
+	}
+	if got.SpreadMinR != 0 {
+		t.Errorf("spread minimum R = %d, want the 0 that switches the quality gate off",
+			got.SpreadMinR)
 	}
 }
 

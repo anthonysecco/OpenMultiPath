@@ -58,10 +58,11 @@ type decision struct {
 
 	// txBulkSpread is the set of paths a bulk flow may be load-balanced
 	// across, one flow to one path by a hash of its 5-tuple (D-044). It is
-	// the stable, off-call, non-red paths - so two healthy links aggregate
-	// for a multi-flow download that would otherwise sit on one, while a
-	// link that is only unstable (a cellular link spiking to 20% loss) is
-	// left out and cannot drag the others down. Empty falls back to txBulk,
+	// the paths that are stable (D-044), big enough beside the best of them
+	// (D-045), and actually delivering (D-046), minus the call's path while
+	// a call is live - so healthy links aggregate for a multi-flow download
+	// that would otherwise sit on one, while a link that would only drag the
+	// others down is left out. Empty falls back to txBulk,
 	// which keeps D-033's single-best choice for the forest-canopy case
 	// where the only bulk-worthy link is an unstable one. Per flow, not per
 	// packet: a single flow still rides a single path, so nothing reorders.
@@ -279,6 +280,45 @@ func (s *scheduler) txFor(class uint8, flow uint32) []uint8 {
 	return d.txTrans
 }
 
+// deliveringForSpread reports whether a path is actually getting bytes to the
+// far end well enough to be handed flows (D-046).
+//
+// D-044 admitted the stable paths and D-045 added size. Both missed the link
+// that was actually hurting: one dropping 66-71% of what it was given, which
+// the state machine still called "stable (clean)" because its loss counter was
+// windowed and its jitter and queue delay were fine. Loss without queueing is
+// invisible to every delay-derived signal - the packet does not wait, it
+// vanishes - so neither stability nor the bandwidth ceiling could see it. The
+// measurement that could was already being taken and simply was not consulted.
+//
+// Two conditions, because they fail differently:
+//
+//   - Quality now. The R factor over the send direction the peer reports
+//     (D-024), so it describes what our traffic is experiencing rather than
+//     what is arriving here. Raw rFactor rather than machine.score: score
+//     folds in the metered-link surcharge, and being expensive is not the same
+//     as being broken. Cost is already handled by the Red test above.
+//
+//   - Reliability over time. A flapping path can read fine at the instant it
+//     is sampled and still be unusable, which is exactly how the D-046 link
+//     kept rejoining the set - it oscillated across the stability threshold
+//     and got its half of the flows back every time it landed on the good
+//     side. machine.flapping is the existing answer to that, and its own
+//     documentation ("the correct behaviour is to stop trying") is precisely
+//     this case.
+//
+// Excluding a path here does not make it ineligible. Bulk still falls back to
+// the single steered path of D-033, which is deliberately unguarded - a
+// flapping link is a fine place for traffic that can wait, when the
+// alternative is putting it on the call's path. This gate governs only which
+// paths are worth *spreading across*.
+func deliveringForSpread(now time.Duration, sc scored, c config.Config) bool {
+	if rFactor(scoreInputs(sc.m, c)) < float64(c.SpreadMinR) {
+		return false
+	}
+	return !sc.mach.flapping(now, c)
+}
+
 // undersizedForSpread reports whether a path is too small a share of the best
 // candidate to be worth hashing bulk flows onto (D-045).
 //
@@ -431,7 +471,7 @@ func (s *scheduler) steerBulk(now time.Duration, d *decision, c config.Config, e
 		carrying[id] = true
 	}
 
-	// The load-balancing set (D-044): stable, non-red, big-enough paths.
+	// The load-balancing set (D-044): stable, non-red, big enough, delivering.
 	// Bulk flows are hashed across these so a multi-flow download uses every
 	// healthy link rather than one. Stable-only on purpose: an unstable link
 	// (cellular loss spiking) stays out, so it cannot drag the aggregate
@@ -446,6 +486,13 @@ func (s *scheduler) steerBulk(now time.Duration, d *decision, c config.Config, e
 	// whole life. So size is now a membership test too, and the failure the
 	// paragraph above describes stops arriving through the other door.
 	//
+	// Nor was size enough (D-046). The link that was actually hurting was
+	// neither unstable nor small: it was dropping two thirds of what it was
+	// given, which no delay-derived signal can see - a dropped packet does
+	// not queue - and which the state machine missed because it reads the
+	// receive direction while the damage was in the send direction. See
+	// deliveringForSpread.
+	//
 	// The call's path is reserved only while a call is actually flowing.
 	// D-033 keeps bulk off the primary to protect real-time, but with no
 	// call live there is nothing to protect and reserving it would strand a
@@ -454,6 +501,9 @@ func (s *scheduler) steerBulk(now time.Duration, d *decision, c config.Config, e
 	rtActive := s.sess != nil && s.sess.realtimeActive(now)
 	spreadable := func(sc scored) bool {
 		if sc.m.budget.Band == usage.Red || sc.mach.state != stateStable {
+			return false
+		}
+		if !deliveringForSpread(now, sc, c) {
 			return false
 		}
 		return !(rtActive && carrying[sc.m.id])

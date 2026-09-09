@@ -1569,3 +1569,130 @@ func TestUndersizedForSpread(t *testing.T) {
 		}
 	}
 }
+
+// The link that produced D-046, reproduced from the real shape of it.
+//
+// The state machine reads inbound loss (pathstate.go: recentLoss) while the
+// scorer reads the outbound loss the peer reports (scoreInputs: txLoss). So a
+// path whose receive direction is clean is called "stable (clean)" however
+// badly its send direction is failing - which is exactly how a link dropping
+// 66-71% of what it was given kept its place in the load-balancing set and
+// took half of every download with it.
+func TestSpreadExcludesAStableButUndeliveringPath(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 40))
+	w.s.setClassifying(true)
+
+	w.set(0, func(p *pathMetric) {
+		p.haveTx, p.txLoss, p.txBurstRatio, p.rttFloorMs = true, 0, 1, 30
+	})
+	// Inbound clean, outbound in ruins. Nothing else says anything is wrong.
+	w.set(1, func(p *pathMetric) {
+		p.haveTx, p.txLoss, p.txBurstRatio, p.rttFloorMs = true, 30, 1, 40
+		p.recentLoss = 0
+	})
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	// The premise. If the state machine had called path 1 unstable, D-044
+	// would already have excluded it and this test would prove nothing.
+	if w.s.machines[1].state != stateStable {
+		t.Fatalf("path 1 is %v, want stable - the whole point is that it looks fine",
+			w.s.machines[1].state)
+	}
+	if spreadSet(d)[1] {
+		t.Errorf("spread %v includes a path losing 30%% of what it is sent", d.txBulkSpread)
+	}
+	if !spreadSet(d)[0] {
+		t.Errorf("spread %v dropped the good path too", d.txBulkSpread)
+	}
+}
+
+// The other side of the gate. Ordinary cellular loss is a few percent and
+// scores in the eighties - a link like that is exactly what the spread is for,
+// and a fix that excluded it would have turned load balancing off.
+func TestSpreadKeepsAPathWithOrdinaryCellularLoss(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 40))
+	w.s.setClassifying(true)
+
+	w.set(0, func(p *pathMetric) {
+		p.haveTx, p.txLoss, p.txBurstRatio, p.rttFloorMs = true, 0, 1, 30
+	})
+	w.set(1, func(p *pathMetric) {
+		p.haveTx, p.txLoss, p.txBurstRatio, p.rttFloorMs = true, 3, 1, 40
+	})
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	if !spreadSet(d)[0] || !spreadSet(d)[1] {
+		t.Errorf("spread = %v, want both: 3%% loss is a working link", d.txBulkSpread)
+	}
+}
+
+// A path can read fine at the instant it is sampled and still be unusable.
+// That is how the D-046 link kept rejoining the set - it oscillated across the
+// stability threshold and collected its half of the flows every time it landed
+// on the good side. machine.flapping already exists to say "stop trying".
+func TestSpreadExcludesAFlappingPath(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 40))
+	w.s.setClassifying(true)
+
+	w.set(0, func(p *pathMetric) {
+		p.haveTx, p.txLoss, p.txBurstRatio, p.rttFloorMs = true, 0, 1, 30
+	})
+	w.set(1, func(p *pathMetric) {
+		p.haveTx, p.txLoss, p.txBurstRatio, p.rttFloorMs = true, 0, 1, 40
+	})
+	w.tick(w.c.PromoteIntervals + 5)
+
+	// Quality is perfect; only the history is bad.
+	m := w.s.machines[1]
+	for i := 0; i < w.c.FlapThreshold; i++ {
+		m.transitions = append(m.transitions, w.now)
+	}
+	d := w.tick(1)
+
+	if spreadSet(d)[1] {
+		t.Errorf("spread %v includes a flapping path", d.txBulkSpread)
+	}
+}
+
+// Principle 5. When the gate leaves nothing, bulk must not stop - it falls
+// back to D-033's single steered path, which is deliberately unguarded because
+// a flaky link is still a better home for a download than the call's path.
+func TestSpreadEmptyStillCarriesBulk(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 40))
+	w.s.setClassifying(true)
+
+	for _, id := range []uint8{0, 1} {
+		w.set(id, func(p *pathMetric) {
+			p.haveTx, p.txLoss, p.txBurstRatio, p.rttFloorMs = true, 40, 1, 40
+		})
+	}
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	if len(d.txBulkSpread) != 0 {
+		t.Fatalf("spread = %v, want empty when nothing is delivering", d.txBulkSpread)
+	}
+	if got := w.s.txFor(protocol.ClassBulk, 7); len(got) == 0 {
+		t.Error("bulk has nowhere to go with an empty spread; it must fall back to txBulk")
+	}
+}
+
+// Cost is not brokenness. The quality gate reads the raw R factor, not
+// machine.score, because score folds in the metered-link surcharge - a yellow
+// link that is working perfectly must still aggregate.
+func TestSpreadQualityGateIgnoresTheMeteredSurcharge(t *testing.T) {
+	w := newWorld(t, path(0, 30), path(1, 40))
+	w.s.setClassifying(true)
+
+	w.set(0, func(p *pathMetric) {
+		p.haveTx, p.txLoss, p.txBurstRatio, p.rttFloorMs = true, 0, 1, 30
+	})
+	w.set(1, func(p *pathMetric) {
+		p.haveTx, p.txLoss, p.txBurstRatio, p.rttFloorMs = true, 0, 1, 40
+		p.budget.Band = usage.Yellow
+	})
+	d := w.tick(w.c.PromoteIntervals + 5)
+
+	if !spreadSet(d)[1] {
+		t.Errorf("spread = %v, want the yellow link: expensive is not broken", d.txBulkSpread)
+	}
+}

@@ -171,6 +171,17 @@ type Config struct {
 	// D-045.
 	BulkSpreadMinSharePercent int `json:"bulk_spread_min_share_percent"`
 
+	// SpreadMinR is the lowest measured quality, in E-model R points, a
+	// path may have and still join the per-flow load-balancing set. It is
+	// scored on the send direction the peer reports (D-024), so it is what
+	// this end's traffic is actually experiencing rather than what is
+	// arriving here.
+	//
+	// Deliberately far below MinAcceptableR: that is a call threshold, and
+	// bulk is explicitly sacrificial. This one only has to separate a link
+	// that is delivering from one that is not. See D-046.
+	SpreadMinR int `json:"spread_min_r"`
+
 	// The classification thresholds of step 7. The two that matter are
 	// ClassifyRTPMaxBytes and ClassifyGapVarianceMs: protocol.md's claim
 	// is that mean packet size and inter-packet-gap variance separate RTP
@@ -457,6 +468,15 @@ var Bounds = map[string]bound{
 	// the bounds can empty a non-empty spread. Zero disables the gate.
 	"bulk_spread_min_share_percent": {Min: 0, Max: 100, Default: 12},
 
+	// R 50 is the floor of G.109's scale - below it the model stops having
+	// a category, which is the right place to stop handing a link flows.
+	// With loss scattered it admits about 20%; bursty loss pushes R down
+	// much faster, which is what we want, because loss in runs is far worse
+	// for a transfer than the same rate scattered. Ordinary cellular (a few
+	// percent) scores 83-90 and is never near this. The link that produced
+	// D-046 scored ~0. Zero disables the gate.
+	"spread_min_r": {Min: 0, Max: 100, Default: 50},
+
 	// Twenty-four packets is under half a second of an RTP flow at its
 	// 20 ms cadence. Long enough for a gap variance to mean something,
 	// short enough that a native conferencing client nobody has a prefix
@@ -532,6 +552,7 @@ func Defaults() Config {
 		BWFallbackKbps:    Bounds["bw_fallback_kbps"].Default,
 
 		BulkSpreadMinSharePercent: Bounds["bulk_spread_min_share_percent"].Default,
+		SpreadMinR:                Bounds["spread_min_r"].Default,
 		ReportIntervalMs:          Bounds["report_interval_ms"].Default,
 
 		ClassifySamplePackets:   Bounds["classify_sample_packets"].Default,
@@ -627,6 +648,7 @@ func (c Config) Sanitised() Config {
 		BWFallbackKbps:    clamp(c.BWFallbackKbps, Bounds["bw_fallback_kbps"]),
 
 		BulkSpreadMinSharePercent: clamp(c.BulkSpreadMinSharePercent, Bounds["bulk_spread_min_share_percent"]),
+		SpreadMinR:                clamp(c.SpreadMinR, Bounds["spread_min_r"]),
 		ReportIntervalMs:          clamp(c.ReportIntervalMs, Bounds["report_interval_ms"]),
 
 		ClassifySamplePackets:   clamp(c.ClassifySamplePackets, Bounds["classify_sample_packets"]),

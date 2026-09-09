@@ -715,6 +715,8 @@ const FIELDS = [
    "Margin a path must have spare before traffic is steered onto it. Arriving exactly at the estimated ceiling is arriving at the wall."],
   ["bw_fallback_kbps", "Capacity if unmeasured", "kbps",
    "What a path is assumed to carry before it has ever been seen to queue. Zero means unknown, which applies no limit at all - set it only where a plan's ceiling is genuinely known, such as a 512k satellite standby tier."],
+  ["spread_min_r", "Load-balancing minimum quality", "R",
+   "Lowest measured quality, in R points, a link needs before downloads and web traffic are spread onto it. Scored on what the far end reports actually arriving, so a link losing most of what it is sent is excluded even while it looks healthy from this side. Well below the call threshold on purpose - bulk tolerates far more than a call. Zero spreads across every healthy link regardless of quality."],
   ["bulk_spread_min_share_percent", "Load-balancing minimum share", "%",
    "Smallest share of the fastest link's capacity a path needs before downloads and web traffic are spread onto it. A link far smaller than the one beside it still takes its half of the flows, and every flow that lands there runs at the small link's speed. Zero spreads across every healthy link regardless of size."],
 ];

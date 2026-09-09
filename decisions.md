@@ -2038,3 +2038,88 @@ only on a state transition, which is the property that argument needs.
 stops flows being pinned to a link that cannot carry them, which is a real
 download fix, but it does not make the download direction faster than the
 paths themselves allow.
+
+## D-046 · Spread membership needs delivery, not just stability and size
+
+**Problem.** D-044 admitted the stable paths to the load-balancing set and
+D-045 added a size test. Both missed the link that was actually costing us
+throughput, and it was neither unstable nor small.
+
+Measured on the vehicle over several hours, on home (the sender for the
+download direction):
+
+```
+path 1: stable (clean) mos 1.0 FLAPPING | rx 42484 lost 102293 | ceiling unknown, carried 41941kbps clean
+path 0: stable (clean) mos 4.2 PRIMARY  | rx 902654 lost   8532 | ceiling 65496kbps
+```
+
+Path 1 was dropping **71%** of what it was given. It was still in the spread,
+and `txFor` hashes uniformly, so it took half of every download. Ookla against
+one fixed server (EGI Hosting, id 32408), runs five seconds apart:
+
+```
+run 1   down   0.49 Mbps      run 4   down 142.69 Mbps
+run 2   down 133.34 Mbps      run 5   down 135.36 Mbps
+run 3   down 137.25 Mbps      run 6   down 145.25 Mbps
+```
+
+Three things had to go wrong together, and each is worth stating:
+
+- **Loss without queueing is invisible to every delay-derived signal.** A
+  dropped packet does not wait in a buffer, so it never raises queue delay.
+  That is why D-023's bandwidth estimator never recorded a ceiling for this
+  path at all (`ceiling unknown` beside 42 Mbps of throughput), and therefore
+  why D-045's size gate read "unknown" and waved it through. A capacity test
+  structurally cannot see this failure.
+- **The state machine reads the wrong direction for this purpose.** It tests
+  `recentLoss`, which is inbound. The damage was outbound, in `txLoss`, which
+  only the peer can see (D-024). Path 1's receive direction was genuinely
+  clean, so `stable (clean)` was correct and useless.
+- **Hysteresis let it back in.** Marked `FLAPPING`, it oscillated across the
+  stability threshold and collected its half of the flows again on every
+  swing to the good side.
+
+**Decision.** Add a delivery test to spread membership: a path joins only if
+`rFactor(scoreInputs(...))` is at least `spread_min_r` (default **50**) and
+`machine.flapping` is false.
+
+- **Scored on the send direction the peer reports**, so it describes what our
+  traffic is experiencing rather than what is arriving here.
+- **Raw `rFactor`, not `machine.score`.** score folds in the metered-link
+  surcharge, and being expensive is not the same as being broken; cost is
+  already handled by the existing Red test. There is a test asserting a yellow
+  link still aggregates.
+- **R 50 is the floor of G.109's scale.** With loss scattered it admits about
+  20%; bursty loss pushes R down much faster, which is what we want, because
+  loss in runs is far worse for a transfer than the same rate scattered - the
+  burst term of D-021 turns out to align with what TCP cares about. Ordinary
+  cellular (a few percent) scores 83-90. The link above scored ~0.
+- **Far below `min_acceptable_r` (70) on purpose.** That is a call threshold.
+  Bulk is explicitly sacrificial and only needs the link to be delivering.
+
+**No new measurement.** Loss was already measured, already on the wire, and
+already correct - the daemon had been printing `mos 1.0` next to
+`stable (clean)` the whole time. It simply was not consulted when placing
+flows.
+
+**Rejected: per-packet routing by total one-way latency (queue + link).** It
+is an appealing simplification - route by queue delay and capacity estimation
+becomes implicit, since a full link's queue builds and it stops being chosen.
+It fails here for the same reason everything else did. On the samples above,
+`rtt + queue` was 53.6 ms for path 1 against 67.3 ms for path 0, and at 06:29
+it was 52.5 ms against 126.4 ms: **the 66%-loss path wins a latency race**,
+so per-packet delay routing would have sent it more traffic, not less. It also
+needs a resequencer that does not exist (`GlobalSeq` is reserved for "a future
+resequencer", header.go) and brings head-of-line blocking, where one loss on
+the bad path stalls everything behind it. Revisit for bulk only, after a
+resequencer and alongside a loss term - not instead of one.
+
+**Rejected: tuning the onset dwell filter.** `bw_onset_dwell_ms` already
+requires queueing to hold for a second before the estimate moves. Neither
+failure reaches it: the under-read records a real onset at the wrong rate, and
+this path never queues at all.
+
+**Not addressed.** The estimator still reads demand rather than capacity
+(path 0 recorded 2343 kbps while carrying 133 Mbps), and still cannot measure
+an idle path. That is a separate decision; this one only stops flows being
+handed to a link that is visibly not delivering.
