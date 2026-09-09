@@ -2123,3 +2123,93 @@ this path never queues at all.
 (path 0 recorded 2343 kbps while carrying 133 Mbps), and still cannot measure
 an idle path. That is a separate decision; this one only stops flows being
 handed to a link that is visibly not delivering.
+
+## D-047 · Narrow the capacity estimate to the job it can do
+
+**Problem.** D-046 established that the bandwidth estimator is wrong in two
+directions, and the session that produced it showed how far: AT&T logged
+`ceiling 2343kbps` while carrying 133 Mbps, and `ceiling unknown` while
+carrying 170 Mbps; Starlink logged `ceiling unknown` throughout while carrying
+42 Mbps at 71% loss. Every consumer of that number inherits the error.
+
+The instinct is to fix the estimator. The better reading is that it is **fit
+for one job and unfit for the other**:
+
+- **Unfit for throughput scheduling.** That needs an absolute figure on a
+  large link, and the onset method cannot produce one: it latches whatever was
+  being sent at the moment queueing began, which is demand.
+- **Fit for duplication gating (D-023).** That asks "is this link too small to
+  take a mirrored call" - a small, *congestive* link, which queues the instant
+  you push into it. Exactly what onset detection sees well.
+
+D-046 already took the throughput job away using loss. This decision finishes
+the move.
+
+**Removed.**
+
+- **`roomier` / `considerRoomier` / `bwPreferFactor`.** This broke a tied score
+  by moving the *primary* onto the path with more measured capacity. The field
+  case behind it (2026-09-01, a flow pinned to a 512 kbps standby link with a
+  multi-megabit one idle) was a **throughput** complaint, and throughput no
+  longer follows the primary: D-044 spreads bulk and transactional across every
+  delivering link whatever is carrying the call. So the outcome that case wanted
+  is still reached without moving a healthy call - and moving it was being
+  decided by the least reliable number in the system. Principle 4 takes
+  reliability over performance; this was a performance optimisation aimed at
+  the one flow that matters most. The replacement test asserts the tie leaves
+  the call alone *and* that bulk still reaches the roomier link.
+- **`bw_fallback_kbps`.** Default 0, which disabled it. A knob for "a plan whose
+  ceiling is known in advance", set by nobody, doing a job a comment does
+  better. `limitKbps` now returns a plain 0 for an unmeasured path.
+
+**Changed.**
+
+- **Regime-change reset, alongside the ageing curve.** The comment on the
+  ageing constants argues an estimate ages in confidence but not in value -
+  *"a link does not shrink because nobody used it"*. True of a fixed link,
+  false of a vehicle: driving out of a cell sector does not make the old number
+  less certain, it makes it wrong, and holding 70% of a wrong number is worse
+  than holding none. The round-trip floor is a property of the route rather
+  than the load, so a floor that moves by more than `bwRegimeFactor` (2x, in
+  either direction) now discards the ceiling and the proven floor with it.
+  Ageing still handles a quiet link; this handles a moved one. They are
+  different questions and both are needed - principle 3, applied to the one
+  file that was assuming otherwise.
+- **The proven floor counts arrivals, not departures.** `provenKbps` now
+  records `sendKbps × (1 − txLoss)` using the loss the peer already reports
+  (D-024), so a link given 40 Mbps that delivers a third of it records ~13
+  Mbps rather than 40. No protocol change; both numbers were already on the
+  wire. Kept as a floor and never a ceiling, which is what keeps it out of the
+  feedback trap the onset-measured ceiling sits in: a ceiling that reads low
+  makes the scheduler send less, which keeps it low, while a floor that reads
+  low costs only a missed opportunity and corrects itself with traffic. A path
+  with no report is undiscounted - unreported is not lossy, it is unmeasured.
+
+**Added: link labels.** `LinkBudget` gains `Label`, and `Config.LabelFor`
+falls back to the interface name. Logs, the state file and the interface now
+say `path 1 (Starlink)` rather than `path 1`. This is the smallest change here
+and probably the most useful: diagnosing this took deriving the mapping by
+hand through `wg show fwmark` → routing table → an IP lookup, and the question
+being asked at 2am in a campground is which physical link to go and look at.
+The id is kept alongside the label because the state file and history log are
+keyed by it.
+
+**Kept deliberately: D-045's size gate.** Largely inert today, because it needs
+a ceiling and rarely gets one. The case it covers - a link that is small *and
+healthy*, scoring R ~90 and sailing through D-046's quality gate - is real and
+returns the moment a standby tier is in use. It fails safe. Not counted as
+working until the estimate improves.
+
+**Decided, not changed: real-time on a failing link.** `txFor` returns early
+for `ClassRealtime`, so D-046's quality gate never applies to calls, and
+`DuplicateMode` defaults to `unstable` - meaning Starlink at 71% loss still
+receives duplicated call audio whenever AT&T wobbles. That is correct and
+stays: the copies that arrive are free insurance, the dedup window discards
+the rest, and D-023's `canCarry` still stops a mirror going onto a link too
+small to hold it. Recording it because it was an accident of where the gate
+sits rather than a decision anyone had made.
+
+**Deferred, explicitly.** Per-packet steering and the resequencer that
+`GlobalSeq` is reserved for; capacity-weighted placement with a flow table;
+a home-side PEP; revisiting D-007's FEC deferral. All are defensible, none
+belong in v1.

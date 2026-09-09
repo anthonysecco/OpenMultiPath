@@ -151,14 +151,6 @@ type Config struct {
 	// packet, and on a 512 kbps standby link every header byte is counted.
 	ReportIntervalMs int `json:"report_interval_ms"`
 
-	// BWFallbackKbps is what a path is assumed to carry before it has ever
-	// been seen to queue. Zero means "unknown", which is the default and
-	// disables the gate rather than guessing: never having watched a path
-	// fill up is not evidence that it is small. Set it where a plan's
-	// ceiling is known in advance - a 512k satellite standby tier is the
-	// case this exists for.
-	BWFallbackKbps int `json:"bw_fallback_kbps"`
-
 	// BulkSpreadMinSharePercent is the smallest share of the best
 	// candidate's measured ceiling a path may have and still join the
 	// per-flow load-balancing set of D-044. Below it the path is left out
@@ -283,8 +275,21 @@ type Config struct {
 	BudgetRedPenaltyR    int `json:"budget_red_penalty_r"`
 }
 
-// LinkBudget is one WAN link's allowance. The zero value is unmetered.
+// LinkBudget is one WAN link's allowance and how it should be named. The
+// zero value is an unmetered link with no label.
 type LinkBudget struct {
+	// Label is what this link is called in logs, the interface, and any
+	// answer to "which one is broken". Empty falls back to the interface
+	// name, which is what every message used before this existed.
+	//
+	// It is here rather than in a table of its own because this map is
+	// already the one place keyed by the name the operator knows, and a
+	// second map keyed the same way would be a second thing to keep in
+	// step. "wg2" and "path 1" are internal facts; "Starlink" is the one
+	// that answers the question actually being asked at 2am in a
+	// campground, which is which physical link to go and look at.
+	Label string `json:"label,omitempty"`
+
 	// CapMB is the billing-cycle allowance in megabytes. Zero means
 	// unmetered: no cap, no bands, no penalty, usage still counted.
 	//
@@ -454,9 +459,6 @@ var Bounds = map[string]bound{
 	// within a couple of scheduler intervals, slow enough to be free.
 	"report_interval_ms": {Min: 100, Max: 60_000, Default: 1_000},
 
-	// Zero means unknown, and unknown means no gate. See BWFallbackKbps.
-	"bw_fallback_kbps": {Min: 0, Max: 10_000_000, Default: 0},
-
 	// An eighth, near enough. A link worth load-balancing onto has to be
 	// able to carry a real fraction of what the best one does: at 12% a
 	// 5 Mbps link still joins a 30 Mbps one, which is right - it is worth
@@ -549,7 +551,6 @@ func Defaults() Config {
 		BWOnsetDwellMs:    Bounds["bw_onset_dwell_ms"].Default,
 		BWMinLoadKbps:     Bounds["bw_min_load_kbps"].Default,
 		BWHeadroomPercent: Bounds["bw_headroom_percent"].Default,
-		BWFallbackKbps:    Bounds["bw_fallback_kbps"].Default,
 
 		BulkSpreadMinSharePercent: Bounds["bulk_spread_min_share_percent"].Default,
 		SpreadMinR:                Bounds["spread_min_r"].Default,
@@ -645,7 +646,6 @@ func (c Config) Sanitised() Config {
 		BWOnsetDwellMs:    clamp(c.BWOnsetDwellMs, Bounds["bw_onset_dwell_ms"]),
 		BWMinLoadKbps:     clamp(c.BWMinLoadKbps, Bounds["bw_min_load_kbps"]),
 		BWHeadroomPercent: clamp(c.BWHeadroomPercent, Bounds["bw_headroom_percent"]),
-		BWFallbackKbps:    clamp(c.BWFallbackKbps, Bounds["bw_fallback_kbps"]),
 
 		BulkSpreadMinSharePercent: clamp(c.BulkSpreadMinSharePercent, Bounds["bulk_spread_min_share_percent"]),
 		SpreadMinR:                clamp(c.SpreadMinR, Bounds["spread_min_r"]),
@@ -692,6 +692,7 @@ func sanitisedLinks(in map[string]LinkBudget) map[string]LinkBudget {
 			l.CycleDay = Bounds["link_cycle_day"].Default
 		}
 		out[name] = LinkBudget{
+			Label:    l.Label,
 			CapMB:    clamp(l.CapMB, Bounds["link_cap_mb"]),
 			CycleDay: clamp(l.CycleDay, Bounds["link_cycle_day"]),
 		}
@@ -713,6 +714,16 @@ func (c Config) LinkFor(iface string) LinkBudget {
 		l.CycleDay = Bounds["link_cycle_day"].Default
 	}
 	return l
+}
+
+// LabelFor is the human name for a link, falling back to the interface name
+// when none is configured. Never returns empty: a log line with a blank where
+// the link should be is worse than one naming an interface.
+func (c Config) LabelFor(iface string) string {
+	if l, ok := c.Links[iface]; ok && l.Label != "" {
+		return l.Label
+	}
+	return iface
 }
 
 func (c Config) EchoInterval() time.Duration {

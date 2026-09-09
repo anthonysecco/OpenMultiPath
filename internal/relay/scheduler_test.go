@@ -534,11 +534,19 @@ func TestHandoverToASmallPathStillHappensBelowTheFloor(t *testing.T) {
 // identical, because the E-model measures impairment and neither is
 // impaired. Path 0 is the 512 kbps satellite standby link and happens to be
 // primary; path 1 is cellular with four times the measured capacity and is
-// idle. Nothing could ever move the flow, because a challenger must beat
-// the incumbent by SwitchMarginR and a tie never will, so upload sat at
+// idle. Nothing could move the flow, because a challenger must beat the
+// incumbent by SwitchMarginR and a tie never will, so upload sat at
 // 0.45 Mbps with a multi-megabit link beside it.
-func TestTiedQualityBreaksTowardsCapacity(t *testing.T) {
+//
+// D-023 answered that by breaking the tie on capacity and moving the call.
+// D-047 removed that, because the complaint was throughput and throughput no
+// longer follows the primary: D-044 spreads bulk across every delivering link
+// whatever is carrying the call. So the outcome the field case wanted is still
+// reached - the idle link gets the transfer - without moving a healthy call on
+// the least reliable number in the system.
+func TestTiedQualityLeavesTheCallAndSpreadsBulkAnyway(t *testing.T) {
 	w := newWorld(t, path(0, 30), path(1, 35))
+	w.s.setClassifying(true)
 	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 3, limitKbps: 506, haveCeiling: true} })
 	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 5, limitKbps: 2071, haveCeiling: true} })
 
@@ -555,8 +563,15 @@ func TestTiedQualityBreaksTowardsCapacity(t *testing.T) {
 	if a, b := d.views[0].Score, d.views[1].Score; a != b {
 		t.Fatalf("paths did not tie (%.1f vs %.1f); this test is about the tie", a, b)
 	}
-	if d.primary != 1 {
-		t.Errorf("primary stayed on path %d (506 kbps) with 2071 kbps available (%s)", d.primary, d.reason)
+	// The call stays put: a healthy primary is not moved for capacity.
+	if d.primary != 0 {
+		t.Errorf("primary moved to path %d; a tie must no longer move a healthy call (%s)",
+			d.primary, d.reason)
+	}
+	// But the transfer still reaches the roomier link.
+	if !spreadSet(d)[1] {
+		t.Errorf("spread = %v, want the idle 2071 kbps path: this is what replaced the handover",
+			d.txBulkSpread)
 	}
 }
 

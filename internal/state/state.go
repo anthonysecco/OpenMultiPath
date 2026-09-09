@@ -113,8 +113,14 @@ type Scheduler struct {
 
 // Path is one link's measurements.
 type Path struct {
-	ID     uint8  `json:"id"`
-	Name   string `json:"name,omitempty"`
+	ID   uint8  `json:"id"`
+	Name string `json:"name,omitempty"`
+
+	// Label is the link's human name ("Starlink"), empty when none is
+	// configured. Name stays the interface, because the interface is what
+	// every other tool on the box is keyed by and renaming it here would
+	// break the one thing this file is for.
+	Label  string `json:"label,omitempty"`
 	Remote string `json:"remote,omitempty"`
 
 	RTTMs        float64 `json:"rtt_ms"`

@@ -116,6 +116,54 @@ type bwEstimate struct {
 	// evidence. It is what ages, and the only thing that does.
 	confirmedAt time.Duration
 	everLoaded  bool
+
+	// ceilingFloorMs is the path's minimum round trip at the moment the
+	// ceiling was recorded, kept so a later reading can tell whether the
+	// ceiling still describes the same link. See regimeChanged.
+	ceilingFloorMs float64
+}
+
+// bwRegimeFactor is how far the round-trip floor has to move before the
+// ceiling is treated as describing a different link.
+//
+// The floor is the round trip with nothing queued on it, so it is a property
+// of the route rather than of the load: it moves when the route does. A
+// handover to a different tower, a 5G-to-LTE fallback, or Starlink picking a
+// different satellite all show up here, and none of them leave the old
+// capacity figure meaning anything.
+//
+// Generous on purpose. This discards evidence, so it should fire on a route
+// that has plainly changed and not on ordinary variation - and the cost of
+// missing one is a stale estimate, which is the situation we were in anyway.
+const bwRegimeFactor = 2.0
+
+// regimeChanged reports whether the path underneath has changed enough that
+// the recorded ceiling no longer describes it (D-047).
+//
+// The comment on the ageing constants above says an estimate ages in
+// confidence but not in value, because "a link does not shrink because nobody
+// used it". That is true of a fixed link and false of a vehicle. Driving out
+// of a cell sector does not make the old number less certain, it makes it
+// wrong, and holding 70% of a wrong number is worse than holding none:
+// principle 3 says variable connectivity is the normal case here, and this is
+// the one file that was assuming otherwise.
+//
+// So the ageing curve still handles a quiet link, and this handles a moved
+// one. They answer different questions and both are needed.
+func (b *bwEstimate) regimeChanged(rttFloorMs float64) bool {
+	if !b.haveCeiling || b.ceilingFloorMs <= 0 || rttFloorMs <= 0 {
+		return false
+	}
+	return rttFloorMs > b.ceilingFloorMs*bwRegimeFactor ||
+		rttFloorMs*bwRegimeFactor < b.ceilingFloorMs
+}
+
+// forgetCeiling discards a ceiling that no longer describes the path. The
+// proven floor goes with it: it was measured on the old route too.
+func (b *bwEstimate) forgetCeiling() {
+	b.ceilingKbps, b.haveCeiling, b.ceilingFloorMs = 0, false, 0
+	b.provenKbps = 0
+	b.queueing, b.onsetSince, b.candidateKbps = false, 0, 0
 }
 
 // noteSent accounts for one packet put onto this path, in wire bytes.
@@ -140,6 +188,13 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx p
 	}
 
 	b.trackFloor(now, rttMs)
+
+	// A route that has plainly moved takes its capacity figure with it.
+	// Checked before anything is concluded from this tick, so a reading
+	// taken on the new route is never folded into the old estimate.
+	if b.regimeChanged(b.minRTTMs) {
+		b.forgetCeiling()
+	}
 
 	if now-b.winStart < bwRateWindow {
 		return
@@ -199,6 +254,7 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx p
 			if !b.haveCeiling || b.candidateKbps < b.ceilingKbps {
 				b.ceilingKbps = b.candidateKbps
 				b.haveCeiling = true
+				b.ceilingFloorMs = b.minRTTMs
 			}
 			b.queueing = true
 			b.onsetSince = 0
@@ -218,12 +274,41 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx p
 	// as one, and it is allowed to lift a stale ceiling that the path has
 	// visibly outgrown - but it never invents headroom above what has
 	// actually flowed.
-	if b.sendKbps > b.provenKbps {
-		b.provenKbps = b.sendKbps
+	// What actually arrived, not what was offered. On a link losing packets
+	// without queueing - Starlink dropping two thirds of what it is given -
+	// the send rate says nothing about capacity, because most of it never
+	// landed. The peer already reports the loss (D-024), so the delivered
+	// rate costs nothing to compute and is the honest figure (D-047).
+	//
+	// Recorded as a floor, never as a ceiling. "This path delivered at least
+	// this much" can only ever be revised upward by more traffic, which is
+	// what keeps it out of the feedback trap that the onset-measured ceiling
+	// sits in: a ceiling that reads low makes the scheduler send less, which
+	// keeps the ceiling low. A floor that reads low costs nothing but a
+	// missed opportunity, and corrects itself the next time traffic flows.
+	if delivered := b.deliveredKbps(tx); delivered > b.provenKbps {
+		b.provenKbps = delivered
 	}
 	if b.haveCeiling && b.sendKbps > b.ceilingKbps {
 		b.ceilingKbps = b.sendKbps
+		b.ceilingFloorMs = b.minRTTMs
 	}
+}
+
+// deliveredKbps is the send rate discounted by the loss the peer reports, or
+// the raw send rate when no report is in hand.
+//
+// Without a report this is the old behaviour exactly, which is the right
+// fallback: an unreported path is not a lossy one, it is an unmeasured one,
+// and assuming loss we cannot see would understate every quiet link.
+func (b *bwEstimate) deliveredKbps(tx peerView) float64 {
+	if !tx.valid || tx.loss <= 0 {
+		return b.sendKbps
+	}
+	if tx.loss >= 100 {
+		return 0
+	}
+	return b.sendKbps * (1 - tx.loss/100)
 }
 
 // outboundQueueMs is how much the link is queueing in our send direction.
@@ -288,12 +373,14 @@ func bwConfidence(age time.Duration) float64 {
 // limitKbps is what the scheduler may assume this path can carry, or 0 for
 // "no opinion" - which every caller must read as permission, not refusal.
 //
-// A path with no observed onset returns the configured fallback, which
-// defaults to 0. That is the honest answer: never having seen a path queue
-// is not evidence that it is small.
+// A path with no observed onset returns 0. That is the honest answer: never
+// having seen a path queue is not evidence that it is small. There used to be
+// a configurable fallback here for a plan whose ceiling was known in advance;
+// D-047 removed it as a knob nobody had set, doing a job a comment does
+// better.
 func (b *bwEstimate) limitKbps(now time.Duration, c config.Config) float64 {
 	if !b.haveCeiling {
-		return float64(c.BWFallbackKbps)
+		return 0
 	}
 	return b.ceilingKbps * bwConfidence(now-b.confirmedAt)
 }
@@ -337,12 +424,3 @@ func (v bwView) canCarry(loadKbps float64, c config.Config) bool {
 	needed := (v.sendKbps + loadKbps) * (1 + float64(c.BWHeadroomPercent)/100)
 	return needed <= v.limitKbps
 }
-
-// bwPreferFactor is how much more capacity a path needs before it displaces
-// an equally-scoring primary. A factor rather than a margin, because these
-// links differ by orders of magnitude rather than by percentages: the case
-// this exists for is 512 kbps against tens of megabits, not 8 Mbps against
-// 9. Set high enough that ordinary variation in the estimate never triggers
-// a handover, since the estimate tracks demand as much as capacity and a
-// tighter rule would chase it.
-const bwPreferFactor = 2.0

@@ -993,6 +993,7 @@ func (s *session) metrics(now time.Duration) []pathMetric {
 			unusable:       p.mtu.ceiling != 0 && p.mtu.confirmed < minUsablePathMTU,
 			bw:             p.bw.view(now, c),
 			budget:         s.budgetState(s.names[id], c),
+			label:          c.LabelFor(s.names[id]),
 
 			haveTx:       p.peer.fresh(now),
 			txSpreadMs:   p.peer.spreadMs,
@@ -1101,9 +1102,9 @@ func (s *session) logStats() {
 		s.mu.Lock()
 		for id, p := range s.paths {
 			st := &p.stats
-			log.Printf("path %d: %s | rtt %.1fms p95-spread %.1fms jitter %.1fms queue %.1fms | "+
+			log.Printf("%s: %s | rtt %.1fms p95-spread %.1fms jitter %.1fms queue %.1fms | "+
 				"rx %d lost %d bursts %v | samples %d%s | mtu %d | tx %.0fkbps %s",
-				id, describe(d, id),
+				pathLabel(id, s.cfg.Get().LabelFor(s.names[id])), describe(d, id),
 				ms(p.rtt), msi(st.spread()), st.jitter/1000, msi(st.queueDelay),
 				st.received, st.lost, st.bursts,
 				st.filled, thinNote(st.thin()),
@@ -1240,6 +1241,7 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 		path := state.Path{
 			ID:                id,
 			Name:              s.names[id],
+			Label:             labelOrEmpty(snap.Config, s.names[id]),
 			Budget:            budget.Band.String(),
 			BudgetMetered:     budget.Metered,
 			CapBytes:          budgetFor(s.names[id], c).CapBytes,

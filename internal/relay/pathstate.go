@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
@@ -69,6 +70,12 @@ type pathMetric struct {
 	// arriving. Receiving on a path proves the reverse direction only, and
 	// paths are asymmetric.
 	confirmedAt time.Duration
+
+	// label is the human name for this link ("Starlink"), or the interface
+	// name when none is configured. Carried on the metric so every log line
+	// and every view can name a link the way the operator does without
+	// reaching back into config.
+	label string
 
 	rttMs        float64
 	p95SpreadMs  float64
@@ -301,4 +308,26 @@ func (m *machine) score(now time.Duration, p pathMetric, c config.Config) float6
 	}
 
 	return clampFloat(r, 0, 100)
+}
+
+// pathLabel renders a path for a human: the link's name where one is
+// configured, and the old "path N" where none is. The id is kept alongside a
+// label because the state file, the history log and every previous log line
+// are keyed by it, and a message that named only "Starlink" could not be
+// matched against them.
+func pathLabel(id uint8, label string) string {
+	if label == "" {
+		return fmt.Sprintf("path %d", id)
+	}
+	return fmt.Sprintf("path %d (%s)", id, label)
+}
+
+// labelOrEmpty is LabelFor without the interface-name fallback: the state
+// file keeps Name and Label as separate fields, so a link with no label must
+// leave Label empty rather than duplicating Name into it.
+func labelOrEmpty(c config.Config, iface string) string {
+	if l := c.LabelFor(iface); l != iface {
+		return l
+	}
+	return ""
 }

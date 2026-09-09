@@ -174,6 +174,13 @@ type scheduler struct {
 	bulkPath     uint8
 	haveBulkPath bool
 
+	// labels is each path's human name, refreshed from the metrics every
+	// evaluation so the log sites that only hold an id can still name a
+	// link the way the operator does. A map rather than a lookup back into
+	// config because the evaluation goroutine owns this and config is
+	// behind a holder.
+	labels map[uint8]string
+
 	// classifying mirrors whether the classifier is actually running.
 	// Below WireGuard it is not: payloads are ciphertext, every packet
 	// comes back ClassUnknown, and a gate that treats unknown as bulk
@@ -317,6 +324,16 @@ func deliveringForSpread(now time.Duration, sc scored, c config.Config) bool {
 		return false
 	}
 	return !sc.mach.flapping(now, c)
+}
+
+// pathName is how the scheduler names a path in a log line. It is the link's
+// configured label where there is one, and the bare id where there is not -
+// which is what every message said before labels existed.
+func (s *scheduler) pathName(id uint8) string {
+	if s.labels == nil {
+		return fmt.Sprintf("path %d", id)
+	}
+	return pathLabel(id, s.labels[id])
 }
 
 // undersizedForSpread reports whether a path is too small a share of the best
@@ -600,9 +617,9 @@ func (s *scheduler) setBulkPath(id uint8, have bool) {
 	}
 	s.bulkPath, s.haveBulkPath = id, have
 	if have {
-		log.Printf("scheduler: bulk -> path %d, off the call's path", id)
+		log.Printf("scheduler: bulk -> %s, off the call's path", s.pathName(id))
 	} else {
-		log.Printf("scheduler: bulk -> path %d, sharing the call's path (nothing else usable)", s.primary)
+		log.Printf("scheduler: bulk -> %s, sharing the call's path (nothing else usable)", s.pathName(s.primary))
 	}
 }
 
@@ -721,6 +738,15 @@ func (s *scheduler) evaluate(now time.Duration, c config.Config) {
 	metrics := s.source(now)
 	sort.Slice(metrics, func(i, j int) bool { return metrics[i].id < metrics[j].id })
 
+	// Refresh the names before anything can log. A path that appeared this
+	// tick must not be announced as a bare id and then renamed next tick.
+	if s.labels == nil {
+		s.labels = make(map[uint8]string, len(metrics))
+	}
+	for _, p := range metrics {
+		s.labels[p.id] = p.label
+	}
+
 	// Advance the machines and score what came out.
 	all := make([]scored, 0, len(metrics))
 	for _, p := range metrics {
@@ -742,7 +768,7 @@ func (s *scheduler) evaluate(now time.Duration, c config.Config) {
 			if s.sess != nil && prev == stateDown && mach.state != stateDown {
 				s.sess.rearmMTU(p.id)
 			}
-			log.Printf("path %d (%s): %s (%s)", p.id, p.name, mach.state, mach.reason)
+			log.Printf("%s: %s (%s)", s.pathName(p.id), mach.state, mach.reason)
 		}
 		all = append(all, scored{
 			m:       p,
@@ -824,11 +850,21 @@ func (s *scheduler) choose(now time.Duration, c config.Config, eligible []scored
 		return
 	}
 	if best.m.id == s.primary {
-		// Being top-ranked is not the same as being the right path. With
-		// scores tied, the primary won that ranking on a couple of
-		// milliseconds of delay, which decides nothing - so a path with
-		// materially more room still deserves asking about.
-		s.considerRoomier(now, cur, c, eligible)
+		// The primary is still top-ranked, so there is nothing to decide.
+		//
+		// This used to reach for capacity as a tie-break (D-023's roomier),
+		// because tied scores are unbreakable - a challenger must beat the
+		// incumbent by SwitchMarginR and a tie never will - and on
+		// 2026-09-01 that pinned a flow to a 512 kbps standby link with a
+		// multi-megabit one idle beside it. D-047 removed it. The complaint
+		// in that field case was throughput, and throughput no longer
+		// follows the primary: D-044 spreads bulk and transactional per
+		// flow across every delivering link regardless of which one is
+		// carrying the call, so the idle link gets the transfer without the
+		// call having to move at all. What was left was moving the *call*
+		// on the least reliable number in the system, for a benefit that
+		// had already been collected elsewhere.
+		s.challengerFor = 0
 		return
 	}
 
@@ -873,37 +909,15 @@ func (s *scheduler) choose(now time.Duration, c config.Config, eligible []scored
 		return
 	}
 
-	// Nothing is materially better on quality. That is not the same as
-	// nothing being better: two paths that both read 93.2 are
-	// indistinguishable to the model and can still differ by a factor of
-	// four in what they can carry, and the tie is currently settled by a
-	// few milliseconds of delay that decide nothing.
-	//
-	// Worse, a tie is unbreakable. A challenger has to beat the incumbent
-	// by SwitchMarginR to displace it, which equal scores can never do, so
-	// whichever path happened to be primary when the scores converged stays
-	// primary indefinitely - on the road that has meant a flow pinned to a
-	// 512 kbps standby link with a multi-megabit one sitting idle beside
-	// it. Capacity is the honest discriminator when quality has none.
-	s.considerRoomier(now, cur, c, eligible)
-}
-
-// considerRoomier moves the flow onto an equally-good path with materially
-// more capacity, under the same stickiness as any other handover.
-func (s *scheduler) considerRoomier(now time.Duration, cur float64, c config.Config, eligible []scored) {
-	id, ok := s.roomier(cur, eligible, c)
-	if !ok {
-		s.challengerFor = 0
-		return
-	}
-	if s.challenger == id {
-		s.challengerFor++
-	} else {
-		s.challenger, s.challengerFor = id, 1
-	}
-	if s.challengerFor >= c.SwitchHoldIntervals {
-		s.beginSwitch(now, id, "equal quality, materially more capacity")
-	}
+	// Nothing is materially better on quality, so the call stays where it
+	// is. Ties are still unbreakable here - a challenger must beat the
+	// incumbent by SwitchMarginR and equal scores never will - and that is
+	// now deliberate. Capacity used to break the tie (D-023's roomier);
+	// D-047 removed it, because the field case it was built for was a
+	// throughput complaint and D-044 already answers that without moving
+	// the call. Leaving a healthy call alone is the conservative reading of
+	// principle 4, and it is the reading this scheduler should have.
+	s.challengerFor = 0
 }
 
 // escapeTo picks where a failing path should hand off to: the best-scoring
@@ -925,33 +939,6 @@ func (s *scheduler) escapeTo(cur float64, eligible []scored) uint8 {
 		}
 	}
 	return eligible[0].m.id
-}
-
-// roomier finds a path that is no worse on quality than the primary and has
-// materially more measured capacity, or reports that none does.
-//
-// Both figures have to be measured. An unknown capacity is not evidence of
-// a large path any more than it is of a small one, so a path nothing has
-// ever loaded never displaces a working primary on this rule.
-func (s *scheduler) roomier(cur float64, eligible []scored, c config.Config) (uint8, bool) {
-	curM, ok := s.metricOf(s.primary, eligible)
-	if !ok || curM.bw.limitKbps <= 0 {
-		return 0, false
-	}
-	for _, sc := range eligible {
-		if sc.m.id == s.primary || sc.m.bw.limitKbps <= 0 {
-			continue
-		}
-		// Within the switch margin counts as tied. Outside it the branch
-		// above has already had its say.
-		if sc.score < cur-float64(c.SwitchMarginR) {
-			continue
-		}
-		if sc.m.bw.limitKbps >= curM.bw.limitKbps*bwPreferFactor {
-			return sc.m.id, true
-		}
-	}
-	return 0, false
 }
 
 // offeredKbps is how much the primary is currently being asked to carry,
@@ -989,7 +976,7 @@ func (s *scheduler) adopt(id uint8, why string) {
 	if s.havePrimary && s.primary == id {
 		return
 	}
-	log.Printf("scheduler: primary -> path %d (%s)", id, why)
+	log.Printf("scheduler: primary -> %s (%s)", s.pathName(id), why)
 	s.primary, s.havePrimary = id, true
 	s.switching, s.challengerFor = false, 0
 }
@@ -998,7 +985,7 @@ func (s *scheduler) adopt(id uint8, why string) {
 // traffic until the new one is confirmed. Never cut then connect - a gap is
 // audible.
 func (s *scheduler) beginSwitch(now time.Duration, to uint8, why string) {
-	log.Printf("scheduler: handover path %d -> path %d (%s), overlapping", s.primary, to, why)
+	log.Printf("scheduler: handover %s -> %s (%s), overlapping", s.pathName(s.primary), s.pathName(to), why)
 	s.switching = true
 	s.switchFrom = s.primary
 	s.switchingTo = to
@@ -1015,7 +1002,7 @@ func (s *scheduler) advanceSwitch(now time.Duration, c config.Config, eligible [
 	// overlapping in the first place.
 	target, ok := s.metricOf(s.switchingTo, eligible)
 	if !ok {
-		log.Printf("scheduler: handover to path %d abandoned, it is no longer usable", s.switchingTo)
+		log.Printf("scheduler: handover to %s abandoned, it is no longer usable", s.pathName(s.switchingTo))
 		s.switching = false
 		return
 	}
@@ -1027,7 +1014,7 @@ func (s *scheduler) advanceSwitch(now time.Duration, c config.Config, eligible [
 
 	switch {
 	case confirmed && elapsed >= c.MBBMin():
-		log.Printf("scheduler: handover to path %d confirmed after %v", s.switchingTo, elapsed.Round(time.Millisecond))
+		log.Printf("scheduler: handover to %s confirmed after %v", s.pathName(s.switchingTo), elapsed.Round(time.Millisecond))
 	case elapsed >= c.MBBMax():
 		// Unconfirmed, but paying double indefinitely is worse than
 		// committing. The new path was chosen because the old one was
