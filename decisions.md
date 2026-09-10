@@ -2387,3 +2387,41 @@ previously permitted a duplication target or spread membership on an
 offered-rate ceiling may now be excluded on its honestly-discounted one. That
 is D-046's own finding, now enforced at the number's source instead of only
 at the scheduling layer that reads it.
+
+## D-051 · Loss alone is sufficient to establish a ceiling, not just revise one
+
+**Problem.** D-050's discount fixed the ceiling's *value* wherever one gets
+set, but a live test immediately found it doesn't fix *whether* one gets set
+at all. Re-running the pinned flood against Starlink after D-050 - offered
+2 Mbps, delivered 0.536 Mbps, 72.8% loss - produced `ceiling_known: false`,
+`limit_kbps: 0`. Not wrong this time: nothing.
+
+The cause is structural. Every ceiling-setting path in this file was gated
+on `up >= BWOnsetMs` - a queueing signal - except the clean-reading lift,
+which D-050 correctly restricted to only *raising* an existing ceiling.
+Starlink's failure here is pure loss with no queueing at all (dropped at the
+radio layer, not buffered), so the onset branch never triggers, and with no
+ceiling yet to lift, the lift branch does nothing either. A link losing
+nearly three quarters of its traffic reads as "no opinion" - which
+`canCarry` and D-045 read as full permission. That is D-046's exact danger,
+now surfacing one layer down from where D-046 fixed it, because the
+estimator itself still had no path from "loss with no queueing" to any
+number at all.
+
+**Decision, confirmed explicitly rather than assumed.** Loss alone is
+sufficient evidence of a wall. The clean-reading branch now establishes an
+initial ceiling - not just revises one - whenever the peer reports real
+loss (`tx.valid && tx.loss > 0`) on a reading that never queued:
+`ceilingKbps = deliveredKbps(tx) * bwSafety`, `haveCeiling = true`. A clean
+reading with no loss reported, or no report at all, still sets nothing -
+absence of failure is not evidence of a ceiling, only failure is.
+`TestLossAloneEstablishesACeilingWithNoQueueing` and
+`TestCleanReadingWithNoLossEstablishesNoCeiling` pin both directions.
+
+**What this does not fix, noted rather than silently left.** `canCarry`
+treats `limitKbps <= 0` as permission unconditionally - it does not
+distinguish "no opinion" from a genuine zero ceiling. A path reported at
+100% loss now correctly computes `ceilingKbps = 0` with `haveCeiling = true`,
+and `canCarry` still waves it through, because it never looks at
+`haveCeiling`. Pre-existing, not introduced here, and out of scope for what
+was asked - recorded so it is not rediscovered as new.

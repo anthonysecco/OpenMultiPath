@@ -87,9 +87,11 @@ type bwEstimate struct {
 	nextMinMs float64
 	haveMin   bool
 
-	// ceilingKbps is where queueing was actually observed to set in, less
-	// the safety margin. Zero until that has happened, and haveCeiling is
-	// what distinguishes "no ceiling seen" from a genuine zero.
+	// ceilingKbps is where a wall was actually observed, less the safety
+	// margin - either queueing setting in, or (D-050) the peer reporting
+	// real loss on a reading that never queued at all. Zero until one of
+	// those has happened, and haveCeiling is what distinguishes "no ceiling
+	// seen" from a genuine zero.
 	ceilingKbps float64
 	haveCeiling bool
 
@@ -255,6 +257,7 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx p
 	// hold was a blip, and is forgotten.
 	b.onsetSince = 0
 	b.queueing = false
+	delivered := b.deliveredKbps(tx)
 
 	// Carrying this much with the link underneath still empty is evidence
 	// the path can do at least this - it is allowed to lift a stale ceiling
@@ -262,8 +265,26 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx p
 	// above what has actually flowed. Delivered, not sent (D-049): a path
 	// losing packets without ever queueing - the D-046 case - must not lift
 	// its own ceiling on traffic that was offered but did not arrive.
-	if delivered := b.deliveredKbps(tx); b.haveCeiling && delivered > b.ceilingKbps {
-		b.ceilingKbps = delivered
+	if b.haveCeiling {
+		if delivered > b.ceilingKbps {
+			b.ceilingKbps = delivered
+			b.ceilingFloorMs = b.minRTTMs
+		}
+		return
+	}
+
+	// No ceiling yet, and no queueing here to explain why (D-050 revision).
+	// If the peer is reporting real loss, the loss is itself the wall - a
+	// link dropping most of what it is given has shown a ceiling just as
+	// surely as one that queues, and onset detection alone would never see
+	// it: a dropped packet does not wait, it vanishes, so there is nothing
+	// here for BWOnsetMs to ever measure. A clean reading with no loss
+	// reported, or none in hand at all, stays "no opinion" - the ordinary
+	// state of a link that has simply not failed yet, which must not read
+	// as a ceiling of anything.
+	if tx.valid && tx.loss > 0 {
+		b.ceilingKbps = delivered * bwSafety
+		b.haveCeiling = true
 		b.ceilingFloorMs = b.minRTTMs
 	}
 }
@@ -347,11 +368,12 @@ func bwConfidence(age time.Duration) float64 {
 // limitKbps is what the scheduler may assume this path can carry, or 0 for
 // "no opinion" - which every caller must read as permission, not refusal.
 //
-// A path with no observed onset returns 0. That is the honest answer: never
-// having seen a path queue is not evidence that it is small. There used to be
-// a configurable fallback here for a plan whose ceiling was known in advance;
-// D-047 removed it as a knob nobody had set, doing a job a comment does
-// better.
+// A path with no observed wall - never seen to queue, and never reported to
+// lose anything - returns 0. That is the honest answer: a link nobody has
+// pushed hard enough to fail is not evidence that it is small. There used to
+// be a configurable fallback here for a plan whose ceiling was known in
+// advance; D-047 removed it as a knob nobody had set, doing a job a comment
+// does better.
 func (b *bwEstimate) limitKbps(now time.Duration, c config.Config) float64 {
 	if !b.haveCeiling {
 		return 0

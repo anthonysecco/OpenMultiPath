@@ -373,6 +373,48 @@ func TestCleanReadingLiftDoesNotCountLostTraffic(t *testing.T) {
 	}
 }
 
+// The gap D-050's first cut left open, closed here: a link that never
+// queues at all - the pure D-046 case, loss with no delay signal whatsoever
+// - previously got no ceiling ever, from either the onset path (nothing to
+// trigger it) or the clean-reading lift (nothing yet to lift). Reported
+// loss on a clean reading must be able to establish one from nothing.
+func TestLossAloneEstablishesACeilingWithNoQueueing(t *testing.T) {
+	d := newBWDriver()
+	// Offered 2 Mbps, RTT flat at the floor throughout - no queueing signal
+	// at all - but the peer reports heavy loss the whole time, the way a
+	// link that drops at the radio layer rather than buffering would.
+	d.runWithPeer(10*time.Second, 2000, 40, 0, 0, 73)
+
+	if !d.b.haveCeiling {
+		t.Fatal("sustained heavy loss with no queueing set no ceiling at all")
+	}
+	// Offered 2000 at 73% loss delivers ~540; the ceiling should land near
+	// that, not at 0 and not near the 2000 offered.
+	if d.b.ceilingKbps <= 0 || d.b.ceilingKbps > 800 {
+		t.Fatalf("ceiling = %.0f kbps, want roughly the ~540 kbps that actually delivered", d.b.ceilingKbps)
+	}
+	if got := d.b.limitKbps(d.now, d.c); got <= 0 {
+		t.Fatal("limit stayed 0 (no opinion) for a link proven to be dropping most of its traffic")
+	}
+}
+
+// A clean reading with no loss reported - or no report at all - must still
+// mean "no opinion", not "the link just proved a ceiling of its full send
+// rate". Only loss is evidence of a wall here; a clean, unreported path is
+// simply unmeasured.
+func TestCleanReadingWithNoLossEstablishesNoCeiling(t *testing.T) {
+	d := newBWDriver()
+	d.runWithPeer(10*time.Second, 4000, 40, 0, 0, 0) // reported, zero loss
+	if d.b.haveCeiling {
+		t.Fatalf("zero reported loss with no queueing set a ceiling of %.0f kbps", d.b.ceilingKbps)
+	}
+
+	d.run(10*time.Second, 4000, 40, 0) // no report at all
+	if d.b.haveCeiling {
+		t.Fatalf("no report and no queueing set a ceiling of %.0f kbps", d.b.ceilingKbps)
+	}
+}
+
 // Driving out of a cell sector does not make the old ceiling less certain, it
 // makes it wrong. The ageing curve holds a quiet link's estimate on purpose;
 // this is the other case, where the link underneath has been replaced.
