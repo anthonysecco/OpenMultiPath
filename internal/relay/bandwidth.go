@@ -82,17 +82,10 @@ type bwEstimate struct {
 	bytes     uint64
 	winStart  time.Duration
 	sendKbps  float64
-	peakKbps  float64
 	minStart  time.Duration
 	minRTTMs  float64
 	nextMinMs float64
 	haveMin   bool
-
-	// provenKbps is the highest rate this path has carried with the link
-	// underneath still empty. It is a floor on capacity, not a ceiling: it
-	// says the path can do at least this, and nothing at all about what
-	// happens above it.
-	provenKbps float64
 
 	// ceilingKbps is where queueing was actually observed to set in, less
 	// the safety margin. Zero until that has happened, and haveCeiling is
@@ -158,11 +151,9 @@ func (b *bwEstimate) regimeChanged(rttFloorMs float64) bool {
 		rttFloorMs*bwRegimeFactor < b.ceilingFloorMs
 }
 
-// forgetCeiling discards a ceiling that no longer describes the path. The
-// proven floor goes with it: it was measured on the old route too.
+// forgetCeiling discards a ceiling that no longer describes the path.
 func (b *bwEstimate) forgetCeiling() {
 	b.ceilingKbps, b.haveCeiling, b.ceilingFloorMs = 0, false, 0
-	b.provenKbps = 0
 	b.queueing, b.onsetSince, b.candidateKbps = false, 0, 0
 }
 
@@ -202,9 +193,6 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx p
 	elapsed := (now - b.winStart).Seconds()
 	if elapsed > 0 {
 		b.sendKbps = float64(b.bytes) * 8 / 1000 / elapsed
-		if b.sendKbps > b.peakKbps {
-			b.peakKbps = b.sendKbps
-		}
 	}
 	b.bytes, b.winStart = 0, now
 
@@ -234,9 +222,6 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx p
 			measured := b.sendKbps * bwSafety
 			if measured < b.ceilingKbps {
 				b.ceilingKbps = measured
-				if b.provenKbps > b.ceilingKbps {
-					b.provenKbps = b.ceilingKbps
-				}
 			}
 			return
 		}
@@ -258,9 +243,6 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx p
 			}
 			b.queueing = true
 			b.onsetSince = 0
-			if b.provenKbps > b.ceilingKbps {
-				b.provenKbps = b.ceilingKbps
-			}
 		}
 		return
 	}
@@ -269,46 +251,14 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx p
 	b.onsetSince = 0
 	b.queueing = false
 
-	// Carrying this much with the link underneath still empty proves the
-	// path can take at least this much. That is a floor, so it is recorded
-	// as one, and it is allowed to lift a stale ceiling that the path has
-	// visibly outgrown - but it never invents headroom above what has
-	// actually flowed.
-	// What actually arrived, not what was offered. On a link losing packets
-	// without queueing - Starlink dropping two thirds of what it is given -
-	// the send rate says nothing about capacity, because most of it never
-	// landed. The peer already reports the loss (D-024), so the delivered
-	// rate costs nothing to compute and is the honest figure (D-047).
-	//
-	// Recorded as a floor, never as a ceiling. "This path delivered at least
-	// this much" can only ever be revised upward by more traffic, which is
-	// what keeps it out of the feedback trap that the onset-measured ceiling
-	// sits in: a ceiling that reads low makes the scheduler send less, which
-	// keeps the ceiling low. A floor that reads low costs nothing but a
-	// missed opportunity, and corrects itself the next time traffic flows.
-	if delivered := b.deliveredKbps(tx); delivered > b.provenKbps {
-		b.provenKbps = delivered
-	}
+	// Carrying this much with the link underneath still empty is evidence
+	// the path can do at least this - it is allowed to lift a stale ceiling
+	// that the path has visibly outgrown, but it never invents headroom
+	// above what has actually flowed.
 	if b.haveCeiling && b.sendKbps > b.ceilingKbps {
 		b.ceilingKbps = b.sendKbps
 		b.ceilingFloorMs = b.minRTTMs
 	}
-}
-
-// deliveredKbps is the send rate discounted by the loss the peer reports, or
-// the raw send rate when no report is in hand.
-//
-// Without a report this is the old behaviour exactly, which is the right
-// fallback: an unreported path is not a lossy one, it is an unmeasured one,
-// and assuming loss we cannot see would understate every quiet link.
-func (b *bwEstimate) deliveredKbps(tx peerView) float64 {
-	if !tx.valid || tx.loss <= 0 {
-		return b.sendKbps
-	}
-	if tx.loss >= 100 {
-		return 0
-	}
-	return b.sendKbps * (1 - tx.loss/100)
 }
 
 // outboundQueueMs is how much the link is queueing in our send direction.
@@ -388,8 +338,6 @@ func (b *bwEstimate) limitKbps(now time.Duration, c config.Config) float64 {
 // bwView is the estimate as the scheduler and the interface see it.
 type bwView struct {
 	sendKbps    float64
-	peakKbps    float64
-	provenKbps  float64
 	ceilingKbps float64
 	limitKbps   float64
 	haveCeiling bool
@@ -400,8 +348,6 @@ type bwView struct {
 func (b *bwEstimate) view(now time.Duration, c config.Config) bwView {
 	return bwView{
 		sendKbps:    b.sendKbps,
-		peakKbps:    b.peakKbps,
-		provenKbps:  b.provenKbps,
 		ceilingKbps: b.ceilingKbps,
 		limitKbps:   b.limitKbps(now, c),
 		haveCeiling: b.haveCeiling,

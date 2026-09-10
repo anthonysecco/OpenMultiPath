@@ -54,20 +54,17 @@ func TestBandwidthIdlePathSetsNoCeiling(t *testing.T) {
 	}
 }
 
-func TestBandwidthCleanLoadProvesFloorNotCeiling(t *testing.T) {
+func TestBandwidthCleanLoadSetsNoCeiling(t *testing.T) {
 	d := newBWDriver()
 	d.run(30*time.Second, 4000, 40, 0)
 
 	if d.b.haveCeiling {
 		t.Fatal("carrying 4 Mbps cleanly was read as having found a ceiling")
 	}
-	if d.b.provenKbps < 3500 {
-		t.Fatalf("proven = %.0f kbps, want roughly the 4000 that flowed cleanly", d.b.provenKbps)
-	}
-	// Clean carriage says "at least this much" and nothing more, so it must
-	// not start refusing traffic above what has happened to flow so far.
+	// No ceiling observed says "no opinion" and nothing more, so it must not
+	// start refusing traffic above what has happened to flow so far.
 	if !d.b.view(d.now, d.c).canCarry(20000, d.c) {
-		t.Fatal("a path with a proven floor but no observed ceiling refused traffic above it")
+		t.Fatal("a path with no observed ceiling refused traffic above what it has carried")
 	}
 }
 
@@ -296,56 +293,6 @@ func TestBandwidthSustainedOnsetCommitsAtOnsetRate(t *testing.T) {
 	}
 }
 
-// runWithPeer is run() with a peer report in hand, so the delivered-rate
-// discount of D-047 has something to work from.
-func (d *bwDriver) runWithPeer(dur time.Duration, kbps, rttMs, downQueueMs, lossPercent float64) {
-	const tick = 200 * time.Millisecond
-	tx := peerView{valid: true, loss: lossPercent, at: d.now}
-	for end := d.now + dur; d.now < end; {
-		d.b.noteSent(int(kbps * 1000 / 8 * tick.Seconds()))
-		d.now += tick
-		tx.at = d.now
-		d.b.observe(d.now, rttMs, downQueueMs, tx, d.c)
-	}
-}
-
-// The Starlink case from D-046, at the estimator rather than the scheduler.
-// A path given 40 Mbps that delivers a third of it has not proved it can
-// carry 40 Mbps, and recording that it did is how a failing link keeps
-// looking like the roomiest one on the box.
-func TestProvenFloorCountsWhatArrivedNotWhatWasOffered(t *testing.T) {
-	clean := newBWDriver()
-	clean.runWithPeer(20*time.Second, 40_000, 40, 0, 0)
-
-	lossy := newBWDriver()
-	lossy.runWithPeer(20*time.Second, 40_000, 40, 0, 66)
-
-	if clean.b.provenKbps < 30_000 {
-		t.Fatalf("clean path proved only %.0f kbps of a 40 Mbps offer", clean.b.provenKbps)
-	}
-	if lossy.b.provenKbps >= clean.b.provenKbps {
-		t.Errorf("a path losing 66%% proved %.0f kbps against the clean path's %.0f; "+
-			"the floor must count arrivals, not departures",
-			lossy.b.provenKbps, clean.b.provenKbps)
-	}
-	// A third of 40 Mbps, give or take the sampling window.
-	if got := lossy.b.provenKbps; got < 10_000 || got > 20_000 {
-		t.Errorf("lossy path proved %.0f kbps, want roughly the 13.6 Mbps that landed", got)
-	}
-}
-
-// No report is not evidence of loss. An unreported path must be measured the
-// way it always was, or every quiet link would be understated.
-func TestProvenFloorIsUndiscountedWithoutAReport(t *testing.T) {
-	d := newBWDriver()
-	d.run(20*time.Second, 8_000, 40, 0)
-
-	if d.b.provenKbps < 6_000 {
-		t.Errorf("proven = %.0f kbps with no peer report, want roughly the 8 Mbps offered",
-			d.b.provenKbps)
-	}
-}
-
 // Driving out of a cell sector does not make the old ceiling less certain, it
 // makes it wrong. The ageing curve holds a quiet link's estimate on purpose;
 // this is the other case, where the link underneath has been replaced.
@@ -365,9 +312,6 @@ func TestCeilingIsDiscardedWhenTheRouteMoves(t *testing.T) {
 	if d.b.haveCeiling {
 		t.Errorf("ceiling of %.0f kbps survived the floor moving 40ms -> 400ms; "+
 			"it was measured on a link that is no longer there", measured)
-	}
-	if d.b.provenKbps != 0 {
-		t.Errorf("proven floor %.0f kbps survived the route change too", d.b.provenKbps)
 	}
 }
 

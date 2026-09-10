@@ -2293,3 +2293,54 @@ would probably pick the right source address on its own, but "probably"
 was not good enough here: if the kernel picked a different one, the pin
 would simply never match, and the flood would silently fall back to ordinary
 routing - failing exactly the test it was run to be. Made explicit instead.
+
+## D-049 · Remove the bandwidth numbers nothing reads, show the UI the one that gates
+
+**Problem.** `bwView` carried five kbps figures - `sendKbps`, `peakKbps`,
+`provenKbps`, `ceilingKbps`, `limitKbps` - and the UI's "Capacity" tile
+collapsed three of them into one headline number, with the other two visible
+only on hover. Auditing every reader (not just the UI) found that scheduling
+code never touches `ceilingKbps`, `provenKbps`, or `peakKbps` directly - only
+`limitKbps` (`canCarry`, D-045's `undersizedForSpread`) and `sendKbps` (fed
+into `canCarry` as current load) are ever read by a gate. The other three
+exist purely to be reported.
+
+That distinction mattered concretely this session. `provenKbps` is a
+one-window floor with no sustain requirement - a single 500ms clean reading
+sets it - and it does not age down, only up, except on a route change. A
+diagnostic UDP flood run through the tunnel (D-048) pushed Starlink's
+`provenKbps`/`ceilingKbps` to 435 Mbps in one tick, because `noteSent` counts
+bytes handed to the local socket over the TUN device, not bytes the physical
+link actually carried, and nothing in the estimator can tell synthetic
+overshoot apart from real traffic. The UI's Capacity tile showed that
+inflated number as fact, with no indication it came from a single burst
+rather than sustained delivery.
+
+**Removed.**
+
+- **`peakKbps`.** Zero readers anywhere outside its own assignment and the
+  UI's hover text. A running max with no gate behind it and no floor/ceiling
+  semantics of its own - decoration.
+- **`provenKbps`**, and `deliveredKbps` with it (its only caller). Not read by
+  any gate; existed to answer a question - "what has this path proven it can
+  do" - that the UI asked but the scheduler never did. Removing it also
+  removes the estimator's own loss-discounting of clean-looking traffic. That
+  sounds like reopening D-046, but does not: D-046's fix lives entirely in
+  `deliveringForSpread`, gates on the peer-reported R factor directly, and
+  never consulted `provenKbps` - the scheduling protection was never routed
+  through this number, only the UI's honesty about it was.
+
+**Changed.** The Capacity tile now shows `limitKbps` when a ceiling has ever
+been observed, `"unknown"` otherwise - the same number `canCarry` and D-045
+actually gate on, discounted the same way theirs is. No more three-way
+collapse manufacturing a headline out of whichever of two different kinds of
+evidence happened to be available; no more a number the interface trusted
+more than the code did. The raw-link diagnostic's estimate comparison
+(`iperfResultHTML`) got the same treatment.
+
+**Consequence worth naming.** The old Capacity tile could show "≥ X" from a
+single proven burst even with no ceiling ever recorded - some information,
+even if optimistic. The new tile shows only "unknown" in that case, because
+there is no longer a floor value to show, and `limitKbps` is honestly 0 until
+a ceiling exists. Less information displayed, but none of it borrowed from a
+number nothing in the system actually trusts.

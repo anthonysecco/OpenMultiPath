@@ -1144,7 +1144,7 @@ func describeCeiling(b *bwEstimate, now time.Duration) string {
 		return fmt.Sprintf("ceiling %.0fkbps (confirmed %v ago)",
 			b.ceilingKbps, (now - b.confirmedAt).Round(time.Second))
 	case b.everLoaded:
-		return fmt.Sprintf("ceiling unknown, carried %.0fkbps clean", b.provenKbps)
+		return "ceiling unknown, loaded but never seen to queue"
 	}
 	return "ceiling unknown, never loaded"
 }
@@ -1283,8 +1283,6 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 
 		bw := p.bw.view(now, snap.Config)
 		path.SendKbps = bw.sendKbps
-		path.PeakKbps = bw.peakKbps
-		path.ProvenKbps = bw.provenKbps
 		path.CeilingKbps = bw.ceilingKbps
 		path.CeilingKnown = bw.haveCeiling
 		path.LimitKbps = bw.limitKbps

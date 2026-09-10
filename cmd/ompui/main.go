@@ -315,7 +315,6 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 		"estimate": map[string]any{
 			"ceiling_kbps":        path.CeilingKbps,
 			"ceiling_known":       path.CeilingKnown,
-			"proven_kbps":         path.ProvenKbps,
 			"limit_kbps":          path.LimitKbps,
 			"ceiling_age_seconds": path.CeilingAgeSeconds,
 		},
@@ -474,7 +473,6 @@ func (s *server) handleDiagBandwidthPinned(w http.ResponseWriter, r *http.Reques
 		"estimate": map[string]any{
 			"ceiling_kbps":        path.CeilingKbps,
 			"ceiling_known":       path.CeilingKnown,
-			"proven_kbps":         path.ProvenKbps,
 			"limit_kbps":          path.LimitKbps,
 			"ceiling_age_seconds": path.CeilingAgeSeconds,
 		},

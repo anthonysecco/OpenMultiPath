@@ -174,22 +174,20 @@ type Path struct {
 	// The reactive bandwidth ceiling of D-023, all in kbps in the send
 	// direction.
 	//
-	// SendKbps is what is going onto the path right now and PeakKbps the
-	// most that ever has. ProvenKbps is the most it has carried without the
-	// link underneath starting to queue - a floor on its capacity, not a
-	// ceiling. CeilingKbps is where queueing was actually observed to set
-	// in, and CeilingKnown distinguishes that from never having seen it.
-	// LimitKbps is what the scheduler is currently willing to assume, which
-	// is the ceiling discounted for how long ago it was confirmed; zero
-	// there means no opinion, and no gate.
+	// SendKbps is what is going onto the path right now. CeilingKbps is
+	// where queueing was actually observed to set in, and CeilingKnown
+	// distinguishes that from never having seen it. LimitKbps is what the
+	// scheduler is currently willing to assume, which is the ceiling
+	// discounted for how long ago it was confirmed; zero there means no
+	// opinion, and no gate - it is the only one of the two the scheduler
+	// itself ever acts on, and the one worth trusting in the interface too
+	// (D-049).
 	//
 	// CeilingAgeSeconds is what ages. The estimate itself does not decay:
 	// an hour of idleness is not evidence that a link shrank, so the number
 	// stands and only the confidence in it slides. -1 means nothing has
 	// ever loaded the path.
 	SendKbps          float64 `json:"send_kbps"`
-	PeakKbps          float64 `json:"peak_kbps"`
-	ProvenKbps        float64 `json:"proven_kbps"`
 	CeilingKbps       float64 `json:"ceiling_kbps"`
 	CeilingKnown      bool    `json:"ceiling_known"`
 	LimitKbps         float64 `json:"limit_kbps"`

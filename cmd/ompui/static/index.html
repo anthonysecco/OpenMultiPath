@@ -388,25 +388,24 @@ function renderPaths(s) {
         bursts.map(b => `<td>${b.count}</td>`).join("") + `</tr></table>`
       : "";
 
-    // Capacity. The estimate is honest about how it was arrived at, because
-    // the three cases call for different responses: a measured ceiling can
-    // be acted on, a floor from clean carriage only says "at least this",
-    // and never having loaded the path says nothing at all. Showing one
-    // number for all three would invite trusting the weakest of them.
-    const capacity = p.ceiling_known
-      ? `${rate(p.ceiling_kbps)}`
-      : p.ceiling_age_seconds >= 0 ? `≥ ${rate(p.proven_kbps)}` : "unknown";
+    // Capacity. limit_kbps - the ceiling discounted for how long it has
+    // gone unconfirmed - is the only bandwidth figure the scheduler itself
+    // ever acts on (D-049), so it is the only one shown: a number the
+    // interface trusts more than the code does would be worse than no
+    // number at all. No ceiling ever observed means no opinion, shown as
+    // "unknown" rather than a floor from clean carriage that could as
+    // easily have been one lucky burst as real sustained capacity.
+    const capacity = p.ceiling_known ? rate(p.limit_kbps) : "unknown";
 
     // What ages is the confidence, never the value: an idle hour is not
-    // evidence that a link shrank. The discount the scheduler is currently
-    // applying is shown rather than folded silently into the headline.
+    // evidence that a link shrank. The undiscounted ceiling and the
+    // discount currently applied are both shown, rather than folded
+    // silently into the headline.
     const capacityNote = p.ceiling_known
       ? (p.limit_kbps < p.ceiling_kbps * 0.99
-          ? `measured ${duration(p.ceiling_age_seconds)} ago; the scheduler is currently assuming ${rate(p.limit_kbps)} while it goes unconfirmed`
-          : `measured ${duration(p.ceiling_age_seconds)} ago, where queueing set in`)
-      : p.ceiling_age_seconds >= 0
-        ? "the most this path has carried without the link filling; its actual ceiling is unmeasured"
-        : "nothing has ever loaded this path, so nothing is assumed about what it can carry";
+          ? `ceiling ${rate(p.ceiling_kbps)} measured ${duration(p.ceiling_age_seconds)} ago; discounted to ${rate(p.limit_kbps)} while it goes unconfirmed`
+          : `ceiling measured ${duration(p.ceiling_age_seconds)} ago, where queueing set in, at full confidence`)
+      : "nothing has ever loaded this path enough to see where it queues, so nothing is assumed about what it can carry";
 
     // Inbound and outbound are labelled apart because they are measured in
     // different places and routinely disagree. Everything unlabelled is
@@ -454,7 +453,7 @@ function renderPaths(s) {
           <div class="v" title="${p.lost.toLocaleString()} packets since the daemon started">${fmt(p.loss_percent, 2)}%</div></div>
         <div class="metric"><div class="k">Received</div><div class="v">${p.received.toLocaleString()}</div></div>
         <div class="metric"><div class="k">Sending</div>
-          <div class="v" title="what is going onto this path right now; peak ${rate(p.peak_kbps)}">${rate(p.send_kbps)}</div></div>
+          <div class="v" title="what is going onto this path right now">${rate(p.send_kbps)}</div></div>
         ${budgetRow(p)}
         <div class="metric"><div class="k">Capacity</div>
           <div class="v" title="${capacityNote}">${capacity}</div></div>
@@ -518,8 +517,7 @@ function iperfResultHTML(d) {
   if (d.error) return `<span style="color:var(--bad)">iperf: ${d.error}</span>`;
   if (d.mbps == null) return "";
   const est = d.est || {};
-  const estStr = est.ceiling_known ? rate(est.ceiling_kbps)
-    : (est.ceiling_age_seconds >= 0 ? "≥ " + rate(est.proven_kbps) : "unmeasured");
+  const estStr = est.ceiling_known ? rate(est.limit_kbps) : "unmeasured";
   return `<strong>${d.mbps.toFixed(1)} Mbps</strong> up to home (aggregate)`
     + (d.retransmits ? ` · ${d.retransmits} retransmits` : "")
     + ` · estimator says ${estStr}`;
