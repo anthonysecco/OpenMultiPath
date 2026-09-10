@@ -3,11 +3,14 @@ package relay
 import (
 	"fmt"
 	"log"
+	"net"
+	"os"
 	"sort"
 	"sync/atomic"
 	"time"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
+	"github.com/anthonysecco/OpenMultiPath/internal/diag"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 	"github.com/anthonysecco/OpenMultiPath/internal/usage"
 )
@@ -194,6 +197,32 @@ type scheduler struct {
 	switchFrom     uint8
 	switchingTo    uint8
 	switchingSince time.Duration
+
+	// pin is an operator-requested override (D-048): force one flow onto
+	// one path, bypassing D-044's hash and every gate above it. Set by
+	// watchDiagPin from a file ompui writes, read by txFor on the data
+	// path, so it needs its own synchronisation rather than living with
+	// the fields above that the evaluation goroutine owns alone.
+	pin atomic.Pointer[diagPin]
+
+	// nowFn is where txFor gets wall-clock time to check the pin's
+	// deadline. A field rather than a bare time.Now() so a test can hold
+	// it still; every other clock read in this file goes through the
+	// session's synthetic elapsed time, but the pin's deadline comes from
+	// ompui as a wall-clock Unix timestamp, since ompui has no way to know
+	// the daemon's synthetic clock.
+	nowFn func() time.Time
+}
+
+// diagPin is a matched, resolved pin: the exact hash the target flow's
+// packets will produce, the path to force them onto, and the deadline
+// after which the pin stops applying even if nothing ever clears the file.
+// The deadline is the backstop - see diag.PinRequest - for ompui crashing
+// or being killed mid-test, so a stuck pin cannot silently outlive it.
+type diagPin struct {
+	flow    uint32
+	path    uint8
+	expires time.Time
 }
 
 func newScheduler(sess *session, cfg *config.Holder, candidates func() []uint8) *scheduler {
@@ -203,6 +232,7 @@ func newScheduler(sess *session, cfg *config.Holder, candidates func() []uint8) 
 		candidates: candidates,
 		source:     sess.metrics,
 		machines:   make(map[uint8]*machine),
+		nowFn:      time.Now,
 	}
 	s.cur.Store(emptyDecision)
 	return s
@@ -263,6 +293,19 @@ func (s *scheduler) txFor(class uint8, flow uint32) []uint8 {
 	// be load-balanced.
 	if class == protocol.ClassRealtime {
 		return s.txPaths(class)
+	}
+
+	// D-048's operator override, checked before any gate below: the whole
+	// point is to answer what a specific link does under load, including a
+	// link the gates currently exclude, which requires routing around them
+	// rather than through them. Scoped to exactly the one flow ompui named
+	// and expiring on its own even if the file that set it is never
+	// cleared - see diagPin.
+	if p := s.pin.Load(); p != nil && p.flow == flow {
+		if s.nowFn().Before(p.expires) {
+			return []uint8{p.path}
+		}
+		s.pin.Store(nil)
 	}
 	// Bulk and transactional both load-balance per flow across the healthy
 	// set. Transactional joins bulk here because pinning it to the primary
@@ -389,6 +432,79 @@ func flowHash(p []byte) uint32 {
 		}
 	}
 	return h
+}
+
+// flowHashTuple computes exactly what flowHash would compute for a packet
+// with this 5-tuple, without needing a real packet to hash. Used only to
+// resolve a diag.PinRequest (D-048): ompui knows the 5-tuple its own probe
+// traffic will carry before it sends a single packet, and this lets it ask
+// the daemon to recognise that flow by the same hash the data path already
+// computes, rather than adding a second way to identify a flow.
+//
+// Kept byte-for-byte identical to flowHash on purpose - see
+// TestFlowHashTupleMatchesFlowHash - so the two can never quietly drift
+// apart.
+func flowHashTuple(src, dst net.IP, proto uint8, srcPort, dstPort uint16) uint32 {
+	const (
+		offset = 2166136261
+		prime  = 16777619
+	)
+	s4, d4 := src.To4(), dst.To4()
+	if s4 == nil || d4 == nil {
+		return 0
+	}
+	h := uint32(offset)
+	for _, b := range s4 {
+		h = (h ^ uint32(b)) * prime
+	}
+	for _, b := range d4 {
+		h = (h ^ uint32(b)) * prime
+	}
+	h = (h ^ uint32(proto)) * prime
+	if proto == 6 || proto == 17 {
+		for _, b := range [4]byte{byte(srcPort >> 8), byte(srcPort), byte(dstPort >> 8), byte(dstPort)} {
+			h = (h ^ uint32(b)) * prime
+		}
+	}
+	return h
+}
+
+// watchDiagPin polls path for an operator-requested pin (D-048), the same
+// way config.Holder.Watch polls settings - mtime and size, not "newer", for
+// the reasons given there: a restored backup or a clock stepped backwards
+// must not hide a real change.
+//
+// Nothing calls this on the responder. Only the initiator chooses among
+// more than one physical path, so only it has a hash for an override to
+// replace.
+func (s *scheduler) watchDiagPin(path string) {
+	var last time.Time
+	var lastSize int64
+	var seen bool
+	for range time.Tick(500 * time.Millisecond) {
+		fi, err := os.Stat(path)
+		if err != nil {
+			if seen {
+				s.pin.Store(nil)
+				seen = false
+			}
+			continue
+		}
+		if seen && fi.ModTime().Equal(last) && fi.Size() == lastSize {
+			continue
+		}
+		last, lastSize, seen = fi.ModTime(), fi.Size(), true
+
+		req, err := diag.ReadPin(path)
+		if err != nil {
+			log.Printf("diag pin: %v, ignoring", err)
+			continue
+		}
+		flow := flowHashTuple(net.ParseIP(req.SrcIP), net.ParseIP(req.DstIP), req.Protocol, req.SrcPort, req.DstPort)
+		expires := time.Unix(req.ExpiresUnix, 0)
+		s.pin.Store(&diagPin{flow: flow, path: req.PathID, expires: expires})
+		log.Printf("diag pin: forcing flow %d onto %s until %s", flow, s.pathName(req.PathID), expires.Format(time.RFC3339))
+	}
 }
 
 // admit reports whether a packet of this class should be sent at all.

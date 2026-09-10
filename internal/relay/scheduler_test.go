@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -1425,6 +1426,72 @@ func TestFlowHashStableAndDistinct(t *testing.T) {
 	}
 	if flowHash([]byte{0x60}) != 0 { // too short / not IPv4
 		t.Error("malformed packet should hash to 0")
+	}
+}
+
+// flowHashTuple (used to resolve a diag.PinRequest, D-048) must produce
+// exactly what flowHash produces for a real packet carrying the same
+// 5-tuple - ompui computes the hash before sending a single byte, from
+// fields it knows ahead of time, and the daemon has to recognise the same
+// flow from the packets that actually arrive.
+func TestFlowHashTupleMatchesFlowHash(t *testing.T) {
+	pkt := func(sp, dp byte) []byte {
+		p := make([]byte, 24)
+		p[0] = 0x45
+		p[9] = 6
+		copy(p[12:16], []byte{10, 0, 0, 5})
+		copy(p[16:20], []byte{1, 1, 1, 1})
+		p[20], p[21], p[22], p[23] = 0, sp, 0, dp
+		return p
+	}
+	want := flowHash(pkt(1, 80))
+	got := flowHashTuple(net.IPv4(10, 0, 0, 5), net.IPv4(1, 1, 1, 1), 6, 1, 80)
+	if got != want {
+		t.Fatalf("flowHashTuple = %d, want %d (flowHash on the equivalent packet)", got, want)
+	}
+	// A different port must diverge here exactly as it does for flowHash -
+	// otherwise a pin could silently match the wrong flow.
+	if other := flowHashTuple(net.IPv4(10, 0, 0, 5), net.IPv4(1, 1, 1, 1), 6, 1, 81); other == want {
+		t.Fatal("flowHashTuple did not vary with destination port")
+	}
+}
+
+// A pin (D-048) forces its named flow onto its named path, bypassing the
+// spread set entirely - the point is to reach a path the gates would
+// otherwise exclude. A flow that does not match the pin, and a flow that
+// does but whose pin has expired, both fall through to ordinary txFor.
+func TestTxForHonoursDiagPin(t *testing.T) {
+	fixedNow := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	s := &scheduler{nowFn: func() time.Time { return fixedNow }}
+	s.cur.Store(&decision{
+		tx: []uint8{0, 1}, txBulk: []uint8{1}, txTrans: []uint8{0},
+		txBulkSpread: []uint8{0, 1},
+	})
+
+	const pinnedFlow = uint32(4242)
+	s.pin.Store(&diagPin{flow: pinnedFlow, path: 7, expires: fixedNow.Add(time.Minute)})
+
+	if got := s.txFor(protocol.ClassBulk, pinnedFlow); !sameSet(got, []uint8{7}) {
+		t.Fatalf("pinned flow = %v, want forced onto [7]", got)
+	}
+	if got := s.txFor(protocol.ClassTransactional, pinnedFlow); !sameSet(got, []uint8{7}) {
+		t.Fatalf("pinned flow (transactional) = %v, want forced onto [7]", got)
+	}
+	// Real-time must never be steered by the pin, even if its hash happened
+	// to match - redundancy across the whole set is the one thing that must
+	// never be overridden for a call.
+	if got := s.txFor(protocol.ClassRealtime, pinnedFlow); !sameSet(got, []uint8{0, 1}) {
+		t.Fatalf("real-time with a matching pin = %v, want the full duplication set unaffected", got)
+	}
+	// A different flow is untouched by the pin and follows the ordinary hash.
+	if got := s.txFor(protocol.ClassBulk, pinnedFlow+1); sameSet(got, []uint8{7}) {
+		t.Fatalf("unrelated flow %v was routed to the pinned path", got)
+	}
+
+	// An expired pin stops applying, even though the flow still matches.
+	s.pin.Store(&diagPin{flow: pinnedFlow, path: 7, expires: fixedNow.Add(-time.Second)})
+	if got := s.txFor(protocol.ClassBulk, pinnedFlow); sameSet(got, []uint8{7}) {
+		t.Fatalf("expired pin still forced flow onto [7]: %v", got)
 	}
 }
 

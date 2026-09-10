@@ -2213,3 +2213,83 @@ sits rather than a decision anyone had made.
 `GlobalSeq` is reserved for; capacity-weighted placement with a flow table;
 a home-side PEP; revisiting D-007's FEC deferral. All are defensible, none
 belong in v1.
+
+## D-048 · A scheduler-pinned uplink test, for ground truth on a path the gates exclude
+
+**Problem.** The existing UDP flood (`handleDiagBandwidth`) binds straight to
+a WAN interface with `--bind-dev`, exactly as it says in its own doc comment.
+That measures the raw link and nothing else - it never enters `omp0`, so it
+is never classified, never scheduled, and never seen by `bwEstimate.observe`.
+It is the right tool for "what will this carrier give me" and the wrong tool
+for the question that actually came up: whether D-045's size gate or D-046's
+delivery gate is excluding a path from load balancing that could in fact
+carry real traffic. A raw-link number cannot answer that - the gates operate
+entirely inside `ompd`, on traffic the daemon itself has scheduled.
+
+**Decision.** Add a second test that reaches the tunnel's overlay address
+(`10.30.0.1`, `omp0`) instead of binding to an interface, so the flood
+becomes an ordinary flow subject to classification and `txFor` like anything
+else - and pair it with an operator-set override that forces the scheduler
+to place that one flow on the path being asked about, regardless of what the
+gates would otherwise decide.
+
+Two designs were possible for the override (see the conversation this
+decision follows): let the scheduler pick whichever path its live gates
+currently favor, or let the operator name the path directly. The first needs
+no new code in the hot path but cannot target a path the gates are actively
+excluding - which is precisely the path worth asking about. Took the second.
+
+**Shape of the override.** `ompd` and `ompui` are deliberately separate
+processes (`cmd/ompui/main.go`'s own header: "it reads the state file the
+daemon leaves behind rather than asking the daemon anything"), so this could
+not be a direct call. Followed the pattern `config.Holder.Watch` already
+established for the same kind of problem - `ompui` writes a file, `ompd`
+polls it - rather than opening a new command channel into the daemon:
+
+- `internal/diag/diagpin.go` defines `PinRequest` (a 5-tuple, a path id, an
+  expiry) and `PinPath` (`/run/openmultipath/diag-pin.json`). Under `/run`,
+  not `/etc`: this is a one-off action tied to one test run, not a durable
+  setting, and tmpfs means a reboot cannot leave a stale one behind. Written
+  with a temp-file-and-rename so the daemon's poll - which trusts mtime and
+  size, the same trust `Holder.Watch` places in the config file - never
+  observes a half-written one.
+- `scheduler.watchDiagPin` (initiator only - only it chooses among more than
+  one physical path) polls that file every 500ms and, on a change, resolves
+  the 5-tuple to a flow hash with `flowHashTuple` - the same FNV-1a `flowHash`
+  already computes per packet, just computed ahead of time from known fields
+  instead of read off the wire. `TestFlowHashTupleMatchesFlowHash` pins the
+  two together so they cannot quietly drift apart.
+- `txFor` checks the pin before any gate, for any class but `ClassRealtime`:
+  a matching, unexpired flow goes straight to the named path, full stop. The
+  expiry is read from `nowFn` (wall clock, a field so a test can hold it
+  still) rather than the session's synthetic elapsed time, because `ompui`
+  has no way to know that clock - it only knows the wall-clock deadline it
+  wrote into the request. The expiry is the backstop for `ompui` dying before
+  its own `defer diag.ClearPin()` runs, not the primary way a pin ends.
+
+**UDP, one stream, on purpose.** The pinned test does not offer the existing
+tool's parallel-TCP mode. Each parallel stream is its own TCP connection with
+its own ephemeral source port, so covering every stream would mean
+registering one pin per stream (or none of them predictably); registering
+only one and calling the *aggregate* a measurement of the pinned path would
+be quietly wrong; iperf3's `--cport` bases parallel streams' ports on the
+given one but leaves that mapping undocumented enough not to build a pin file
+format on top of it. A single UDP flow has exactly one 5-tuple, so one pin
+covers all of it. TCP-through-the-scheduler stayed out rather than build the
+multi-pin plumbing for a v1 test.
+
+**Home side: a second iperf3 server, not a reconfigured one.**
+`omp-iperf.service` stays bound to the transport hub `10.20.1.1`, for the
+raw-link test exactly as before. `omp-iperf-overlay.service` binds the TUN
+address `10.30.0.1` instead of widening the existing unit to `0.0.0.0` -
+`0.0.0.0` would also bind whatever answers on the public interface, and
+`omp-iperf.service`'s own comment is explicit that avoiding exactly that
+exposure is why it binds one address rather than all of them. Same
+reasoning, so a second unit rather than a loosened one.
+
+**Correctness note worth keeping.** `diag.Options` gained `LocalIP` (`-B`)
+alongside `CPort` (`--cport`). Routing to a directly-connected overlay subnet
+would probably pick the right source address on its own, but "probably"
+was not good enough here: if the kernel picked a different one, the pin
+would simply never match, and the flood would silently fall back to ordinary
+routing - failing exactly the test it was run to be. Made explicit instead.

@@ -6,6 +6,7 @@ import (
 	"net"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
+	"github.com/anthonysecco/OpenMultiPath/internal/diag"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 	"github.com/anthonysecco/OpenMultiPath/internal/record"
 	"github.com/anthonysecco/OpenMultiPath/internal/usage"
@@ -157,6 +158,7 @@ func RunInitiator(cfg InitiatorConfig) error {
 	sched := newScheduler(sess, cfg.Settings, paths.active)
 	sess.sched = sched
 	go sched.run()
+	go sched.watchDiagPin(diag.PinPath)
 
 	// Local endpoint -> whichever paths the scheduler has chosen. The global
 	// sequence is allocated once here, before any copies are made, so

@@ -470,15 +470,17 @@ function renderPaths(s) {
   }).join("");
 }
 
-// diagBlock is the on-demand link tests for one path: the iperf test of the
-// tunnel uplink to home, and the speedtest of the carrier's own internet
-// capacity. Both are shown only on the end that owns the path and only while
-// the link is up, since both pin to the interface with the same
-// SO_BINDTODEVICE the daemon uses and there is nothing to bind to on a link
-// that is down. Each test's state lives in diagRuns[id] - .iperf and .speed -
+// diagBlock is the on-demand link tests for one path: the iperf test and UDP
+// flood of the tunnel uplink to home, the speedtest of the carrier's own
+// internet capacity, and the scheduler-pinned UDP flood (D-048). All are
+// shown only on the end that owns the path and only while the link is up -
+// the first three pin to the interface with the same SO_BINDTODEVICE the
+// daemon uses and there is nothing to bind to on a link that is down, and
+// the pinned test cannot force traffic onto a socket that is not up either.
+// Each test's state lives in diagRuns[id] - .iperf, .speed, .udp, .pinned -
 // rather than in the DOM, so the once-a-second refresh that rebuilds every
 // card does not wipe a test in progress or its result, and running one test
-// does not clear the other's result.
+// does not clear another's result.
 function diagBlock(owns, p) {
   if (!owns || !p.bound) return "";
   const d = diagRuns[p.id] || {};
@@ -500,6 +502,12 @@ function diagBlock(owns, p) {
         ${d.udp && d.udp.running ? "Flooding…" : "Flood uplink (UDP)"}</button>
       <span class="muted" title="A UDP flood over the tunnel to home: iperf sends as fast as it can and reports what got through plus the loss above that. Unlike TCP it does not back off, so it finds the raw forwarding ceiling - and it saturates the link for the duration, disrupting anything else on it, and spends data at the full offered rate. A deliberate stress test.">tunnel, unlimited UDP · saturates the link · spends data fast</span>
       <div class="diag-result">${udpResultHTML(d.udp)}</div>
+    </div>
+    <div class="diag-row">
+      <button class="diag-btn" ${d.pinned && d.pinned.running ? "disabled" : ""} onclick="runPinnedFlood(${p.id})">
+        ${d.pinned && d.pinned.running ? "Flooding…" : "Flood via scheduler (forced)"}</button>
+      <span class="muted" title="The same UDP flood, but sent through ompd's own classification and scheduling instead of bound straight to the interface, with the daemon told to force this one flow onto this path regardless of what its load-balancing gates would normally allow. The 'Flood uplink' button above measures what the carrier will give any traffic; this measures what ompd's own scheduler actually does with it - including a path currently excluded from load balancing, which is usually the one worth asking about.">through ompd, forced path · saturates the link · spends data fast</span>
+      <div class="diag-result">${pinnedResultHTML(d.pinned)}</div>
     </div>
   </div>`;
 }
@@ -542,6 +550,19 @@ function udpResultHTML(d) {
     + ` of ${d.offered.toFixed(0)} offered`
     + ` · <span style="color:${lossColor}">${d.loss.toFixed(1)}% loss</span>`
     + ` · ${d.jitter.toFixed(1)} ms jitter`;
+}
+
+function pinnedResultHTML(d) {
+  if (!d) return "";
+  if (d.running) return `<span class="muted">forcing the flow onto this path…</span>`;
+  if (d.error) return `<span style="color:var(--bad)">pinned flood: ${d.error}</span>`;
+  if (d.delivered == null) return "";
+  const lossColor = d.loss >= 5 ? "var(--bad)" : d.loss >= 1 ? "var(--warn)" : "var(--good)";
+  return `<strong>${d.delivered.toFixed(1)} Mbps</strong> delivered`
+    + ` of ${d.offered.toFixed(0)} offered`
+    + ` · <span style="color:${lossColor}">${d.loss.toFixed(1)}% loss</span>`
+    + ` · ${d.jitter.toFixed(1)} ms jitter`
+    + ` <span class="muted">(through ompd, forced)</span>`;
 }
 
 // runBandwidthTest and runSpeedtest each trigger their test and record the
@@ -610,6 +631,29 @@ async function runUdpFlood(id) {
     };
   } catch (e) {
     d.udp = { error: String(e) };
+  }
+  if (lastState) renderPaths(lastState);
+}
+
+async function runPinnedFlood(id) {
+  const d = diagRuns[id] || (diagRuns[id] = {});
+  d.pinned = { running: true };
+  if (lastState) renderPaths(lastState);
+  try {
+    const r = await fetch("/api/diag/bandwidth-pinned", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path_id: id, seconds: 5, target_mbps: 0 }),
+    });
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok) d.pinned = { error: b.error || ("HTTP " + r.status) };
+    else if (b.error) d.pinned = { error: b.error };
+    else d.pinned = {
+      delivered: b.result.mbps, offered: b.result.offered_mbps,
+      loss: b.result.loss_percent, jitter: b.result.jitter_ms,
+    };
+  } catch (e) {
+    d.pinned = { error: String(e) };
   }
   if (lastState) renderPaths(lastState);
 }

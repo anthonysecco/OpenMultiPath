@@ -7,14 +7,26 @@
 // number is only ever as good as the load that has happened to flow, and
 // there is no way to check it against ground truth. This is that check: an
 // operator-triggered iperf3 run over one path, for comparing the estimate to
-// a real saturating transfer. It is not wired into scheduling and never runs
-// on its own - it costs uplink data, which on a metered link is the whole
-// reason the estimator avoids active probing in the first place.
+// a real saturating transfer. Neither the run nor its result feeds back into
+// the estimator - it costs uplink data, which on a metered link is the whole
+// reason the estimator avoids active probing in the first place - and it
+// never runs on its own.
 //
-// The run is pinned to a single path with SO_BINDTODEVICE (iperf3's
+// The default run is pinned to a single path with SO_BINDTODEVICE (iperf3's
 // --bind-dev), exactly as the daemon pins its own per-path sockets - source
 // address alone does not pin egress here, since the kernel routes every
-// transport address out the first tunnel regardless.
+// transport address out the first tunnel regardless. This measures the raw
+// link, entirely outside the daemon: it never touches ompd's classification
+// or scheduling, so its number is what the carrier will give any traffic,
+// not what ompd's own load balancer would actually hand a flow.
+//
+// diagpin.go is the other shape of this test (D-048): instead of binding
+// straight to an interface, the run targets the daemon's own overlay address
+// so it becomes an ordinary classified, scheduled flow, with a pin request
+// forcing the scheduler to place it on the path being tested. That answers a
+// different question - not "what can this link carry" but "what does ompd's
+// own path selection do with this link under load" - and only the second one
+// exercises the code an operator is actually trying to diagnose.
 package diag
 
 import (
@@ -27,11 +39,25 @@ import (
 
 // Options describes one uplink test.
 type Options struct {
-	Iface   string // the interface to pin egress to, e.g. "wg1"
+	// Iface pins egress to one interface with SO_BINDTODEVICE, e.g. "wg1" -
+	// the raw-link test's way of choosing a path. Leave empty for the
+	// scheduler-pinned test (D-048), which instead reaches the tunnel's
+	// overlay address and lets ompd's own routing choose the physical link,
+	// steered there by a diag.PinRequest rather than by binding.
+	Iface   string
 	Server  string // iperf3 server address, e.g. "10.20.1.1"
 	Port    int    // iperf3 server port
 	Seconds int    // test duration
 	Streams int    // parallel TCP streams; <=1 runs a single stream
+
+	// LocalIP fixes the client's local source address via iperf3's -B. Empty
+	// leaves it to routing, the normal case for the raw-link test, which
+	// already pins egress with Iface. The scheduler-pinned test sets this to
+	// the tunnel's own overlay address so the outgoing 5-tuple is guaranteed
+	// to match the one it registered in the pin request - if the kernel
+	// picked a different source address, the pin would simply never match
+	// and the flood would silently fall back to ordinary, un-pinned routing.
+	LocalIP string
 
 	// UDP runs a UDP flood instead of a TCP transfer. TargetMbps caps the
 	// send rate; 0 means unlimited - a true flood that sends as fast as the
@@ -48,6 +74,13 @@ type Options struct {
 	// then falls out of the rate, which is the point: the same payload over
 	// a slower path simply takes longer.
 	Bytes int64
+
+	// CPort fixes the client's local source port via iperf3's --cport. 0
+	// leaves it to the kernel, the normal case. The scheduler-pin test
+	// (D-048) needs this: the daemon matches the diagnostic flow by its
+	// exact 5-tuple, computed before the run starts, and an ephemeral
+	// source port would make that unpredictable.
+	CPort int
 }
 
 // Args is the iperf3 command line for these options. Split out from the run
@@ -62,8 +95,13 @@ func (o Options) Args() []string {
 	args := []string{
 		"-c", o.Server,
 		"-p", strconv.Itoa(o.Port),
-		"--bind-dev", o.Iface,
 		"-J",
+	}
+	if o.Iface != "" {
+		args = append(args, "--bind-dev", o.Iface)
+	}
+	if o.LocalIP != "" {
+		args = append(args, "-B", o.LocalIP)
 	}
 	if o.Bytes > 0 {
 		// -n is the total to transfer across all streams (verified on
@@ -84,6 +122,9 @@ func (o Options) Args() []string {
 	}
 	if o.Streams > 1 {
 		args = append(args, "-P", strconv.Itoa(o.Streams))
+	}
+	if o.CPort > 0 {
+		args = append(args, "--cport", strconv.Itoa(o.CPort))
 	}
 	return args
 }

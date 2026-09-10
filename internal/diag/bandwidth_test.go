@@ -146,3 +146,23 @@ func TestArgsFixedBytes(t *testing.T) {
 		t.Errorf("args %q has -t alongside -n", got)
 	}
 }
+
+// The scheduler-pinned test (D-048) reaches the tunnel's overlay address
+// instead of binding to an interface, so no Iface means no --bind-dev - the
+// empty string is not a valid device name to hand iperf3. -B and --cport
+// fix the outgoing 5-tuple instead, so it matches what was registered in the
+// pin request.
+func TestArgsNoInterfaceUsesOverlayAddressing(t *testing.T) {
+	got := strings.Join(Options{
+		Server: "10.30.0.1", Port: 5201, Seconds: 5, UDP: true,
+		LocalIP: "10.30.0.2", CPort: 55201,
+	}.Args(), " ")
+	if strings.Contains(got, "--bind-dev") {
+		t.Errorf("args %q has --bind-dev with no Iface set", got)
+	}
+	for _, want := range []string{"-B 10.30.0.2", "--cport 55201"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("args %q missing %q", got, want)
+		}
+	}
+}

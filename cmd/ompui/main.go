@@ -45,7 +45,15 @@ type server struct {
 	// iperf server serves one client at a time, and two saturating uploads
 	// at once would measure neither path honestly.
 	iperfServer string
-	diagMu      sync.Mutex
+
+	// overlayIperfServer is the same iperf3 server, reached over the
+	// tunnel's overlay network instead of the transport hub (D-048). Traffic
+	// sent here is an ordinary classified, scheduled flow rather than a
+	// direct link measurement, which is what lets a diag.PinRequest force
+	// ompd's own scheduler to place it on a chosen path.
+	overlayIperfServer string
+
+	diagMu sync.Mutex
 }
 
 func main() {
@@ -55,9 +63,16 @@ func main() {
 	configPath := flag.String("config", "/etc/openmultipath/config.json", "settings file shared with the daemon")
 	unit := flag.String("unit", "ompd", "systemd unit for the daemon, for log access and restarts")
 	iperfServer := flag.String("iperf-server", "10.20.1.1:5201", "initiator only: home's iperf3 address for the on-demand per-path uplink test")
+	overlayIperfServer := flag.String("overlay-iperf-server", "10.30.0.1:5201", "initiator only: home's iperf3 address reached over the tunnel overlay, for the scheduler-pinned uplink test (D-048)")
 	flag.Parse()
 
-	s := &server{statePath: *statePath, configPath: *configPath, unit: *unit, iperfServer: *iperfServer}
+	s := &server{
+		statePath:          *statePath,
+		configPath:         *configPath,
+		unit:               *unit,
+		iperfServer:        *iperfServer,
+		overlayIperfServer: *overlayIperfServer,
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(mustSubFS())))
@@ -66,6 +81,7 @@ func main() {
 	mux.HandleFunc("/api/logs", s.handleLogs)
 	mux.HandleFunc("/api/restart", s.handleRestart)
 	mux.HandleFunc("/api/diag/bandwidth", s.handleDiagBandwidth)
+	mux.HandleFunc("/api/diag/bandwidth-pinned", s.handleDiagBandwidthPinned)
 	mux.HandleFunc("/api/diag/speedtest", s.handleDiagSpeedtest)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
@@ -311,6 +327,190 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 	}
 	out["result"] = res
 	writeJSON(w, http.StatusOK, out)
+}
+
+// diagPinSrcPort is the fixed local source port the pinned test's iperf3
+// client always uses (via --cport), so the exact 5-tuple can be computed and
+// registered before the run starts. Single-flight with diagMu means nothing
+// else ever contends for it.
+const diagPinSrcPort = 55201
+
+// handleDiagBandwidthPinned runs the UDP flood as an ordinary classified,
+// scheduled flow over the tunnel's overlay network, with a diag.PinRequest
+// (D-048) forcing ompd's own scheduler to place it on the chosen path.
+//
+// handleDiagBandwidth measures the raw link, entirely outside the daemon -
+// what the carrier will give any traffic. This measures something different:
+// what ompd's own load balancer actually does with the link under load,
+// which is the thing an operator staring at a low estimate is usually
+// actually trying to diagnose, and which raw-link numbers cannot show at
+// all - D-045 and D-046 can exclude a path from the spread set no matter how
+// fast the raw link tests.
+//
+// UDP flood only, one stream. A parallel TCP transfer opens one connection
+// per stream, each with its own source port and therefore its own flow hash,
+// and the pin would have to cover every one of them for the whole offered
+// load to actually land on the chosen path. A single UDP flow has exactly
+// one 5-tuple, so one pin covers it completely - see flowHashTuple.
+func (s *server) handleDiagBandwidthPinned(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		PathID     *uint8 `json:"path_id"`
+		Seconds    int    `json:"seconds"`
+		TargetMbps int    `json:"target_mbps"`
+		MBytes     int    `json:"mbytes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PathID == nil {
+		http.Error(w, "expected a JSON body with a path_id", http.StatusBadRequest)
+		return
+	}
+	if req.Seconds < 1 || req.Seconds > 30 {
+		req.Seconds = 10
+	}
+	if req.TargetMbps < 0 || req.TargetMbps > 10000 {
+		req.TargetMbps = 0
+	}
+	var fixedBytes int64
+	if req.MBytes > 0 {
+		if req.MBytes > 2000 {
+			req.MBytes = 2000
+		}
+		fixedBytes = int64(req.MBytes) * 1_000_000
+	}
+
+	snap, err := state.Read(s.statePath)
+	if err != nil {
+		http.Error(w, "cannot read state to resolve the path: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if !snap.ManagesPaths {
+		http.Error(w, "this end does not own its paths; run the test from the vehicle", http.StatusBadRequest)
+		return
+	}
+	var path *state.Path
+	for i := range snap.Paths {
+		if snap.Paths[i].ID == *req.PathID {
+			path = &snap.Paths[i]
+			break
+		}
+	}
+	if path == nil {
+		http.Error(w, "no such path", http.StatusNotFound)
+		return
+	}
+	if !path.Bound {
+		http.Error(w, "that link is down; nothing to test over - a pin cannot force traffic onto a socket that is not up", http.StatusConflict)
+		return
+	}
+
+	srcIP, err := overlaySourceIP()
+	if err != nil {
+		http.Error(w, "resolving the tunnel's own overlay address: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	host, portStr, err := net.SplitHostPort(s.overlayIperfServer)
+	if err != nil {
+		http.Error(w, "overlay iperf server address is misconfigured: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	port, _ := strconv.Atoi(portStr)
+
+	// Single-flight, shared with the raw-link tests: two saturating runs at
+	// once would measure neither path honestly, pinned or not.
+	if !s.diagMu.TryLock() {
+		http.Error(w, "a bandwidth test is already running", http.StatusConflict)
+		return
+	}
+	defer s.diagMu.Unlock()
+
+	timeout := time.Duration(req.Seconds+15) * time.Second
+	if fixedBytes > 0 {
+		timeout = 180 * time.Second
+	}
+
+	// The pin's own deadline outlives the run by a wide margin - it is the
+	// backstop for ompui being killed before the deferred ClearPin below
+	// runs, not the normal way this ends.
+	pin := diag.PinRequest{
+		PathID:      *req.PathID,
+		SrcIP:       srcIP.String(),
+		DstIP:       host,
+		Protocol:    17, // UDP
+		SrcPort:     diagPinSrcPort,
+		DstPort:     uint16(port),
+		ExpiresUnix: time.Now().Add(timeout + time.Minute).Unix(),
+	}
+	if err := diag.WritePin(pin); err != nil {
+		http.Error(w, "recording the diagnostic pin: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer diag.ClearPin()
+	// The daemon polls for a new pin at most twice a second (watchDiagPin);
+	// give it a moment to pick this one up before any traffic is sent, or
+	// the flood's first packets would ride ordinary routing and be missed
+	// for what they were meant to prove.
+	time.Sleep(750 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
+	res, runErr := diag.Run(ctx, diag.Options{
+		Server:     host,
+		Port:       port,
+		LocalIP:    srcIP.String(),
+		Seconds:    req.Seconds,
+		UDP:        true,
+		TargetMbps: req.TargetMbps,
+		Bytes:      fixedBytes,
+		CPort:      diagPinSrcPort,
+	})
+
+	out := map[string]any{
+		"path_id": *req.PathID,
+		"estimate": map[string]any{
+			"ceiling_kbps":        path.CeilingKbps,
+			"ceiling_known":       path.CeilingKnown,
+			"proven_kbps":         path.ProvenKbps,
+			"limit_kbps":          path.LimitKbps,
+			"ceiling_age_seconds": path.CeilingAgeSeconds,
+		},
+	}
+	if runErr != nil {
+		out["error"] = runErr.Error()
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	out["result"] = res
+	writeJSON(w, http.StatusOK, out)
+}
+
+// overlaySourceIP is the tunnel's own address on the overlay network - the
+// source address the pinned test's traffic actually carries, since it is
+// reached through the TUN device rather than a bound physical interface.
+// omp0 is not a flag: every deploy on this project already hardcodes that
+// name (see the ompd.service.d/d020.conf drop-ins), so this matches an
+// existing convention rather than adding a new one.
+func overlaySourceIP() (net.IP, error) {
+	ifi, err := net.InterfaceByName("omp0")
+	if err != nil {
+		return nil, fmt.Errorf("reading the omp0 tunnel interface: %w", err)
+	}
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return nil, fmt.Errorf("reading omp0's address: %w", err)
+	}
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			if ip4 := ipn.IP.To4(); ip4 != nil {
+				return ip4, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("omp0 has no IPv4 address")
 }
 
 // handleDiagSpeedtest runs a public-internet speed test pinned to one path's
