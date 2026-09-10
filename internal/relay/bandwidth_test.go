@@ -293,6 +293,86 @@ func TestBandwidthSustainedOnsetCommitsAtOnsetRate(t *testing.T) {
 	}
 }
 
+// runWithPeer is run() with a peer report in hand - queueMs is what the peer
+// says our send direction is queueing (D-024), which is what actually drives
+// onset detection once a report exists; see outboundQueueMs. lossPercent is
+// what the ceiling's D-049 discount works from.
+func (d *bwDriver) runWithPeer(dur time.Duration, kbps, rttMs, downQueueMs, queueMs, lossPercent float64) {
+	const tick = 200 * time.Millisecond
+	tx := peerView{valid: true, queueMs: queueMs, loss: lossPercent, at: d.now}
+	for end := d.now + dur; d.now < end; {
+		d.b.noteSent(int(kbps * 1000 / 8 * tick.Seconds()))
+		d.now += tick
+		tx.at = d.now
+		d.b.observe(d.now, rttMs, downQueueMs, tx, d.c)
+	}
+}
+
+// The scenario this session actually ran into: a link offered 2 Mbps that
+// only delivers a quarter of it, with the round trip rising enough to read
+// as onset. Before D-049 the ceiling latched the offered rate - 2000 kbps,
+// the opposite of the truth - because nothing between sendKbps and the
+// ceiling ever asked what arrived.
+func TestOnsetCeilingIsDiscountedForLoss(t *testing.T) {
+	d := newBWDriver()
+	d.run(10*time.Second, 500, 40, 0) // clean floor, no report yet
+	d.runWithPeer(d.c.BWOnsetDwell()+3*time.Second, 2000, 120, 0, 60, 75)
+
+	if !d.b.haveCeiling {
+		t.Fatal("sustained onset with heavy loss set no ceiling")
+	}
+	// Offered 2000, delivered ~500 (75% loss); the ceiling must track the
+	// latter, not the former.
+	if d.b.ceilingKbps > 1000 {
+		t.Fatalf("ceiling = %.0f kbps, close to the 2000 offered rather than the ~500 delivered "+
+			"at 75%% loss - the ceiling is not discounting for loss", d.b.ceilingKbps)
+	}
+}
+
+// Continuing congestion revises the ceiling down on a lower rate that still
+// queues (D-023); that revised rate has to be loss-discounted too, or the
+// revision itself can be inflated by traffic that was offered but never
+// arrived.
+func TestContinuingCongestionCeilingIsDiscountedForLoss(t *testing.T) {
+	d := newBWDriver()
+	d.runWithPeer(d.c.BWOnsetDwell()+2*time.Second, 4000, 120, 0, 60, 0) // onset, clean, ceiling near 3400
+	if !d.b.haveCeiling {
+		t.Fatal("no ceiling recorded; the test needs one to revise")
+	}
+
+	// The link gets both slower and lossy while still queueing.
+	d.runWithPeer(3*time.Second, 2000, 130, 0, 60, 60)
+
+	// Offered 2000 at 60% loss delivers ~800; the revised ceiling must
+	// track that, not the 2000 offered.
+	if d.b.ceilingKbps > 1000 {
+		t.Fatalf("ceiling = %.0f kbps after a lossy revision; want it near the ~800 delivered, "+
+			"not the 2000 offered", d.b.ceilingKbps)
+	}
+}
+
+// A path that is clean by every delay-derived signal but quietly losing
+// packets - the D-046 case - must not lift its own ceiling on what was
+// offered. Only what arrived counts as evidence the link grew.
+func TestCleanReadingLiftDoesNotCountLostTraffic(t *testing.T) {
+	d := newBWDriver()
+	d.run(10*time.Second, 2000, 40, 0)
+	d.run(5*time.Second, 2000, 100, 0) // onset pins a ceiling near 1700
+	if !d.b.haveCeiling {
+		t.Fatal("no ceiling recorded; the test needs one to (not) lift")
+	}
+	low := d.b.ceilingKbps
+
+	// The queue clears - RTT back at the floor - but the link is now
+	// dropping most of what is sent. Nothing here should look like growth.
+	d.runWithPeer(10*time.Second, 6000, 40, 0, 0, 80)
+
+	if d.b.ceilingKbps > low+100 {
+		t.Fatalf("ceiling rose from %.0f to %.0f kbps on a clean-looking read that delivered only "+
+			"20%% of 6000 offered; a lift must be based on what arrived", low, d.b.ceilingKbps)
+	}
+}
+
 // Driving out of a cell sector does not make the old ceiling less certain, it
 // makes it wrong. The ageing curve holds a quiet link's estimate on purpose;
 // this is the other case, where the link underneath has been replaced.

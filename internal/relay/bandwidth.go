@@ -219,21 +219,26 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx p
 			// Already in confirmed congestion. A lower rate that is still
 			// queueing is direct evidence the wall moved in, and is trusted
 			// at once - this is long past a transient blip. (D-023)
-			measured := b.sendKbps * bwSafety
+			//
+			// Discounted by the loss the peer reports (D-049): what was sent
+			// into a filling buffer is not what came out the other side, and
+			// a link that is dropping most of its offered rate has not shown
+			// a wall at the offered rate - it has shown one well below it.
+			measured := b.deliveredKbps(tx) * bwSafety
 			if measured < b.ceilingKbps {
 				b.ceilingKbps = measured
 			}
 			return
 		}
 
-		// A fresh onset. Latch the send rate now, while it still means
+		// A fresh onset. Latch the delivered rate now, while it still means
 		// something, but do not act on it until the queueing has held for
 		// BWOnsetDwell. A single spike - one busy report interval - would
 		// otherwise collapse a good estimate to whatever happened to be in
 		// flight at that instant (D-023 revision, 2026-09-06).
 		if b.onsetSince == 0 {
 			b.onsetSince = now
-			b.candidateKbps = b.sendKbps * bwSafety
+			b.candidateKbps = b.deliveredKbps(tx) * bwSafety
 		}
 		if now-b.onsetSince >= c.BWOnsetDwell() {
 			if !b.haveCeiling || b.candidateKbps < b.ceilingKbps {
@@ -254,11 +259,30 @@ func (b *bwEstimate) observe(now time.Duration, rttMs, downQueueMs float64, tx p
 	// Carrying this much with the link underneath still empty is evidence
 	// the path can do at least this - it is allowed to lift a stale ceiling
 	// that the path has visibly outgrown, but it never invents headroom
-	// above what has actually flowed.
-	if b.haveCeiling && b.sendKbps > b.ceilingKbps {
-		b.ceilingKbps = b.sendKbps
+	// above what has actually flowed. Delivered, not sent (D-049): a path
+	// losing packets without ever queueing - the D-046 case - must not lift
+	// its own ceiling on traffic that was offered but did not arrive.
+	if delivered := b.deliveredKbps(tx); b.haveCeiling && delivered > b.ceilingKbps {
+		b.ceilingKbps = delivered
 		b.ceilingFloorMs = b.minRTTMs
 	}
+}
+
+// deliveredKbps is the send rate discounted by the loss the peer reports, or
+// the raw send rate when no report is in hand.
+//
+// Without a report this is the send rate unmodified, which is the right
+// fallback: an unreported path is not a lossy one, it is an unmeasured one,
+// and assuming loss we cannot see would understate every quiet link's
+// ceiling for no evidence at all.
+func (b *bwEstimate) deliveredKbps(tx peerView) float64 {
+	if !tx.valid || tx.loss <= 0 {
+		return b.sendKbps
+	}
+	if tx.loss >= 100 {
+		return 0
+	}
+	return b.sendKbps * (1 - tx.loss/100)
 }
 
 // outboundQueueMs is how much the link is queueing in our send direction.

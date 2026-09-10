@@ -2344,3 +2344,46 @@ even if optimistic. The new tile shows only "unknown" in that case, because
 there is no longer a floor value to show, and `limitKbps` is honestly 0 until
 a ceiling exists. Less information displayed, but none of it borrowed from a
 number nothing in the system actually trusts.
+
+## D-050 · Discount the ceiling for loss, not just the number D-049 removed
+
+**Problem.** D-049 made `limitKbps` the only bandwidth figure the UI shows,
+on the reasoning that it's also the only one anything gates on. The very
+next live test broke that trust: a pinned flood (D-048) offered Starlink
+2 Mbps, 72.6% of it was lost, and the daemon's own ceiling read 2,130 kbps -
+close to what was *offered*, nowhere near the ~540 kbps iperf3 actually
+delivered.
+
+The instinct was to bring back `provenKbps` for display. That would not have
+caught this: `provenKbps` only ever updated on a clean, non-queueing reading,
+and this traffic - rising RTT and heavy loss together - went through the
+onset/congestion branch, which never touched it. The real bug was upstream
+of any display: `ceilingKbps` is set and raised in three places, and all
+three used raw `sendKbps` - what was offered - with nothing asking what the
+peer actually received.
+
+**Decision.** Discount all three with `deliveredKbps(tx)` = `sendKbps × (1 −
+peer-reported loss)`, the same function D-047 built for `provenKbps` and
+D-049 deleted along with it - reinstated here as what `ceilingKbps` itself
+is built from, not as a second number nobody consults:
+
+- **Fresh onset** (`candidateKbps`): latches delivered rate at the moment
+  queueing begins, not offered rate.
+- **Continuing congestion** (`measured`): a revision while still queueing is
+  discounted the same way, so a link that stays congested and gets lossier
+  cannot revise its own ceiling upward on traffic that never arrived.
+- **Clean-reading lift**: this is the direct D-046 case, reopened. A path
+  clean by every delay signal but quietly losing packets must not lift its
+  own ceiling on what was offered - only on what arrived.
+
+One number, one path from measurement to both the gate and the display,
+rather than two paths that can disagree. `TestOnsetCeilingIsDiscountedForLoss`
+pins the exact scenario that exposed this: offered 2000 kbps at 75% loss now
+sets a ceiling near 500, not near 2000.
+
+**Consequence.** `canCarry` and D-045's spread gate now see a lower ceiling
+on any lossy link than they did an hour ago - correctly. A link that was
+previously permitted a duplication target or spread membership on an
+offered-rate ceiling may now be excluded on its honestly-discounted one. That
+is D-046's own finding, now enforced at the number's source instead of only
+at the scheduling layer that reads it.
