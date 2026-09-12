@@ -63,7 +63,13 @@
   .diag-btn:disabled { opacity: 0.6; cursor: default; }
   .diag-result { flex-basis: 100%; margin-top: 4px; }
   .metrics { display: grid; gap: 10px 16px; grid-template-columns: repeat(auto-fit, minmax(105px, 1fr)); }
-  .metric .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  .metric .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; cursor: help; }
+  .metric-group { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .metric-group:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+  .metric-group h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--dim); margin: 0 0 10px; font-weight: 600;
+  }
   .dir { display: inline-block; padding: 0 4px; border-radius: 3px; background: rgba(127,127,127,.18);
          font-size: 9px; letter-spacing: .04em; vertical-align: 1px; }
   .metric .v { font-size: 17px; font-variant-numeric: tabular-nums; margin-top: 1px; }
@@ -190,14 +196,16 @@ const bandClass = { green: "good", yellow: "warn", red: "bad" };
 // because a band on an uncapped link would be reporting a judgement
 // nobody asked for.
 function budgetRow(p) {
+  const kTitle = "Bytes carried on this physical link during the current billing cycle, " +
+    "from kernel interface counters. Tracked whether or not a cap is configured.";
   if (p.used_bytes === undefined || p.used_bytes === null) return "";
   if (!p.budget_metered) {
-    return `<div class="metric"><div class="k">This cycle</div>
+    return `<div class="metric"><div class="k" title="${kTitle}">This cycle</div>
       <div class="v" title="no allowance configured for this link">${bytes(p.used_bytes)}</div></div>`;
   }
   const cls = bandClass[p.budget] || "good";
   const pct = p.cap_bytes ? Math.round(p.used_bytes / p.cap_bytes * 100) : 0;
-  return `<div class="metric"><div class="k">This cycle <span class="tag ${cls}">${p.budget}</span></div>
+  return `<div class="metric"><div class="k" title="${kTitle}">This cycle <span class="tag ${cls}">${p.budget}</span></div>
     <div class="v" title="${pct}% of the allowance used; on course for ${bytes(p.projected_bytes)} by the end of the cycle">${bytes(p.used_bytes)} / ${bytes(p.cap_bytes)}</div></div>`;
 }
 
@@ -381,13 +389,6 @@ function renderPaths(s) {
     const penalty = (p.r_factor - p.score) >= 1
       ? `penalised ${fmt(p.r_factor - p.score, 0)} R` : "raw quality";
 
-    const bursts = (p.bursts || []).filter(b => b.count > 0);
-    const burstRow = bursts.length
-      ? `<table style="margin-top:12px"><tr><th>Loss bursts</th>` +
-        bursts.map(b => `<th>${b.label}</th>`).join("") + `</tr><tr><td></td>` +
-        bursts.map(b => `<td>${b.count}</td>`).join("") + `</tr></table>`
-      : "";
-
     // Capacity. limit_kbps - the ceiling discounted for how long it has
     // gone unconfirmed - is the only bandwidth figure the scheduler itself
     // ever acts on (D-049), so it is the only one shown: a number the
@@ -415,18 +416,18 @@ function renderPaths(s) {
     // and until these were shown separately that was invisible.
     const inLabel = p.tx_reported ? `<span class="dir">in</span>` : "";
     const outRows = p.tx_reported ? `
-        <div class="metric"><div class="k">Network <span class="dir">out</span></div>
+        <div class="metric"><div class="k" title="One-way network delay in the send direction: half this path's RTT floor plus the peer's reported p95 tail. Measured by the peer, not by this end - send and receive are independent paths and routinely disagree.">Network <span class="dir">out</span></div>
           <div class="v" title="one-way network delay in the send direction: half the ${fmt(p.rtt_floor_ms)} ms round-trip floor, plus the ${fmt(p.tx_spread_ms)} ms p95 tail the peer measured. The two directions' figures sum to about the round-trip floor, which is the symmetry assumption checking out.">${fmt(p.tx_delay_ms - (cfg.base_delay_ms || 0))} ms</div></div>
-        <div class="metric"><div class="k">Score delay <span class="dir">out</span></div>
+        <div class="metric"><div class="k" title="What the E-model scorer is actually fed for outbound delay: the network figure to the left, plus a fixed non-network allowance (codec framing, jitter buffer, the hairpin through home) set by Base delay. Not comparable to a raw round trip.">Score delay <span class="dir">out</span></div>
           <div class="v" title="what the E-model is actually fed: the ${fmt(p.tx_delay_ms - (cfg.base_delay_ms || 0))} ms above plus a fixed ${cfg.base_delay_ms || 0} ms of non-network budget - codec framing, the far end's jitter buffer, and the hairpin through home. Both ends add that constant independently, so this figure is NOT comparable with the round trip.">${fmt(p.tx_delay_ms)} ms</div></div>
-        <div class="metric"><div class="k">p95 spread <span class="dir">out</span></div><div class="v">${fmt(p.tx_spread_ms)} ms</div></div>
-        <div class="metric"><div class="k">Jitter <span class="dir">out</span></div><div class="v">${fmt(p.tx_jitter_ms)} ms</div></div>
-        <div class="metric"><div class="k">Queue delay <span class="dir">out</span></div><div class="v">${fmt(p.tx_queue_delay_ms)} ms</div></div>
-        <div class="metric"><div class="k">Loss <span class="dir">out</span></div>
+        <div class="metric"><div class="k" title="The peer's measured 95th-percentile tail latency on packets this end sent it - the send direction, which cannot be observed locally.">p95 spread <span class="dir">out</span></div><div class="v">${fmt(p.tx_spread_ms)} ms</div></div>
+        <div class="metric"><div class="k" title="The peer's measured RFC 3550 interarrival jitter on this end's transmissions.">Jitter <span class="dir">out</span></div><div class="v">${fmt(p.tx_jitter_ms)} ms</div></div>
+        <div class="metric"><div class="k" title="The peer's measured queue buildup on this end's send direction - the only direct evidence of congestion on the path this end transmits on.">Queue delay <span class="dir">out</span></div><div class="v">${fmt(p.tx_queue_delay_ms)} ms</div></div>
+        <div class="metric"><div class="k" title="Loss rate the peer reports on this end's transmissions, over roughly the last minute. This is the figure a send decision actually needs - a round trip alone can't say which direction loss happened in.">Loss <span class="dir">out</span></div>
           <div class="v" style="color:var(--${lossClass(p.tx_loss_percent)})">${fmt(p.tx_loss_percent, 2)}%</div></div>` : "";
 
     const bindRow = owns
-      ? `<div class="metric"><div class="k">Link drops</div>
+      ? `<div class="metric"><div class="k" title="Times this path's socket has gone down and come back since the daemon started - an interface bounce, DHCP renewal, or address change on this physical link specifically.">Link drops</div>
            <div class="v" title="times this link has gone away since the daemon started, address changes included">${p.drops || 0}</div></div>`
       : "";
 
@@ -436,34 +437,42 @@ function renderPaths(s) {
         <span class="muted">#${p.id}</span>
         ${tags}
       </div>
-      <div class="metrics">
-        <div class="metric"><div class="k">Quality</div>
-          <div class="v" style="color:var(--${mosClass(p.mos)})" title="${penalty}">${fmt(p.mos, 2)} MOS</div></div>
-        <div class="metric"><div class="k">Score</div>
-          <div class="v" title="E-model R factor after penalties; the scheduler ranks on this">${fmt(p.score, 0)} R</div></div>
-        <div class="metric"><div class="k">RTT</div>
-          <div class="v" title="round trip; floor ${fmt(p.rtt_floor_ms)} ms with nothing queued on it">${fmt(p.rtt_ms)} ms</div></div>
-        <div class="metric"><div class="k">p95 spread ${inLabel}</div><div class="v">${fmt(p.p95_spread_ms)} ms</div></div>
-        <div class="metric"><div class="k">Jitter ${inLabel}</div><div class="v">${fmt(p.jitter_ms)} ms</div></div>
-        <div class="metric"><div class="k">Queue delay ${inLabel}</div><div class="v">${fmt(p.queue_delay_ms)} ms</div></div>
-        <div class="metric"><div class="k">Loss ${inLabel}</div>
-          <div class="v" style="color:var(--${lossClass(p.recent_loss_percent)})">${fmt(p.recent_loss_percent, 2)}%</div></div>
-        ${outRows}
-        <div class="metric"><div class="k">Loss (lifetime)</div>
-          <div class="v" title="${p.lost.toLocaleString()} packets since the daemon started">${fmt(p.loss_percent, 2)}%</div></div>
-        <div class="metric"><div class="k">Received</div><div class="v">${p.received.toLocaleString()}</div></div>
-        <div class="metric"><div class="k">Sending</div>
-          <div class="v" title="what is going onto this path right now">${rate(p.send_kbps)}</div></div>
-        ${budgetRow(p)}
-        <div class="metric"><div class="k">Capacity</div>
-          <div class="v" title="${capacityNote}">${capacity}</div></div>
-        <div class="metric"><div class="k">Path MTU</div><div class="v">${p.path_mtu || "—"}</div></div>
-        <div class="metric"><div class="k">Samples</div><div class="v">${p.samples}</div></div>
-        <div class="metric"><div class="k">Last seen</div>
-          <div class="v">${p.last_seen_seconds < 0 ? "never" : duration(p.last_seen_seconds)}</div></div>
-        ${bindRow}
+      <div class="metric-group">
+        <h3>Live</h3>
+        <div class="metrics">
+          <div class="metric"><div class="k" title="Mean Opinion Score (1-5), the R-factor at right converted to the scale a person reads at a glance. This is what a call would sound like if steered onto this path alone, right now.">Quality</div>
+            <div class="v" style="color:var(--${mosClass(p.mos)})" title="${penalty}">${fmt(p.mos, 2)} MOS</div></div>
+          <div class="metric"><div class="k" title="ITU-T G.107 R-factor (0-100): one-way delay and loss combined into the single number the scheduler actually ranks paths on, after penalties for burst loss, flapping, and budget.">Score</div>
+            <div class="v" title="E-model R factor after penalties; the scheduler ranks on this">${fmt(p.score, 0)} R</div></div>
+          <div class="metric"><div class="k" title="Most recent round-trip time, measured by echoing a timestamp back. The two ends' clocks never need to be synchronized for this to be valid.">RTT</div>
+            <div class="v" title="round trip; floor ${fmt(p.rtt_floor_ms)} ms with nothing queued on it">${fmt(p.rtt_ms)} ms</div></div>
+          <div class="metric"><div class="k" title="95th-percentile transit time above this path's own floor, over roughly the last 200 packets received here. Tail latency - what a call actually feels, not the average.">p95 spread ${inLabel}</div><div class="v">${fmt(p.p95_spread_ms)} ms</div></div>
+          <div class="metric"><div class="k" title="RFC 3550 interarrival jitter: smoothed packet-to-packet variation in arrival timing, measured on packets received here.">Jitter ${inLabel}</div><div class="v">${fmt(p.jitter_ms)} ms</div></div>
+          <div class="metric"><div class="k" title="How far the most recent packet's transit exceeds this path's own rolling-minimum delay - i.e. how full the buffer ahead of it is right now, inbound.">Queue delay ${inLabel}</div><div class="v">${fmt(p.queue_delay_ms)} ms</div></div>
+          <div class="metric"><div class="k" title="Loss rate over roughly the last minute, measured directly on packets arriving here.">Loss ${inLabel}</div>
+            <div class="v" style="color:var(--${lossClass(p.recent_loss_percent)})">${fmt(p.recent_loss_percent, 2)}%</div></div>
+          ${outRows}
+          <div class="metric"><div class="k" title="Current outbound bit rate on this path: data, any duplicated copies, and protocol overhead (echoes, reports, MTU probes) combined.">Sending</div>
+            <div class="v" title="what is going onto this path right now">${rate(p.send_kbps)}</div></div>
+          <div class="metric"><div class="k" title="Estimated usable ceiling: the send rate at which this path's own queue was last seen to build, discounted the longer that measurement goes unconfirmed. The only bandwidth figure the scheduler itself acts on.">Capacity</div>
+            <div class="v" title="${capacityNote}">${capacity}</div></div>
+          <div class="metric"><div class="k" title="Largest physical packet size confirmed to cross this path by active probing. The tunnel's own MTU is the smallest of these across every path, so one small path caps everyone.">Path MTU</div><div class="v">${p.path_mtu || "—"}</div></div>
+          <div class="metric"><div class="k" title="How many of the last 200 packets back the delay and jitter figures above. Below 20, treat this path's statistics as too thin to trust - especially before promoting it.">Samples</div><div class="v">${p.samples}</div></div>
+          <div class="metric"><div class="k" title="Time since anything last arrived on this path. A live call needs this in the low single digits of seconds; a value that keeps climbing is a path going quiet.">Last seen</div>
+            <div class="v">${p.last_seen_seconds < 0 ? "never" : duration(p.last_seen_seconds)}</div></div>
+        </div>
       </div>
-      ${burstRow}
+
+      <div class="metric-group">
+        <h3>Cumulative</h3>
+        <div class="metrics">
+          <div class="metric"><div class="k" title="Total loss since the daemon started, as a percentage of everything meant to arrive. Unlike the recent figure above, an old incident never ages out of this one - read it as history, not current health.">Loss (lifetime)</div>
+            <div class="v" title="${p.lost.toLocaleString()} packets since the daemon started">${fmt(p.loss_percent, 2)}%</div></div>
+          <div class="metric"><div class="k" title="Total packets delivered on this path since the daemon started.">Received</div><div class="v">${p.received.toLocaleString()}</div></div>
+          ${budgetRow(p)}
+          ${bindRow}
+        </div>
+      </div>
       ${diagBlock(owns, p)}
     </div>`;
   }).join("");
