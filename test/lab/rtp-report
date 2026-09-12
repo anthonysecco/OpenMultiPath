@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""rtp-report: judge RTP streams captured at the receiving end of the tunnel.
+
+    rtp-report <pcap> [port=clock-rate ...]
+
+tshark dissects the packets (it is already how the project reads captures);
+this computes what a conferencing client's jitter buffer would feel, per
+stream: loss, packets out of order, the longest gap between arrivals, and the
+RFC 3550 interarrival jitter against the stream's own RTP clock. tshark's own
+RTP statistics skip jitter for dynamic payload types, which is every Opus and
+VP8 stream, so it is done here with the clock rate given per port. Defaults:
+5004 is Opus at 48 kHz and 5006 is video at 90 kHz, which is what omp-lab rtp
+sends.
+
+Video is judged per frame rather than per packet: a frame's packets leave
+together, so the gap that matters is between the first packets of successive
+frames.
+"""
+import subprocess
+import sys
+from collections import defaultdict
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(2)
+    pcap = sys.argv[1]
+    clocks = {5004: 48000, 5006: 90000}
+    for arg in sys.argv[2:]:
+        port, rate = arg.split("=")
+        clocks[int(port)] = int(rate)
+
+    decode = []
+    for port in clocks:
+        decode += ["-d", f"udp.port=={port},rtp"]
+    fields = ["frame.time_epoch", "udp.dstport", "rtp.ssrc", "rtp.seq", "rtp.timestamp", "rtp.marker"]
+    cmd = ["tshark", "-r", pcap, *decode, "-Y", "rtp", "-T", "fields", "-E", "separator=,"]
+    for f in fields:
+        cmd += ["-e", f]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+
+    streams = defaultdict(list)
+    for line in out.splitlines():
+        parts = line.split(",")
+        if len(parts) < 6 or not parts[2]:
+            continue
+        t, port, ssrc, seq, ts, marker = parts[:6]
+        streams[(int(port), ssrc)].append((float(t), int(seq), int(ts), marker in ("1", "True")))
+
+    print(f"{'stream':<22} {'pkts':>6} {'lost':>6} {'reord':>6} {'max gap ms':>11} {'jitter ms':>10} {'max jitter':>11}")
+    for (port, ssrc), pkts in sorted(streams.items()):
+        rate = clocks.get(port, 90000)
+        seqs = [p[1] for p in pkts]
+        # Unwrap 16-bit sequence numbers.
+        unwrapped, base, last = [], 0, None
+        for s in seqs:
+            if last is not None and s < last and last - s > 32768:
+                base += 65536
+            unwrapped.append(s + base)
+            last = s
+        expected = max(unwrapped) - min(unwrapped) + 1
+        lost = expected - len(set(unwrapped))
+        reordered = sum(1 for a, b in zip(unwrapped, unwrapped[1:]) if b < a)
+
+        # One arrival per RTP timestamp: the first packet of each frame.
+        firsts = {}
+        for t, _, ts, _ in pkts:
+            firsts.setdefault(ts, t)
+        frames = sorted(firsts.items(), key=lambda kv: kv[1])
+        max_gap, jitter, max_jitter = 0.0, 0.0, 0.0
+        for (ts0, t0), (ts1, t1) in zip(frames, frames[1:]):
+            max_gap = max(max_gap, t1 - t0)
+            d = (t1 - t0) - ((ts1 - ts0) & 0xFFFFFFFF if ts1 >= ts0 else -((ts0 - ts1) & 0xFFFFFFFF)) / rate
+            jitter += (abs(d) - jitter) / 16
+            max_jitter = max(max_jitter, jitter)
+        kind = "audio" if rate == 48000 else "video"
+        print(f"{kind + ' ' + ssrc:<22} {len(pkts):>6} {lost:>6} {reordered:>6} {max_gap * 1000:>11.1f} {jitter * 1000:>10.2f} {max_jitter * 1000:>11.2f}")
+
+
+if __name__ == "__main__":
+    main()

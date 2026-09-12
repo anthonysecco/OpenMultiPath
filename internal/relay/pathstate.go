@@ -121,6 +121,15 @@ type pathMetric struct {
 	txLoss       float64
 	txBurstRatio float64
 
+	// The version 3 figures the cascade paces on: the standing queue and
+	// loss over the last second, both in the send direction. txAge is how
+	// long ago the report carrying them arrived, or -1 if none ever has -
+	// the controller treats "went quiet" and "never said" differently.
+	txStandingMs float64
+	txShortLoss  float64
+	txRxKbps     float64 // what the peer received on this path over the last second
+	txAge        time.Duration
+
 	// rttFloorMs is the round trip with nothing queued on it, which is the
 	// only part of the delay that can be split symmetrically with a clear
 	// conscience.

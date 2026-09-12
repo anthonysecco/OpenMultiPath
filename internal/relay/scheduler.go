@@ -88,6 +88,17 @@ type decision struct {
 	// starve bulk until the first tick for no measured reason.
 	withholdBulk bool
 
+	// cascade is v0.2's bulk placement, in fill order, when cascadeOn; see
+	// cascade.go. cascadeIDs holds the same ids in the same order, so the
+	// data path can hand back a one-path slice without allocating. When the
+	// cascade is not running, cascadeWhy says why and bulk is placed per flow
+	// by txBulkSpread and txBulk exactly as in v0.1.
+	cascade     []cascadeMember
+	cascadeIDs  []uint8
+	cascadeOn   bool
+	cascadeWhy  string
+	overflowIdx int // where bulk goes past every allowance
+
 	primary     uint8
 	havePrimary bool
 
@@ -212,6 +223,59 @@ type scheduler struct {
 	// ompui as a wall-clock Unix timestamp, since ompui has no way to know
 	// the daemon's synthetic clock.
 	nowFn func() time.Time
+
+	// peerResequences reports whether the far end can put a spread flow
+	// back in order, which is wire version 3. The cascade never runs
+	// without it.
+	peerResequences func() bool
+
+	// clockFn is the session clock, read per packet by the cascade's token
+	// buckets. A field so tests can drive it.
+	clockFn func() time.Duration
+
+	// The cascade's evaluation state, owned by the evaluation goroutine:
+	// the fill order held across evaluations, the swaps waiting out their
+	// hysteresis, each path's controller, and the counters last read.
+	cascadeOrder  []uint8
+	swapFor       map[[2]uint8]int
+	caps          map[uint8]*capCtl
+	lastBulkBytes [256]uint64
+	lastBulkAt    time.Duration
+
+	cascadeLogged    bool
+	cascadeWasOn     bool
+	cascadeWhyLogged string
+
+	// bulkBytes is what the data path put onto each path as cascaded bulk,
+	// read by the evaluation as a rate. Atomic because two goroutines meet
+	// here.
+	bulkBytes [256]atomic.Uint64
+
+	// tokens and tokensAt are the cascade's token buckets, owned by the one
+	// goroutine reading the local endpoint.
+	tokens   [256]float64
+	tokensAt [256]time.Duration
+
+	// overflowed counts bulk sent past every allowance onto the least-queued
+	// path; see pickCascade.
+	overflowed atomic.Uint64
+
+	// exhaustedCount is, per path, how many bulk packets found its allowance
+	// spent; lastExhausted the count the evaluation last read. Demand
+	// evidence for the controller.
+	exhaustedCount [256]atomic.Uint64
+	lastExhausted  [256]uint64
+}
+
+// clock is the session clock, for the data path.
+func (s *scheduler) clock() time.Duration {
+	if s.clockFn != nil {
+		return s.clockFn()
+	}
+	if s.sess != nil {
+		return s.sess.elapsed()
+	}
+	return 0
 }
 
 // diagPin is a matched, resolved pin: the exact hash the target flow's
@@ -233,6 +297,9 @@ func newScheduler(sess *session, cfg *config.Holder, candidates func() []uint8) 
 		source:     sess.metrics,
 		machines:   make(map[uint8]*machine),
 		nowFn:      time.Now,
+	}
+	if sess != nil {
+		s.peerResequences = func() bool { return sess.emitVersion() >= 3 }
 	}
 	s.cur.Store(emptyDecision)
 	return s
@@ -301,11 +368,8 @@ func (s *scheduler) txFor(class uint8, flow uint32) []uint8 {
 	// rather than through them. Scoped to exactly the one flow ompui named
 	// and expiring on its own even if the file that set it is never
 	// cleared - see diagPin.
-	if p := s.pin.Load(); p != nil && p.flow == flow {
-		if s.nowFn().Before(p.expires) {
-			return []uint8{p.path}
-		}
-		s.pin.Store(nil)
+	if pin := s.pinnedPath(flow); pin != nil {
+		return pin
 	}
 	// Bulk and transactional both load-balance per flow across the healthy
 	// set. Transactional joins bulk here because pinning it to the primary
@@ -328,6 +392,20 @@ func (s *scheduler) txFor(class uint8, flow uint32) []uint8 {
 		return d.tx
 	}
 	return d.txTrans
+}
+
+// pinnedPath is D-048's operator override for one flow, or nil. The pin
+// expires on its own even if the file that set it is never cleared.
+func (s *scheduler) pinnedPath(flow uint32) []uint8 {
+	p := s.pin.Load()
+	if p == nil || p.flow != flow {
+		return nil
+	}
+	if s.nowFn().Before(p.expires) {
+		return []uint8{p.path}
+	}
+	s.pin.Store(nil)
+	return nil
 }
 
 // deliveringForSpread reports whether a path is actually getting bytes to the
@@ -916,7 +994,19 @@ func (s *scheduler) evaluate(now time.Duration, c config.Config) {
 	s.choose(now, c, eligible)
 	s.buildTx(d, c, eligible, sendable)
 	s.steerBulk(now, d, c, eligible)
-	s.applyAdmission(d, c, eligible)
+	s.buildCascade(now, d, c, eligible)
+	if d.cascadeOn {
+		// The cascade's controller protects the call's path now, and D-031's
+		// gate is not kept behind it (S7). The gate still runs in flow mode,
+		// which is v0.1 exactly and the way back.
+		s.setWithholding(false)
+		d.withholdBulk = false
+	} else {
+		s.applyAdmission(d, c, eligible)
+	}
+	if s.sess != nil {
+		s.sess.updateHold(now, c)
+	}
 
 	for _, sc := range all {
 		d.views[sc.m.id] = pathView{

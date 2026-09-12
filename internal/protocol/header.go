@@ -9,11 +9,17 @@
 //
 //	base header, 15 bytes, on every packet
 //	  0       version (high 4 bits) | type (low 4 bits)
-//	  1       flags: bit0 echo block present, bits1-2 class, bits3-7 reserved
+//	  1       flags: bit0 echo block present, bits1-2 class, bit3 report
+//	          block, bit4 auth tag, bit5 can read version 2, bit6 can read
+//	          version 3, bit7 reserved
 //	  2       path id
 //	  3-6     global sequence, assigned once before path selection
 //	  7-10    per-path sequence, assigned at transmit on one specific path
 //	  11-14   send timestamp, microseconds on the sender's own clock
+//
+//	flow sequence, 4 bytes, on version 3 data packets of class bulk only
+//	  bits 31-20  flow bucket, the sender's hash of the inner 5-tuple
+//	  bits 19-0   sequence within that bucket, wrapping at 2^20
 //
 //	echo block, present only when the echo flag is set
 //	  0       entry count
@@ -32,6 +38,11 @@
 //	    5-6   interarrival jitter, 0.1 ms units
 //	    7-8   recent loss, parts per thousand
 //	    9     burst ratio, tenths
+//	  version 3 adds 6 bytes per entry, 16 in all:
+//	    10-11 standing queue, the least transit above the floor over the
+//	          last ~100 ms, 0.1 ms units
+//	    12-13 loss over the last second, parts per thousand
+//	    14-15 receive rate over the last second, 16 kbps units
 //
 //	auth tag, present only when the auth flag is set (version 2)
 //	  8 bytes, HMAC-SHA256 over every header byte preceding it, truncated
@@ -84,8 +95,13 @@ import (
 // upgraded first with no outage - scope-v1.md is blunt that a tunnel broken
 // from 800 miles away is unrecoverable, and a flag day is exactly how that
 // happens.
+//
+// Version 3 is v0.2's: a flow sequence on bulk data packets, so the far end
+// can put a flow spread across several paths back in order, and two faster
+// figures on each path report for the controller that decides how much bulk
+// each path takes. See v0.2-design.md.
 const (
-	Version    = 2
+	Version    = 3
 	MinVersion = 1
 )
 
@@ -150,8 +166,44 @@ const EchoEntryLen = 11
 // second that costs nothing.
 const MaxEchoEntries = 4
 
-// ReportEntryLen is the size of a single path report entry.
-const ReportEntryLen = 10
+// ReportEntryLen is the size of a single path report entry in version 2,
+// and ReportEntryLenV3 its size once version 3 appended the standing queue
+// and the short-window loss.
+const (
+	ReportEntryLen   = 10
+	ReportEntryLenV3 = 16
+)
+
+// reportEntryLen is the entry size a packet of the given version carries.
+func reportEntryLen(version uint8) int {
+	if version >= 3 {
+		return ReportEntryLenV3
+	}
+	return ReportEntryLen
+}
+
+// FlowSeqLen is the size of the flow sequence field on a version 3 bulk
+// data packet.
+const FlowSeqLen = 4
+
+// FlowBuckets is how many flow sequence spaces there are. Twelve bits of the
+// field: enough that two busy flows rarely share one, small enough that the
+// sender's table of counters is a few kilobytes.
+const FlowBuckets = 1 << 12
+
+// FlowSeqBits is the width of the sequence within a bucket, and FlowSeqMask
+// the mask that wraps it.
+const (
+	FlowSeqBits = 20
+	FlowSeqMask = 1<<FlowSeqBits - 1
+)
+
+// carriesFlowSeq is the rule for where the flow sequence field appears. It is
+// implied rather than flagged: every input is already in the base header, and
+// it keeps the last flag bit free for the next version's capability.
+func carriesFlowSeq(version, typ, class uint8) bool {
+	return version >= 3 && typ == TypeData && class == ClassBulk
+}
 
 // MaxReportEntries caps how many paths one report block describes, on the
 // same reasoning as MaxEchoEntries: a hard maximum the MTU budget can be
@@ -175,11 +227,15 @@ const AuthTagLen = 8
 // is worth the extra constant: folding them into the budget would cost
 // every data packet the worst-case report size for the sake of a block sent
 // once a second on a packet with no payload at all.
-const MaxDataHeaderLen = BaseLen + 1 + MaxEchoEntries*EchoEntryLen + AuthTagLen
+//
+// The flow sequence is counted in although only bulk carries it: the tunnel
+// MTU is one number for every packet, and a packet sized for a transactional
+// flow must still fit once the classifier calls that flow bulk.
+const MaxDataHeaderLen = BaseLen + FlowSeqLen + 1 + MaxEchoEntries*EchoEntryLen + AuthTagLen
 
 // MaxHeaderLen is the largest header of any type, which is what receive
 // buffers have to allow for.
-const MaxHeaderLen = MaxDataHeaderLen + 1 + MaxReportEntries*ReportEntryLen
+const MaxHeaderLen = MaxDataHeaderLen + 1 + MaxReportEntries*ReportEntryLenV3
 
 const (
 	flagEcho   = 1 << 0
@@ -202,7 +258,17 @@ const (
 	// Its parser reads the echo flag and the class, and pays no attention to
 	// bits 3 through 7 - which makes this readable by a new build and
 	// invisible to an old one.
+	//
+	// It says "I can read version 2" and nothing more. Before version 3 it
+	// was read as "the newest version this build knows", which is the same
+	// thing only while there are two versions: a version 3 build reading a
+	// version 2 build's bit that way would have emitted version 3 at a peer
+	// that rejects it, and taken the tunnel down halfway through an upgrade.
 	flagCapable = 1 << 5
+
+	// flagCapableV3 says "I can read version 3". A version 3 build sets both
+	// bits, so a version 2 peer still sees the one it understands.
+	flagCapableV3 = 1 << 6
 )
 
 var (
@@ -278,6 +344,27 @@ type ReportEntry struct {
 	// scattered exactly as chance would scatter it, higher means runs.
 	// Saturates at 25.5, by which point the distinction stopped mattering.
 	BurstTenths uint8
+
+	// StandingQueueTenthMs (version 3) is the least transit above the floor
+	// across the last ~100 ms. QueueTenthMs is one packet's reading, and on
+	// a satellite link one packet can sit behind a handover spike that is
+	// gone by the next; a queue that is really standing raises every
+	// reading in the window, which is what the least of them shows.
+	StandingQueueTenthMs uint16
+
+	// ShortLossPerMille (version 3) is loss over the last second. The
+	// thirty-second LossPerMille is right for judging a path and far too
+	// slow for pacing onto one: it would go on reporting an incident for
+	// half a minute after the cap had already been cut for it.
+	ShortLossPerMille uint16
+
+	// RxKbpsBy16 (version 3) is what actually arrived on the path over the
+	// last second, in 16 kbps units - up to a gigabit. The sender can only
+	// count what it put in; during a burst the link's own buffer absorbs the
+	// difference without any loss, so a rate worked out from sending and
+	// loss reads high exactly while the link is full. This is the arrival
+	// rate, which cannot.
+	RxKbpsBy16 uint16
 }
 
 // Header is the parsed form of the wire header.
@@ -298,6 +385,19 @@ type Header struct {
 	// only ever compared against other readings from that same sender, so
 	// the two ends need no shared epoch.
 	SendTS uint32
+
+	// FlowBucket and FlowSeq order a bulk flow that the sender spread
+	// across several paths (version 3). The bucket is the sender's hash of
+	// the flow, carried rather than recomputed at the receiver so that two
+	// builds hashing differently cannot interleave unrelated flows in one
+	// sequence space. FlowSeq wraps at 2^20.
+	//
+	// Written on every version 3 bulk data packet. HasFlow is set by Parse
+	// when the field was present; it is ignored when encoding, where the
+	// version, type and class alone decide.
+	FlowBucket uint16
+	FlowSeq    uint32
+	HasFlow    bool
 
 	// Echo carries measurement feedback for the peer, when present.
 	Echo []EchoEntry
@@ -331,7 +431,7 @@ func (h *Header) AppendTo(dst []byte, version uint8, key []byte) []byte {
 
 	// Advertised on every packet, whatever version this one is encoded as.
 	// See flagCapable: it is what lets the two ends find each other.
-	flags := byte(flagCapable)
+	flags := byte(flagCapable | flagCapableV3)
 	if len(h.Echo) > 0 {
 		flags |= flagEcho
 	}
@@ -353,6 +453,11 @@ func (h *Header) AppendTo(dst []byte, version uint8, key []byte) []byte {
 	dst = binary.BigEndian.AppendUint32(dst, h.PathSeq)
 	dst = binary.BigEndian.AppendUint32(dst, h.SendTS)
 
+	if carriesFlowSeq(version, h.Type, h.Class) {
+		field := uint32(h.FlowBucket%FlowBuckets)<<FlowSeqBits | h.FlowSeq&FlowSeqMask
+		dst = binary.BigEndian.AppendUint32(dst, field)
+	}
+
 	if len(h.Echo) > 0 {
 		dst = append(dst, uint8(len(h.Echo)))
 		for _, e := range h.Echo {
@@ -372,6 +477,11 @@ func (h *Header) AppendTo(dst []byte, version uint8, key []byte) []byte {
 			dst = binary.BigEndian.AppendUint16(dst, r.JitterTenthMs)
 			dst = binary.BigEndian.AppendUint16(dst, r.LossPerMille)
 			dst = append(dst, r.BurstTenths)
+			if version >= 3 {
+				dst = binary.BigEndian.AppendUint16(dst, r.StandingQueueTenthMs)
+				dst = binary.BigEndian.AppendUint16(dst, r.ShortLossPerMille)
+				dst = binary.BigEndian.AppendUint16(dst, r.RxKbpsBy16)
+			}
 		}
 	}
 
@@ -409,11 +519,18 @@ func Parse(b []byte, key []byte) (Header, []byte, uint8, error) {
 	}
 
 	// What the peer can read, which is not the same as what this packet is
-	// encoded as. A build that advertises capability is telling us we may
-	// emit the newest version we know; one that does not is old, and gets
-	// exactly what it can parse.
+	// encoded as: the highest version it has advertised, and never more
+	// than that. A build that advertises nothing is old and gets exactly
+	// what it can parse. See flagCapable for why this is not simply "the
+	// newest version this build knows".
 	negotiated := version
-	if b[1]&flagCapable != 0 {
+	if b[1]&flagCapable != 0 && negotiated < 2 {
+		negotiated = 2
+	}
+	if b[1]&flagCapableV3 != 0 && negotiated < 3 {
+		negotiated = 3
+	}
+	if negotiated > Version {
 		negotiated = Version
 	}
 
@@ -426,6 +543,17 @@ func Parse(b []byte, key []byte) (Header, []byte, uint8, error) {
 	h.SendTS = binary.BigEndian.Uint32(b[11:15])
 
 	rest := b[BaseLen:]
+
+	if carriesFlowSeq(version, h.Type, h.Class) {
+		if len(rest) < FlowSeqLen {
+			return h, nil, 0, ErrShort
+		}
+		field := binary.BigEndian.Uint32(rest[:FlowSeqLen])
+		h.FlowBucket = uint16(field >> FlowSeqBits)
+		h.FlowSeq = field & FlowSeqMask
+		h.HasFlow = true
+		rest = rest[FlowSeqLen:]
+	}
 
 	if flags&flagEcho != 0 {
 		if len(rest) < 1 {
@@ -464,12 +592,13 @@ func Parse(b []byte, key []byte) (Header, []byte, uint8, error) {
 		if count > MaxReportEntries {
 			return h, nil, 0, fmt.Errorf("%w: %d report entries", ErrMalformed, count)
 		}
-		if len(rest) < count*ReportEntryLen {
+		entryLen := reportEntryLen(version)
+		if len(rest) < count*entryLen {
 			return h, nil, 0, ErrShort
 		}
 		h.Reports = make([]ReportEntry, count)
 		for i := range h.Reports {
-			e := rest[i*ReportEntryLen:]
+			e := rest[i*entryLen:]
 			h.Reports[i] = ReportEntry{
 				PathID:        e[0],
 				SpreadTenthMs: binary.BigEndian.Uint16(e[1:3]),
@@ -478,8 +607,13 @@ func Parse(b []byte, key []byte) (Header, []byte, uint8, error) {
 				LossPerMille:  binary.BigEndian.Uint16(e[7:9]),
 				BurstTenths:   e[9],
 			}
+			if version >= 3 {
+				h.Reports[i].StandingQueueTenthMs = binary.BigEndian.Uint16(e[10:12])
+				h.Reports[i].ShortLossPerMille = binary.BigEndian.Uint16(e[12:14])
+				h.Reports[i].RxKbpsBy16 = binary.BigEndian.Uint16(e[14:16])
+			}
 		}
-		rest = rest[count*ReportEntryLen:]
+		rest = rest[count*entryLen:]
 	}
 
 	if flags&flagAuth != 0 {
@@ -511,6 +645,16 @@ func Parse(b []byte, key []byte) (Header, []byte, uint8, error) {
 // worst possible time to discover it.
 func SeqAfter(a, b uint32) bool {
 	return int32(a-b) > 0
+}
+
+// FlowSeqDiff is a - b in the 20-bit flow sequence space, as a signed
+// distance: positive when a comes after b. The same serial arithmetic as
+// SeqAfter, in the narrower field, and for the same reason - the space wraps
+// every million packets, which at bulk rates is under two minutes, so a plain
+// comparison would break on the first long download rather than after weeks.
+func FlowSeqDiff(a, b uint32) int32 {
+	shift := 32 - FlowSeqBits
+	return int32((a-b)<<shift) >> shift
 }
 
 // MicrosSince returns the microseconds elapsed between two timestamps taken

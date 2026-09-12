@@ -197,6 +197,13 @@ type pathState struct {
 	// this path. Zero value means it has never said, which is not the same
 	// as it having said the path is bad.
 	peer peerView
+
+	// bulkRxAt is when a flow-sequenced bulk packet last arrived here, which
+	// means the far end is spreading bulk and pacing it on what we report.
+	// lastFastReport is when we last reported for that reason. See
+	// fastReportDue.
+	bulkRxAt       time.Duration
+	lastFastReport time.Duration
 }
 
 // peerView is the far end's measurement of our send direction on one path.
@@ -212,6 +219,11 @@ type peerView struct {
 	jitterMs float64
 	loss     float64
 	burst    float64
+
+	// Version 3: the standing queue and loss over the last second.
+	standingMs float64
+	shortLoss  float64
+	rxKbps     float64 // what the peer received on this path over the last second
 
 	at    time.Duration
 	valid bool
@@ -330,6 +342,16 @@ type session struct {
 	meter      *usage.Meter
 	lastEcho   time.Duration
 	lastReport time.Duration
+
+	// reseq puts bulk the far end spread across paths back in order before
+	// delivery (v0.2). Nil in tests that exercise measurement alone, where
+	// payloads are written straight through.
+	reseq *resequencer
+
+	// flowSeqs is the next flow sequence for each bucket. Touched only by
+	// the one goroutine reading the local endpoint, so it needs no lock:
+	// allocation happens once per packet there, before any copies are made.
+	flowSeqs [protocol.FlowBuckets]uint32
 }
 
 func newSession(cfg *config.Holder, node, role string) *session {
@@ -539,17 +561,57 @@ func (s *session) classTotals() (realtime, transactional, bulk, unknown uint64) 
 }
 
 func (s *session) stamp(pathID uint8, globalSeq uint32, class uint8, payload, buf []byte) []byte {
-	return s.buildWith(protocol.TypeData, pathID, globalSeq, class, payload, buf, nil)
+	return s.buildWith(protocol.TypeData, pathID, globalSeq, class, flowTag{}, payload, buf, nil)
+}
+
+// flowTag is one bulk packet's place in its flow's sequence (v0.2). The zero
+// value is written as bucket 0, sequence 0 on a version 3 bulk packet, so the
+// data path must always stamp bulk through stampFlow with a tag from
+// nextFlowTag.
+type flowTag struct {
+	bucket uint16
+	seq    uint32
+}
+
+// nextFlowTag allocates the flow sequence for one bulk packet, from the flow
+// hash the scheduler already computed. Called once per packet, after the
+// decision to send it and before any copies: a sequence allocated for a
+// packet that was then dropped would leave a gap the far end had to wait out.
+func (s *session) nextFlowTag(flow uint32) flowTag {
+	b := uint16(flow % protocol.FlowBuckets)
+	seq := s.flowSeqs[b]
+	s.flowSeqs[b] = (seq + 1) & protocol.FlowSeqMask
+	return flowTag{bucket: b, seq: seq}
+}
+
+// stampFlow is stamp for the data path, carrying the flow tag a version 3
+// bulk packet needs. Every copy of one packet takes the same tag.
+func (s *session) stampFlow(pathID uint8, globalSeq uint32, class uint8, tag flowTag, payload, buf []byte) []byte {
+	return s.buildWith(protocol.TypeData, pathID, globalSeq, class, tag, payload, buf, nil)
+}
+
+// deliverData hands an arriving data payload on: dropped if it is a copy
+// already delivered, resequenced if it is spread bulk, written straight
+// through otherwise.
+func (s *session) deliverData(h *protocol.Header, payload []byte, write func([]byte) error) error {
+	if !s.deliver(h.GlobalSeq) {
+		return nil
+	}
+	if h.HasFlow && s.reseq != nil {
+		s.reseq.push(h.PathID, h.FlowBucket, h.FlowSeq, payload)
+		return nil
+	}
+	return write(payload)
 }
 
 // build is for the packets that are not user traffic. Probes and reports
 // carry no flow to classify and nothing downstream would act on a class,
 // so they go out unclassified.
 func (s *session) build(typ, pathID uint8, globalSeq uint32, payload, buf []byte) []byte {
-	return s.buildWith(typ, pathID, globalSeq, protocol.ClassUnknown, payload, buf, nil)
+	return s.buildWith(typ, pathID, globalSeq, protocol.ClassUnknown, flowTag{}, payload, buf, nil)
 }
 
-func (s *session) buildWith(typ, pathID uint8, globalSeq uint32, class uint8, payload, buf []byte, reports []protocol.ReportEntry) []byte {
+func (s *session) buildWith(typ, pathID uint8, globalSeq uint32, class uint8, tag flowTag, payload, buf []byte, reports []protocol.ReportEntry) []byte {
 	now := s.elapsed()
 
 	s.mu.Lock()
@@ -562,6 +624,9 @@ func (s *session) buildWith(typ, pathID uint8, globalSeq uint32, class uint8, pa
 		PathSeq:   p.nextSeq,
 		SendTS:    uint32(now.Microseconds()),
 		Reports:   reports,
+
+		FlowBucket: tag.bucket,
+		FlowSeq:    tag.seq,
 	}
 	p.nextSeq++
 	p.sentSince++
@@ -632,21 +697,58 @@ func (s *session) dueForReport(id uint8) bool {
 // on data, so a data packet's header stays small enough that the tunnel MTU
 // does not have to budget for a block sent once a second.
 func (s *session) buildReport(pathID uint8, buf []byte) []byte {
+	return s.buildReportWith(pathID, buf, false)
+}
+
+// buildReportWith is buildReport, and when fast is set it carries path
+// reports whatever the ordinary report cadence says - see fastReportDue.
+func (s *session) buildReportWith(pathID uint8, buf []byte, fast bool) []byte {
 	now := s.elapsed()
 
 	var reports []protocol.ReportEntry
 	if s.emitVersion() >= 2 {
 		s.mu.Lock()
-		if now-s.lastReport >= s.cfg.Get().ReportInterval() {
-			reports = s.collectReportsLocked()
+		if fast || now-s.lastReport >= s.cfg.Get().ReportInterval() {
+			reports = s.collectReportsLocked(now)
 			if len(reports) > 0 {
 				s.lastReport = now
 			}
 		}
+		if fast {
+			s.pathLocked(pathID).lastFastReport = now
+		}
 		s.mu.Unlock()
 	}
 
-	return s.buildWith(protocol.TypeReport, pathID, s.nextGlobalSeq(), protocol.ClassUnknown, nil, buf, reports)
+	return s.buildWith(protocol.TypeReport, pathID, s.nextGlobalSeq(), protocol.ClassUnknown, flowTag{}, nil, buf, reports)
+}
+
+// fastReportWindow is how long after the last spread bulk packet a path keeps
+// reporting at the fast cadence.
+const fastReportWindow = 2 * time.Second
+
+// fastReportDue reports whether a path should carry a report now because the
+// far end is spreading bulk onto it (v0.2-design.md, section 6).
+//
+// The far end paces bulk on what we report about its send direction, and the
+// ordinary rule defeats that twice over: reports go out once a second, and
+// only on a path idle enough to have no data to ride. A path carrying spread
+// bulk is by definition never idle. So while bulk is arriving on a path, a
+// report goes out on it at the cascade cadence regardless. One report covers
+// every path, so sending on each bulk-carrying path is redundancy against
+// loss rather than repetition.
+func (s *session) fastReportDue(id uint8) bool {
+	if s.emitVersion() < 3 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.elapsed()
+	p := s.pathLocked(id)
+	if p.bulkRxAt == 0 || now-p.bulkRxAt > fastReportWindow {
+		return false
+	}
+	return now-p.lastFastReport >= s.cfg.Get().CascadeReportInterval()
 }
 
 // collectReportsLocked describes what we have measured on the peer's
@@ -656,7 +758,7 @@ func (s *session) buildReport(pathID uint8, buf []byte) []byte {
 // block: a path that has gone quiet is exactly the one the peer most needs
 // told about, because silence at this end is how its send direction failing
 // looks from here.
-func (s *session) collectReportsLocked() []protocol.ReportEntry {
+func (s *session) collectReportsLocked(now time.Duration) []protocol.ReportEntry {
 	out := make([]protocol.ReportEntry, 0, len(s.paths))
 	for id, p := range s.paths {
 		if p.stats.received == 0 {
@@ -673,9 +775,25 @@ func (s *session) collectReportsLocked() []protocol.ReportEntry {
 			JitterTenthMs: tenthMs(st.jitter / 1000),
 			LossPerMille:  perMille(st.recentLossPercent()),
 			BurstTenths:   tenths(st.recentBurstRatio()),
+
+			StandingQueueTenthMs: tenthMs(msi(st.standingQueue(now))),
+			ShortLossPerMille:    perMille(st.shortLossPercent(now)),
+			RxKbpsBy16:           by16(st.shortRxKbps(now)),
 		})
 	}
 	return out
+}
+
+// by16 converts kbps to the wire's 16 kbps units, saturating.
+func by16(kbps float64) uint16 {
+	v := kbps / 16
+	switch {
+	case v < 0:
+		return 0
+	case v > math.MaxUint16:
+		return math.MaxUint16
+	}
+	return uint16(v + 0.5)
 }
 
 // tenthMs converts milliseconds to the wire's tenths, saturating rather
@@ -831,7 +949,10 @@ func (s *session) runProbes(pathIDs func() []uint8, send func(pathID uint8, pkt 
 		now := s.elapsed()
 
 		for _, id := range pathIDs() {
-			if s.dueForReport(id) {
+			switch {
+			case s.fastReportDue(id):
+				send(id, s.buildReportWith(id, buf, true))
+			case s.dueForReport(id):
 				send(id, s.buildReport(id, buf))
 			}
 		}
@@ -878,6 +999,15 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 		// from here on would read as ancient and sequence tracking would
 		// never recover.
 		p.started = false
+
+		// Its flow sequences started again too.
+		if s.reseq != nil {
+			s.reseq.reset()
+		}
+	}
+	p.stats.noteBytes(wireLen)
+	if h.HasFlow {
+		p.bulkRxAt = now
 	}
 
 	// Per-path sequences are strictly monotonic, so a jump past what was
@@ -939,7 +1069,11 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 			loss:     float64(r.LossPerMille) / 10,
 			burst:    float64(r.BurstTenths) / 10,
 			at:       now,
-			valid:    true,
+
+			standingMs: float64(r.StandingQueueTenthMs) / 10,
+			shortLoss:  float64(r.ShortLossPerMille) / 10,
+			rxKbps:     float64(r.RxKbpsBy16) * 16,
+			valid:      true,
 		}
 	}
 }
@@ -1001,10 +1135,75 @@ func (s *session) metrics(now time.Duration) []pathMetric {
 			txJitterMs:   p.peer.jitterMs,
 			txLoss:       p.peer.loss,
 			txBurstRatio: p.peer.burst,
+			txStandingMs: p.peer.standingMs,
+			txShortLoss:  p.peer.shortLoss,
+			txRxKbps:     p.peer.rxKbps,
+			txAge:        txAge(now, p.peer),
 			rttFloorMs:   ms(p.rttFloor.cur),
 		})
 	}
 	return out
+}
+
+// txAge is how long ago the peer last reported on a path, or -1 if it never
+// has.
+func txAge(now time.Duration, v peerView) time.Duration {
+	if !v.valid {
+		return -1
+	}
+	return now - v.at
+}
+
+// holdLiveWindow is how recently a path must have delivered anything to
+// count toward the resequencer's hold.
+const holdLiveWindow = 2 * time.Second
+
+// updateHold sets how long the resequencer waits for a missing packet, from
+// this end's own inbound measurements (v0.2-design.md, section 7).
+//
+// The receiver is measuring exactly the direction it is resequencing, so
+// nothing needs to come over the wire and no clocks need to agree. The wait
+// a gap deserves is how far behind the fastest path the slowest can deliver:
+// the difference in their base delays, plus the queue the far end's cascade
+// lets stand on a path - the smaller of the worst tail measured and the
+// cascade's own queue target - plus a margin, capped.
+//
+// Every live path counts, not only those already carrying spread bulk. The
+// hold has to be right before the far end spills onto a second path, not an
+// evaluation after: the lab run that found this delivered its first few
+// hundred spilled packets late while the hold was still sized for one path.
+func (s *session) updateHold(now time.Duration, c config.Config) {
+	if s.reseq == nil {
+		return
+	}
+	s.mu.Lock()
+	slowest, fastest, tail, n := 0.0, math.Inf(1), 0.0, 0
+	for _, p := range s.paths {
+		if p.stats.received == 0 || now-p.seenAt > holdLiveWindow || !p.rttFloor.have {
+			continue
+		}
+		base := ms(p.rttFloor.cur) / 2
+		if base > slowest {
+			slowest = base
+		}
+		if base < fastest {
+			fastest = base
+		}
+		if t := msi(p.stats.spread()); t > tail {
+			tail = t
+		}
+		n++
+	}
+	s.mu.Unlock()
+
+	hold := c.ResequencerHoldMargin()
+	if n > 1 {
+		if target := float64(c.CascadeQueueTargetMs); tail > target {
+			tail = target
+		}
+		hold += time.Duration((slowest - fastest + tail) * float64(time.Millisecond))
+	}
+	s.reseq.setPredictedHold(hold, c.ResequencerMaxHold())
 }
 
 // budgetFor turns the configured allowance for an interface into the form
@@ -1123,6 +1322,18 @@ func (s *session) logStats() {
 		}
 		if w := s.withheldBulk.Load(); w > 0 {
 			log.Printf("admission: %d bulk packets withheld to protect the call", w)
+		}
+		if s.sched != nil {
+			// Named from the session's own table rather than the scheduler's,
+			// which belongs to the evaluation goroutine.
+			name := func(id uint8) string { return pathLabel(id, s.cfg.Get().LabelFor(s.names[id])) }
+			log.Printf("bulk: %s; %d sent past every allowance", describeCascade(d, name), s.sched.overflowed.Load())
+		}
+		if s.reseq != nil {
+			if st := s.reseq.stats(); st.Reordered > 0 || st.Late > 0 {
+				log.Printf("resequencer: hold %.0fms, %d held now, %d reordered, %d late, gaps given up %d lost / %d timed out / %d forced",
+					st.HoldMs, st.Buffered, st.Reordered, st.Late, st.GapsLost, st.GapsTimedOut, st.GapsForced)
+			}
 		}
 		if mtu := s.recommendedTunnelMTULocked(); mtu != 0 {
 			log.Printf("recommended tunnel mtu: %d", mtu)
@@ -1276,6 +1487,8 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 			path.TxQueueDelayMs = p.peer.queueMs
 			path.TxJitterMs = p.peer.jitterMs
 			path.TxLossPercent = p.peer.loss
+			path.TxStandingQueueMs = p.peer.standingMs
+			path.TxShortLossPercent = p.peer.shortLoss
 			path.TxDelayMs = outboundDelayMs(ms(p.rttFloor.cur), p.peer.spreadMs,
 				float64(snap.Config.BaseDelayMs))
 		}
@@ -1300,6 +1513,15 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 			path.Transitions = v.Transitions
 			path.Sending = v.Sending
 			path.Primary = d.havePrimary && d.primary == id
+		}
+		path.CascadePosition = -1
+		for i, m := range d.cascade {
+			if d.cascadeOn && m.id == id {
+				path.CascadePosition = i
+				path.CascadeProtected = m.protected
+				path.BulkCapKbps = m.capKbps
+				path.BulkKbps = m.sentKbps
+			}
 		}
 		if snap.ManagesPaths {
 			path.Bound = p.bound
@@ -1365,6 +1587,19 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 	// meaning anything.
 	if len(d.txBulk) == 1 && !d.blind {
 		snap.Scheduler.BulkPath = int(d.txBulk[0])
+	}
+	snap.Scheduler.BulkScheduler = config.BulkFlow
+	if d.cascadeOn {
+		snap.Scheduler.BulkScheduler = config.BulkCascade
+	} else {
+		snap.Scheduler.BulkSchedulerReason = d.cascadeWhy
+	}
+	if s.sched != nil {
+		snap.Scheduler.BulkOverflowed = s.sched.overflowed.Load()
+	}
+	snap.Scheduler.WireVersion = int(s.emitVersion())
+	if s.reseq != nil {
+		snap.Scheduler.Resequencer = s.reseq.stats()
 	}
 	return snap
 }

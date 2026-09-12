@@ -43,6 +43,7 @@ func TestRoundTripWithEcho(t *testing.T) {
 		GlobalSeq: math.MaxUint32,
 		PathSeq:   42,
 		SendTS:    1000,
+		HasFlow:   true, // version 3 bulk data carries the flow sequence
 		Echo: []EchoEntry{
 			{PathID: 1, TS: 900, Delay: 250, MaxSeen: 1472},
 			{PathID: 2, TS: 880, Delay: 17000, MaxSeen: 0},
@@ -51,7 +52,7 @@ func TestRoundTripWithEcho(t *testing.T) {
 	payload := []byte{0x01, 0x02, 0x03}
 
 	wire := append(in.AppendTo(nil, Version, nil), payload...)
-	want := BaseLen + 1 + 2*EchoEntryLen + len(payload)
+	want := BaseLen + FlowSeqLen + 1 + 2*EchoEntryLen + len(payload)
 	if len(wire) != want {
 		t.Fatalf("encoded length = %d, want %d", len(wire), want)
 	}
@@ -171,7 +172,7 @@ func TestRoundTripWithReports(t *testing.T) {
 	}
 
 	wire := in.AppendTo(nil, Version, nil)
-	want := BaseLen + 1 + 2*ReportEntryLen
+	want := BaseLen + 1 + 2*ReportEntryLenV3
 	if len(wire) != want {
 		t.Fatalf("encoded length = %d, want %d", len(wire), want)
 	}
@@ -251,7 +252,7 @@ func TestCapabilityIsAdvertisedOnOldPackets(t *testing.T) {
 // version 1. This is the packet an un-upgraded vehicle sends.
 func TestLegacyPeerStaysOnVersionOne(t *testing.T) {
 	wire := (&Header{Type: TypeData, PathID: 1}).AppendTo(nil, 1, nil)
-	wire[1] &^= flagCapable // as an old build would have left it
+	wire[1] &^= flagCapable | flagCapableV3 // as an old build would have left it
 
 	_, _, negotiated, err := Parse(wire, nil)
 	if err != nil {
@@ -324,5 +325,173 @@ func TestAuthIgnoredWhenNoKeyConfigured(t *testing.T) {
 	}
 	if out.GlobalSeq != 3 {
 		t.Errorf("GlobalSeq = %d, want 3", out.GlobalSeq)
+	}
+}
+
+// The upgrade to version 3 must not repeat the mistake the capability bit
+// was read with before it: a version 2 peer advertises that it can read
+// version 2, and a version 3 build must hear exactly that and no more.
+// Emitting version 3 at it would have every packet rejected mid-upgrade.
+func TestVersionTwoPeerIsNotSentVersionThree(t *testing.T) {
+	wire := (&Header{Type: TypeData, PathID: 1}).AppendTo(nil, 2, nil)
+	wire[1] &^= flagCapableV3 // what a version 2 build leaves clear
+
+	_, _, negotiated, err := Parse(wire, nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if negotiated != 2 {
+		t.Errorf("negotiated = %d with a version 2 peer, want 2", negotiated)
+	}
+}
+
+// And the other half: two version 3 builds find each other even while both
+// are still emitting an older version, which is how every session starts.
+func TestVersionThreeIsNegotiatedFromAnOlderPacket(t *testing.T) {
+	for _, v := range []uint8{1, 2} {
+		wire := (&Header{Type: TypeData, PathID: 1}).AppendTo(nil, v, nil)
+		_, _, negotiated, err := Parse(wire, nil)
+		if err != nil {
+			t.Fatalf("version %d: Parse: %v", v, err)
+		}
+		if negotiated != 3 {
+			t.Errorf("version %d packet from a version 3 build negotiated %d, want 3", v, negotiated)
+		}
+	}
+}
+
+func TestFlowSequenceRoundTrip(t *testing.T) {
+	in := Header{
+		Type:       TypeData,
+		Class:      ClassBulk,
+		PathID:     1,
+		GlobalSeq:  99,
+		FlowBucket: FlowBuckets - 1,
+		FlowSeq:    FlowSeqMask,
+		HasFlow:    true,
+		Echo:       []EchoEntry{{PathID: 0, TS: 5, Delay: 6, MaxSeen: 1400}},
+	}
+	payload := []byte("inner packet")
+	wire := append(in.AppendTo(nil, 3, nil), payload...)
+	if want := BaseLen + FlowSeqLen + 1 + EchoEntryLen + len(payload); len(wire) != want {
+		t.Fatalf("encoded length = %d, want %d", len(wire), want)
+	}
+	out, rest, _, err := Parse(wire, nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Errorf("round trip mismatch:\n got %+v\nwant %+v", out, in)
+	}
+	if string(rest) != string(payload) {
+		t.Errorf("payload = %q, want %q", rest, payload)
+	}
+}
+
+// The field is on version 3 bulk data and nowhere else. A version 2 peer
+// cannot parse it, and real-time, transactional and control packets are
+// never resequenced, so carrying it on them would be bytes for nothing.
+func TestFlowSequenceOnlyOnVersionThreeBulkData(t *testing.T) {
+	cases := []struct {
+		name    string
+		version uint8
+		typ     uint8
+		class   uint8
+		want    bool
+	}{
+		{"v3 bulk data", 3, TypeData, ClassBulk, true},
+		{"v2 bulk data", 2, TypeData, ClassBulk, false},
+		{"v3 real-time data", 3, TypeData, ClassRealtime, false},
+		{"v3 transactional data", 3, TypeData, ClassTransactional, false},
+		{"v3 unclassified data", 3, TypeData, ClassUnknown, false},
+		{"v3 bulk-classed report", 3, TypeReport, ClassBulk, false},
+	}
+	for _, tc := range cases {
+		h := Header{Type: tc.typ, Class: tc.class, PathID: 1, FlowBucket: 7, FlowSeq: 42}
+		wire := h.AppendTo(nil, tc.version, nil)
+		grew := len(wire) == BaseLen+FlowSeqLen
+		if grew != tc.want {
+			t.Errorf("%s: encoded %d bytes, flow field present = %v, want %v", tc.name, len(wire), grew, tc.want)
+		}
+		out, _, _, err := Parse(wire, nil)
+		if err != nil {
+			t.Fatalf("%s: Parse: %v", tc.name, err)
+		}
+		if out.HasFlow != tc.want {
+			t.Errorf("%s: HasFlow = %v, want %v", tc.name, out.HasFlow, tc.want)
+		}
+	}
+}
+
+// The flow sequence steers the resequencer, so forging it must be as hard as
+// forging anything else in the header.
+func TestAuthCoversTheFlowSequence(t *testing.T) {
+	key := []byte("correct horse battery staple")
+	wire := (&Header{Type: TypeData, Class: ClassBulk, PathID: 1, FlowBucket: 3, FlowSeq: 9}).AppendTo(nil, 3, key)
+	if _, _, _, err := Parse(wire, key); err != nil {
+		t.Fatalf("untampered packet: %v", err)
+	}
+	wire[BaseLen+3] ^= 0x01 // low byte of the sequence
+	if _, _, _, err := Parse(wire, key); !errors.Is(err, ErrAuth) {
+		t.Errorf("altering the flow sequence gave %v, want ErrAuth", err)
+	}
+}
+
+func TestVersionThreeReportsCarryTheFastFigures(t *testing.T) {
+	in := Header{
+		Type:   TypeReport,
+		PathID: 0,
+		Reports: []ReportEntry{
+			{PathID: 1, QueueTenthMs: 400, StandingQueueTenthMs: 120, LossPerMille: 3, ShortLossPerMille: 40, BurstTenths: 10, RxKbpsBy16: 1250},
+		},
+	}
+	out, _, _, err := Parse(in.AppendTo(nil, 3, nil), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Errorf("v3 round trip mismatch:\n got %+v\nwant %+v", out, in)
+	}
+
+	wire := in.AppendTo(nil, 2, nil)
+	if want := BaseLen + 1 + ReportEntryLen; len(wire) != want {
+		t.Fatalf("v2 encoding is %d bytes, want %d: a version 2 peer cannot read the longer entry", len(wire), want)
+	}
+	out, _, _, err = Parse(wire, nil)
+	if err != nil {
+		t.Fatalf("v2 Parse: %v", err)
+	}
+	if out.Reports[0].QueueTenthMs != 400 || out.Reports[0].StandingQueueTenthMs != 0 {
+		t.Errorf("v2 report = %+v, want the version 2 fields only", out.Reports[0])
+	}
+}
+
+// The field that wraps every million packets.
+func TestFlowSeqDiffWraps(t *testing.T) {
+	cases := []struct {
+		a, b uint32
+		want int32
+	}{
+		{10, 7, 3},
+		{7, 10, -3},
+		{0, FlowSeqMask, 1},
+		{FlowSeqMask, 0, -1},
+		{5, FlowSeqMask - 4, 10},
+	}
+	for _, tc := range cases {
+		if got := FlowSeqDiff(tc.a, tc.b); got != tc.want {
+			t.Errorf("FlowSeqDiff(%d, %d) = %d, want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+// The tunnel MTU arithmetic in v0.2-design.md: a 1420 byte path less outer
+// IP/UDP, this header at its largest and WireGuard leaves 1288.
+func TestDataHeaderBudget(t *testing.T) {
+	if MaxDataHeaderLen != 72 {
+		t.Errorf("MaxDataHeaderLen = %d, want 72; the deployed -tun-mtu depends on it", MaxDataHeaderLen)
+	}
+	if got := 1420 - 28 - MaxDataHeaderLen - 32; got != 1288 {
+		t.Errorf("tunnel MTU on a 1420 path = %d, want 1288", got)
 	}
 }

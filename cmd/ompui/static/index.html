@@ -317,8 +317,34 @@ function renderScheduler(s) {
      </div>
      <p class="muted">${sc.reason || ""}</p>
      ${order ? `<p class="muted">Ranked: ${order}</p>` : ""}
+     ${bulkPlacement(s, named)}
      ${classSplit(sc)}
      </div>`;
+}
+
+// How bulk is being placed (v0.2). Worth a line of its own next to the path
+// choice: "cascade" configured but running as "flow" is the first thing to
+// check when downloads do not aggregate, and the reason says why - an older
+// peer, no classifier, or blind mode.
+function bulkPlacement(s, named) {
+  const sc = s.scheduler || {};
+  if (!sc.bulk_scheduler) return "";
+  const rs = sc.resequencer || {};
+  const reseq = rs.reordered || rs.late
+    ? ` · resequencer holding ${fmt(rs.hold_ms, 0)} ms, ${(rs.reordered || 0).toLocaleString()} reordered, ${(rs.late || 0).toLocaleString()} late`
+    : "";
+  if (sc.bulk_scheduler !== "cascade") {
+    return `<p class="muted" title="Bulk is placed one flow to one path, v0.1's scheduler.">Bulk: per flow${sc.bulk_scheduler_reason ? ` (${sc.bulk_scheduler_reason})` : ""}${reseq}</p>`;
+  }
+  const members = (s.paths || [])
+    .filter(p => p.cascade_position >= 0)
+    .sort((a, b) => a.cascade_position - b.cascade_position)
+    .map(p => {
+      const cap = p.bulk_cap_kbps > 0 ? `capped ${rate(p.bulk_cap_kbps)}` : "uncapped";
+      return `${named(p.id)}${p.cascade_protected ? " (call's path)" : ""} ${cap}`;
+    }).join(" → ");
+  const dropped = sc.bulk_overflowed ? ` · ${sc.bulk_overflowed.toLocaleString()} past every allowance` : "";
+  return `<p class="muted" title="Bulk fills the slowest path first and spills onto faster ones only as each congests, the call's path last. A cap is how much bulk a path may currently take, set from the standing queue and loss the far end reports.">Bulk: cascade ${members}${dropped}${reseq}</p>`;
 }
 
 // What the classifier has decided, since the daemon started.
@@ -424,7 +450,14 @@ function renderPaths(s) {
         <div class="metric"><div class="k" title="The peer's measured RFC 3550 interarrival jitter on this end's transmissions.">Jitter <span class="dir">out</span></div><div class="v">${fmt(p.tx_jitter_ms)} ms</div></div>
         <div class="metric"><div class="k" title="The peer's measured queue buildup on this end's send direction - the only direct evidence of congestion on the path this end transmits on.">Queue delay <span class="dir">out</span></div><div class="v">${fmt(p.tx_queue_delay_ms)} ms</div></div>
         <div class="metric"><div class="k" title="Loss rate the peer reports on this end's transmissions, over roughly the last minute. This is the figure a send decision actually needs - a round trip alone can't say which direction loss happened in.">Loss <span class="dir">out</span></div>
-          <div class="v" style="color:var(--${lossClass(p.tx_loss_percent)})">${fmt(p.tx_loss_percent, 2)}%</div></div>` : "";
+          <div class="v" style="color:var(--${lossClass(p.tx_loss_percent)})">${fmt(p.tx_loss_percent, 2)}%</div></div>
+        <div class="metric"><div class="k" title="The least transit above this path's floor over the last ~100 ms, as the peer measured it on this end's transmissions. A lone jitter spike does not move it; a queue that is really building does. This is what the bulk cascade paces on.">Standing queue <span class="dir">out</span></div><div class="v">${fmt(p.tx_standing_queue_ms)} ms</div></div>
+        <div class="metric"><div class="k" title="Loss over the last second on this end's transmissions, as the peer measured it. The fast figure the bulk cascade reacts to; the one-minute figure beside it is for judging the path.">Loss 1 s <span class="dir">out</span></div>
+          <div class="v" style="color:var(--${lossClass(p.tx_short_loss_percent)})">${fmt(p.tx_short_loss_percent, 1)}%</div></div>` : "";
+
+    const bulkRow = p.cascade_position >= 0 ? `
+        <div class="metric"><div class="k" title="This path's place in the bulk cascade: bulk fills place 1 first and spills to the next place only once a path congests. The call's path is always last, and otherwise treated like any path - a call never holds bulk back. The cap is how much bulk the path takes before the rest spills on - uncapped until its queue or loss says it is full.">Bulk ${p.cascade_position + 1}${p.cascade_protected ? " · call's path" : ""}</div>
+          <div class="v" title="${p.bulk_cap_kbps > 0 ? "capped at " + rate(p.bulk_cap_kbps) : "uncapped"}">${rate(p.bulk_kbps)}${p.bulk_cap_kbps > 0 ? " / " + rate(p.bulk_cap_kbps) : ""}</div></div>` : "";
 
     const bindRow = owns
       ? `<div class="metric"><div class="k" title="Times this path's socket has gone down and come back since the daemon started - an interface bounce, DHCP renewal, or address change on this physical link specifically.">Link drops</div>
@@ -452,6 +485,7 @@ function renderPaths(s) {
           <div class="metric"><div class="k" title="Loss rate over roughly the last minute, measured directly on packets arriving here.">Loss ${inLabel}</div>
             <div class="v" style="color:var(--${lossClass(p.recent_loss_percent)})">${fmt(p.recent_loss_percent, 2)}%</div></div>
           ${outRows}
+          ${bulkRow}
           <div class="metric"><div class="k" title="Current outbound bit rate on this path: data, any duplicated copies, and protocol overhead (echoes, reports, MTU probes) combined.">Sending</div>
             <div class="v" title="what is going onto this path right now">${rate(p.send_kbps)}</div></div>
           <div class="metric"><div class="k" title="Estimated usable ceiling: the send rate at which this path's own queue was last seen to build, discounted the longer that measurement goes unconfirmed. The only bandwidth figure the scheduler itself acts on.">Capacity</div>
@@ -756,6 +790,21 @@ const FIELDS = [
   ["mbb_max_ms", "Handover maximum overlap", "ms",
    "Longest to keep paying for two copies while waiting for the new path to be confirmed."],
 
+  ["cascade_queue_target_ms", "Bulk spill queue", "ms",
+   "Standing queue in the send direction at which a path counts as full, and bulk starts spilling onto the next path in the fill order. The same on every path, the call's included."],
+  ["cascade_loss_percent", "Bulk spill loss", "%",
+   "Send-direction loss over the last second that counts as a path being full even with no queue - a link dropping traffic at the radio never queues."],
+  ["cascade_recover_intervals", "Bulk cap recovery", "intervals",
+   "Clean evaluations before a path's bulk cap grows again."],
+  ["cascade_order_hysteresis_ms", "Bulk order margin", "ms",
+   "How much slower a path must be before it is filled ahead of the one in front of it. Stops two similar links trading places."],
+  ["cascade_report_interval_ms", "Fast report interval", "ms",
+   "How often a node receiving spread bulk reports its paths back, so the sender can pace. The ordinary report is once a second and only on idle paths."],
+  ["resequencer_hold_margin_ms", "Resequencer margin", "ms",
+   "Added to the measured delay difference between paths to give how long a missing bulk packet is waited for."],
+  ["resequencer_max_hold_ms", "Resequencer maximum hold", "ms",
+   "Longest a missing bulk packet is ever waited for. A path further behind the call's path than this is not spread onto."],
+
   ["report_interval_ms", "Path report interval", "ms",
    "How often each end tells the other what it measured on the other's transmissions. This is the far end's only way to see its own send direction."],
   ["bw_onset_ms", "Capacity onset", "ms",
@@ -780,6 +829,12 @@ const DUPLICATE_HINTS = {
   "always": "Every packet on every usable path. This is what saturated the standby-plan link.",
 };
 
+// How bulk is placed, and the v0.2 kill switch.
+const BULK_HINTS = {
+  "cascade": "Bulk per packet: slowest path first, spilling onto faster ones as each fills, the call's path last. The default. Needs both ends on v0.2.",
+  "flow": "v0.1: one flow to one path, and a gate that stops bulk when the call's path queues. The way back if the cascade misbehaves.",
+};
+
 async function loadConfig() {
   const r = await (await fetch("/api/config")).json();
   const modes = Object.keys(DUPLICATE_HINTS);
@@ -800,7 +855,17 @@ async function loadConfig() {
        ${modes.map(m => `<option value="${m}"${m === current ? " selected" : ""}>${m}</option>`).join("")}
      </select></span>
      <div class="hint" id="duplicate_hint">${DUPLICATE_HINTS[current]}</div>
+   </div>
+   <div class="field">
+     <label for="bulk_scheduler">Bulk placement</label>
+     <span><select id="bulk_scheduler" name="bulk_scheduler">
+       ${Object.keys(BULK_HINTS).map(m => `<option value="${m}"${m === (r.config.bulk_scheduler || "cascade") ? " selected" : ""}>${m}</option>`).join("")}
+     </select></span>
+     <div class="hint" id="bulk_hint">${BULK_HINTS[r.config.bulk_scheduler || "cascade"]}</div>
    </div>`;
+  $("bulk_scheduler").addEventListener("change", e => {
+    $("bulk_hint").textContent = BULK_HINTS[e.target.value] || "";
+  });
 
   $("duplicate_mode").addEventListener("change", e => {
     $("duplicate_hint").textContent = DUPLICATE_HINTS[e.target.value] || "";
@@ -812,6 +877,7 @@ $("config").addEventListener("submit", async e => {
   const body = {};
   for (const [key] of FIELDS) body[key] = Number($(key).value);
   body.duplicate_mode = $("duplicate_mode").value;
+  body.bulk_scheduler = $("bulk_scheduler").value;
 
   const res = await fetch("/api/config", {
     method: "POST",
@@ -827,6 +893,7 @@ $("config").addEventListener("submit", async e => {
   const r = await res.json();
   for (const [key] of FIELDS) $(key).value = r.config[key];
   $("duplicate_mode").value = r.config.duplicate_mode;
+  $("bulk_scheduler").value = r.config.bulk_scheduler;
   $("saved").hidden = false;
   setTimeout(() => { $("saved").hidden = true; }, 2500);
 });

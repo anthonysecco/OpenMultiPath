@@ -109,6 +109,48 @@ type Scheduler struct {
 	// as a byte string and base64s it, which turns the one field a
 	// recovery script has to read into "AQA=".
 	Ranking []int `json:"ranking,omitempty"`
+
+	// BulkScheduler is how bulk is actually being placed right now -
+	// "cascade" or "flow" - which is not always what the setting asks for:
+	// cascade quietly falls back to flow against a peer that cannot
+	// resequence, below WireGuard, and in blind mode. BulkSchedulerReason
+	// says why when the two differ.
+	BulkScheduler       string `json:"bulk_scheduler,omitempty"`
+	BulkSchedulerReason string `json:"bulk_scheduler_reason,omitempty"`
+
+	// BulkOverflowed counts bulk sent past every path's allowance onto the
+	// least-queued path. The cascade never drops bulk; a steadily climbing
+	// figure means the allowances are set lower than the links can carry.
+	BulkOverflowed uint64 `json:"bulk_overflowed"`
+
+	// WireVersion is the version this end is speaking to its peer.
+	WireVersion int `json:"wire_version"`
+
+	// Resequencer is the health of the receive-side reordering of spread
+	// bulk.
+	Resequencer Resequencer `json:"resequencer"`
+}
+
+// Resequencer describes the receive side of v0.2's per-packet bulk spread.
+type Resequencer struct {
+	// HoldMs is how long a missing packet is currently waited for, and
+	// Buffered how many packets are waiting behind gaps right now.
+	HoldMs   float64 `json:"hold_ms"`
+	Buffered int     `json:"buffered"`
+
+	// Cumulative counts. Reordered is packets that arrived ahead of a gap
+	// and were held; the three Gaps figures are gaps given up on, split by
+	// why: every path had passed them (a real loss, found quickly), the
+	// hold ran out (a path went quiet), or memory was short. Late is packets
+	// that arrived after their gap had been given up on and were delivered
+	// anyway - persistently above zero means the hold is too short.
+	Delivered    uint64 `json:"delivered"`
+	Reordered    uint64 `json:"reordered"`
+	Late         uint64 `json:"late"`
+	GapsLost     uint64 `json:"gaps_lost"`
+	GapsTimedOut uint64 `json:"gaps_timed_out"`
+	GapsForced   uint64 `json:"gaps_forced"`
+	SenderResets uint64 `json:"sender_resets"`
 }
 
 // Path is one link's measurements.
@@ -161,6 +203,12 @@ type Path struct {
 	TxQueueDelayMs float64 `json:"tx_queue_delay_ms"`
 	TxJitterMs     float64 `json:"tx_jitter_ms"`
 	TxLossPercent  float64 `json:"tx_loss_percent"`
+
+	// Version 3 figures: the standing queue - the least transit above the
+	// floor over the last ~100 ms - and loss over the last second. What the
+	// cascade paces on.
+	TxStandingQueueMs  float64 `json:"tx_standing_queue_ms"`
+	TxShortLossPercent float64 `json:"tx_short_loss_percent"`
 
 	// TxDelayMs is the one-way delay estimate the scheduler actually ranks
 	// on: half the round-trip floor, plus what the peer says it is queueing.
@@ -237,6 +285,18 @@ type Path struct {
 	// while duplicating.
 	Sending bool `json:"sending"`
 	Primary bool `json:"primary,omitempty"`
+
+	// The cascade (v0.2). CascadePosition is this path's place in the bulk
+	// fill order, first filled first, or -1 when bulk is not placed on it
+	// by the cascade. CascadeProtected marks the path carrying real-time and
+	// transactional traffic, which is always last and otherwise treated like
+	// any other path. BulkCapKbps is how much
+	// bulk it may currently take, 0 meaning uncapped, and BulkKbps how much
+	// it carried over the last evaluation.
+	CascadePosition  int     `json:"cascade_position"`
+	CascadeProtected bool    `json:"cascade_protected,omitempty"`
+	BulkCapKbps      float64 `json:"bulk_cap_kbps"`
+	BulkKbps         float64 `json:"bulk_kbps"`
 
 	LastSeenSeconds float64 `json:"last_seen_seconds"`
 	Alive           bool    `json:"alive"`

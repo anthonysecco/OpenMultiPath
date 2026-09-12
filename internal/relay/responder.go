@@ -66,6 +66,12 @@ func RunResponder(cfg ResponderConfig) error {
 
 	sess := newSession(cfg.Settings, cfg.Node, roleResponder)
 	sess.setAuthKey(cfg.AuthKey)
+
+	// v0.2: bulk the far end spread across paths is put back in order here
+	// before it reaches the local endpoint. Only packets carrying a flow
+	// sequence go through it; everything else is written straight through.
+	sess.reseq = newResequencer(local.write, sess.elapsed)
+	go sess.reseq.run()
 	go sess.logStats()
 	if cfg.StatePath != "" {
 		go sess.writeState(cfg.StatePath, cfg.WGInterface)
@@ -130,10 +136,7 @@ func RunResponder(cfg ResponderConfig) error {
 		// One delivery per packet, however many copies arrive. See
 		// dedup.go: WireGuard's replay window used to do this
 		// underneath, and D-020 moved the daemon above it.
-		if !sess.deliver(h.GlobalSeq) {
-			return
-		}
-		if err := local.write(payload); err != nil {
+		if err := sess.deliverData(&h, payload, local.write); err != nil {
 			log.Printf("responder: write to local endpoint failed: %v", err)
 		}
 	})
@@ -172,18 +175,26 @@ func RunResponder(cfg ResponderConfig) error {
 			return
 		}
 
-		globalSeq := sess.nextGlobalSeq()
-
-		tx := sched.txFor(class, flowHash(payload))
+		// Placement before sequencing; see the initiator.
+		flow := flowHash(payload)
+		tx, send := sched.txForPacket(class, flow, len(payload))
+		if !send {
+			return
+		}
 		if len(tx) == 0 {
 			tx = known()
+		}
+		globalSeq := sess.nextGlobalSeq()
+		var tag flowTag
+		if class == protocol.ClassBulk {
+			tag = sess.nextFlowTag(flow)
 		}
 		for _, id := range tx {
 			addr := sess.remoteFor(id)
 			if addr == nil {
 				continue // never heard from, so nowhere to send
 			}
-			out := sess.stamp(id, globalSeq, class, payload, scratch)
+			out := sess.stampFlow(id, globalSeq, class, tag, payload, scratch)
 			if _, err := pubConn.WriteToUDP(out, addr); err != nil {
 				log.Printf("responder: write to path %d at %s failed: %v", id, addr, err)
 			}

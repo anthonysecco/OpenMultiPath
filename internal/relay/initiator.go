@@ -75,6 +75,12 @@ func RunInitiator(cfg InitiatorConfig) error {
 	sess := newSession(cfg.Settings, cfg.Node, roleInitiator)
 	sess.setAuthKey(cfg.AuthKey)
 
+	// v0.2: bulk the far end spread across paths is put back in order here
+	// before it reaches the local endpoint. Only packets carrying a flow
+	// sequence go through it; everything else is written straight through.
+	sess.reseq = newResequencer(local.write, sess.elapsed)
+	go sess.reseq.run()
+
 	// Path ids are indices into the configured list, so a path keeps its
 	// identity across every unbind and rebind. A link that vanishes for
 	// ten minutes comes back as the same path with its history intact,
@@ -140,10 +146,7 @@ func RunInitiator(cfg InitiatorConfig) error {
 		// One delivery per packet, however many copies arrive. See
 		// dedup.go: WireGuard's replay window used to do this
 		// underneath, and D-020 moved the daemon above it.
-		if !sess.deliver(h.GlobalSeq) {
-			return
-		}
-		if err := local.write(payload); err != nil {
+		if err := sess.deliverData(&h, payload, local.write); err != nil {
 			log.Printf("initiator: write to local endpoint failed: %v", err)
 		}
 	})
@@ -190,17 +193,28 @@ func RunInitiator(cfg InitiatorConfig) error {
 			return
 		}
 
-		globalSeq := sess.nextGlobalSeq()
+		// The placement comes before any sequence is allocated: the cascade
+		// can drop a bulk packet at the ingress, and a flow sequence spent on
+		// a packet that was never sent is a gap the far end would wait out.
+		flow := flowHash(payload)
+		tx, send := sched.txForPacket(class, flow, len(payload))
+		if !send {
+			return
+		}
 
 		// Before the first evaluation the scheduler has no opinion, so
 		// fall back to every bound path. Coming up sending nothing would
 		// leave the tunnel dead until the first tick.
-		tx := sched.txFor(class, flowHash(payload))
 		if len(tx) == 0 {
 			tx = paths.active()
 		}
+		globalSeq := sess.nextGlobalSeq()
+		var tag flowTag
+		if class == protocol.ClassBulk {
+			tag = sess.nextFlowTag(flow)
+		}
 		for _, id := range tx {
-			paths.send(id, sess.stamp(id, globalSeq, class, payload, scratch))
+			paths.send(id, sess.stampFlow(id, globalSeq, class, tag, payload, scratch))
 		}
 	})
 

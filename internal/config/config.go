@@ -243,6 +243,55 @@ type Config struct {
 	// another burst of standing queue through the call.
 	AdmissionRecoverIntervals int `json:"admission_recover_intervals"`
 
+	// BulkScheduler picks how bulk is placed, and it is the v0.2 kill
+	// switch. "cascade" spreads bulk per packet: it fills the slowest usable
+	// path first and spills onto faster ones only as each congests, down to
+	// the path carrying the call, with the far end putting each flow back
+	// in order. "flow" is v0.1 exactly - one flow to one path by a hash,
+	// and admission control's binary gate protecting the call's path.
+	//
+	// Cascade needs a peer that can resequence, so against an older build
+	// it quietly behaves as flow whatever this says. Flipping it takes
+	// effect on the next evaluation. See v0.2-design.md.
+	BulkScheduler string `json:"bulk_scheduler"`
+
+	// CascadeQueueTargetMs is the send-direction standing queue at which a
+	// path is treated as full, and bulk starts spilling onto the next path.
+	// The same on every path, the call's included: real-time on a path sets
+	// its place in the fill order and nothing else.
+	CascadeQueueTargetMs int `json:"cascade_queue_target_ms"`
+
+	// CascadeLossPercent is send-direction loss over the last second that
+	// counts as congestion even with no queue. D-046's link lost two thirds
+	// of what it was given and never queued at all.
+	CascadeLossPercent int `json:"cascade_loss_percent"`
+
+	// CascadeRecoverIntervals is how many clean evaluations a path's bulk
+	// allowance waits before growing again. Cutting at once and growing only
+	// after a clean run is the asymmetry admission control used, for the same
+	// reason: symmetric rules oscillate.
+	CascadeRecoverIntervals int `json:"cascade_recover_intervals"`
+
+	// CascadeOrderHysteresisMs is how much slower a path must be before it
+	// overtakes the one ahead of it in the fill order. Two links a few
+	// milliseconds apart would otherwise swap every evaluation.
+	CascadeOrderHysteresisMs int `json:"cascade_order_hysteresis_ms"`
+
+	// CascadeReportIntervalMs is how often a node receiving spread bulk
+	// tells the sender what its paths are doing. The ordinary cadence is a
+	// second, and only on idle paths, which is exactly when spreading does
+	// not need it.
+	CascadeReportIntervalMs int `json:"cascade_report_interval_ms"`
+
+	// ResequencerHoldMarginMs is added to the measured spread in delay
+	// between paths to give how long the far end waits for a missing packet
+	// before giving up on it. ResequencerMaxHoldMs caps that wait whatever
+	// is measured, and a path further behind the call's path than the cap
+	// is not spread onto at all - its packets would arrive after the wait
+	// had given up on them.
+	ResequencerHoldMarginMs int `json:"resequencer_hold_margin_ms"`
+	ResequencerMaxHoldMs    int `json:"resequencer_max_hold_ms"`
+
 	// Cost tracking, step 10. Links carries one entry per WAN interface
 	// that has an allowance worth respecting; an interface with no entry
 	// is unmetered, which is the default and the only sane one. A cap
@@ -339,6 +388,26 @@ const (
 	DuplicateAlways = "always"
 )
 
+// Bulk schedulers. See Config.BulkScheduler.
+const (
+	BulkCascade = "cascade"
+	BulkFlow    = "flow"
+)
+
+// BulkSchedulers is every accepted value, default first.
+var BulkSchedulers = []string{BulkCascade, BulkFlow}
+
+// bulkScheduler brings the setting to something meaningful. A typo gets the
+// default, as with the duplication policy.
+func bulkScheduler(s string) string {
+	for _, m := range BulkSchedulers {
+		if s == m {
+			return s
+		}
+	}
+	return BulkCascade
+}
+
 // DuplicateModes is every accepted value, in the order the interface
 // offers them.
 var DuplicateModes = []string{DuplicateOff, DuplicateSwitching, DuplicateUnstable, DuplicateAlways}
@@ -405,6 +474,28 @@ var Bounds = map[string]bound{
 	// back and forth across the threshold.
 	"admission_queue_delay_ms":    {Min: 10, Max: 5_000, Default: 150},
 	"admission_recover_intervals": {Min: 1, Max: 1_000, Default: 25},
+
+	// v0.2's cascade. Every one of these is reasoned rather than measured,
+	// and the drive that settles them is the next thing after deployment.
+	//
+	// 40 ms of standing queue is well past scheduling noise and well short of
+	// the 100 ms at which the state machine calls a path unstable.
+	"cascade_queue_target_ms": {Min: 5, Max: 1_000, Default: 40},
+
+	// Above ordinary cellular loss, so random radio loss does not ratchet a
+	// healthy link down the way it collapsed cubic (D-041). Links losing far
+	// more are already kept out by spread_min_r.
+	"cascade_loss_percent": {Min: 1, Max: 50, Default: 5},
+
+	// A second at the default cadence.
+	"cascade_recover_intervals":   {Min: 1, Max: 1_000, Default: 5},
+	"cascade_order_hysteresis_ms": {Min: 0, Max: 500, Default: 10},
+	"cascade_report_interval_ms":  {Min: 50, Max: 5_000, Default: 200},
+
+	// Enough to hold Starlink beside LTE (S2 in v0.2-design.md), and a cap
+	// that stops one wild reading turning the hold into a stall.
+	"resequencer_hold_margin_ms": {Min: 0, Max: 500, Default: 10},
+	"resequencer_max_hold_ms":    {Min: 20, Max: 2_000, Default: 200},
 
 	// Three intervals to demote, ten to promote, straight from
 	// protocol.md. At the default cadence that is 600 ms down and 2 s up.
@@ -532,6 +623,14 @@ func Defaults() Config {
 		UnstableJitterMs:          Bounds["unstable_jitter_ms"].Default,
 		AdmissionQueueDelayMs:     Bounds["admission_queue_delay_ms"].Default,
 		AdmissionRecoverIntervals: Bounds["admission_recover_intervals"].Default,
+		BulkScheduler:             BulkCascade,
+		CascadeQueueTargetMs:      Bounds["cascade_queue_target_ms"].Default,
+		CascadeLossPercent:        Bounds["cascade_loss_percent"].Default,
+		CascadeRecoverIntervals:   Bounds["cascade_recover_intervals"].Default,
+		CascadeOrderHysteresisMs:  Bounds["cascade_order_hysteresis_ms"].Default,
+		CascadeReportIntervalMs:   Bounds["cascade_report_interval_ms"].Default,
+		ResequencerHoldMarginMs:   Bounds["resequencer_hold_margin_ms"].Default,
+		ResequencerMaxHoldMs:      Bounds["resequencer_max_hold_ms"].Default,
 		DemoteIntervals:           Bounds["demote_intervals"].Default,
 		PromoteIntervals:          Bounds["promote_intervals"].Default,
 		DownSilenceMs:             Bounds["down_silence_ms"].Default,
@@ -627,6 +726,14 @@ func (c Config) Sanitised() Config {
 		UnstableJitterMs:          clamp(c.UnstableJitterMs, Bounds["unstable_jitter_ms"]),
 		AdmissionQueueDelayMs:     clamp(c.AdmissionQueueDelayMs, Bounds["admission_queue_delay_ms"]),
 		AdmissionRecoverIntervals: clamp(c.AdmissionRecoverIntervals, Bounds["admission_recover_intervals"]),
+		BulkScheduler:             bulkScheduler(c.BulkScheduler),
+		CascadeQueueTargetMs:      clamp(c.CascadeQueueTargetMs, Bounds["cascade_queue_target_ms"]),
+		CascadeLossPercent:        clamp(c.CascadeLossPercent, Bounds["cascade_loss_percent"]),
+		CascadeRecoverIntervals:   clamp(c.CascadeRecoverIntervals, Bounds["cascade_recover_intervals"]),
+		CascadeOrderHysteresisMs:  clamp(c.CascadeOrderHysteresisMs, Bounds["cascade_order_hysteresis_ms"]),
+		CascadeReportIntervalMs:   clamp(c.CascadeReportIntervalMs, Bounds["cascade_report_interval_ms"]),
+		ResequencerHoldMarginMs:   clamp(c.ResequencerHoldMarginMs, Bounds["resequencer_hold_margin_ms"]),
+		ResequencerMaxHoldMs:      clamp(c.ResequencerMaxHoldMs, Bounds["resequencer_max_hold_ms"]),
 		DemoteIntervals:           clamp(c.DemoteIntervals, Bounds["demote_intervals"]),
 		PromoteIntervals:          clamp(c.PromoteIntervals, Bounds["promote_intervals"]),
 		DownSilenceMs:             clamp(c.DownSilenceMs, Bounds["down_silence_ms"]),
@@ -753,6 +860,18 @@ func (c Config) RecordMaxBytes() int64 {
 
 func (c Config) ReportInterval() time.Duration {
 	return time.Duration(c.ReportIntervalMs) * time.Millisecond
+}
+
+func (c Config) CascadeReportInterval() time.Duration {
+	return time.Duration(c.CascadeReportIntervalMs) * time.Millisecond
+}
+
+func (c Config) ResequencerHoldMargin() time.Duration {
+	return time.Duration(c.ResequencerHoldMarginMs) * time.Millisecond
+}
+
+func (c Config) ResequencerMaxHold() time.Duration {
+	return time.Duration(c.ResequencerMaxHoldMs) * time.Millisecond
 }
 
 func (c Config) EvalInterval() time.Duration {

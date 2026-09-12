@@ -33,8 +33,8 @@ import "sync"
 // The window is sized so that case is rare rather than relied upon. Two
 // copies of a packet are sent at the same moment and separated only by the
 // difference in path latency - a few hundred milliseconds at worst - so a
-// window covering thousands of packets is many times wider than it needs
-// to be, and costs 512 bytes.
+// window covering tens of thousands of packets is many times wider than it
+// needs to be, and costs 8 KB.
 type dedupWindow struct {
 	mu   sync.Mutex
 	bits []uint64
@@ -42,10 +42,15 @@ type dedupWindow struct {
 	seen bool
 }
 
-// dedupBits is the width of the window, in packets. 4096 covers four
-// seconds at a thousand packets a second, against a reordering budget
-// measured in hundreds of milliseconds.
-const dedupBits = 4096
+// dedupBits is the width of the window, in packets.
+//
+// It was 4096, "four seconds at a thousand packets a second". v0.2 spreads
+// bulk per packet, and a bulk flow on two links runs at tens of thousands of
+// packets a second: a duplicated real-time copy arriving 200 ms behind its
+// twin is then six thousand sequences back, past a 4096-packet window, and
+// would fail open into being delivered twice. 65536 covers two seconds at
+// thirty thousand packets a second.
+const dedupBits = 65536
 
 func newDedupWindow() *dedupWindow {
 	return &dedupWindow{bits: make([]uint64, dedupBits/64)}

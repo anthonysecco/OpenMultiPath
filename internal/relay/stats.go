@@ -72,6 +72,30 @@ type pathStats struct {
 
 	queueDelay int32 // most recent reading above the rolling minimum
 
+	// The standing queue: the least reading across the last two short
+	// buckets, above the same rolling minimum. queueDelay is one packet and
+	// moves with every jitter spike; a queue that is really standing lifts
+	// every reading in the window, so the least of them is the part that
+	// would not drain if the next packet were the last. It is what the
+	// cascade controller paces on (v0.2-design.md, section 5.4).
+	standCur, standPrev int32
+	haveStandCur        bool
+	haveStandPrev       bool
+	standStart          time.Duration
+	standing            int32
+	standingAt          time.Duration
+
+	// Loss over the last second, in two half-second buckets, for the same
+	// controller. The thirty-second window below is right for judging a
+	// path and far too slow to pace on.
+	shortStart           time.Duration
+	shortRecv, shortLost uint64
+	shortPrevRecv        uint64
+	shortPrevLost        uint64
+	shortBytes           uint64
+	shortPrevBytes       uint64
+	shortPrevValid       bool
+
 	bursts   [len(burstBuckets) + 1]uint64
 	runLen   int // consecutive losses currently accumulating
 	received uint64
@@ -96,6 +120,101 @@ type pathStats struct {
 	// apart from a rate alone.
 	winBursts  uint64
 	prevBursts uint64
+}
+
+// standBucket is the width of one standing-queue bucket. Two of them make
+// the window, so a reading is at most ~100 ms old - a couple of report
+// intervals at the cascade cadence, and long enough to span several packets
+// on anything carrying enough traffic to be worth pacing.
+const standBucket = 50 * time.Millisecond
+
+// standingStale is how long the last standing-queue reading is believed once
+// nothing more has arrived. Silence is not evidence the queue drained.
+const standingStale = time.Second
+
+// shortLossBucket is half the short loss window.
+const shortLossBucket = 500 * time.Millisecond
+
+// observeStanding folds one relative transit reading into the standing
+// queue window.
+func (s *pathStats) observeStanding(rel int32, now time.Duration) {
+	if now-s.standStart >= standBucket {
+		// Turn the bucket over. A gap longer than two buckets leaves nothing
+		// from before it worth keeping.
+		s.standPrev, s.haveStandPrev = s.standCur, s.haveStandCur && now-s.standStart < 2*standBucket
+		s.haveStandCur = false
+		s.standStart = now
+	}
+	if !s.haveStandCur || rel < s.standCur {
+		s.standCur, s.haveStandCur = rel, true
+	}
+	least := s.standCur
+	if s.haveStandPrev && s.standPrev < least {
+		least = s.standPrev
+	}
+	s.standing = least - s.windowMin
+	if s.standing < 0 {
+		s.standing = 0
+	}
+	s.standingAt = now
+}
+
+// standingQueue is the standing queue in microseconds, or zero once the
+// reading is too old to say anything.
+func (s *pathStats) standingQueue(now time.Duration) int32 {
+	if s.standingAt == 0 || now-s.standingAt > standingStale {
+		return 0
+	}
+	return s.standing
+}
+
+// rollShortLoss turns the short loss buckets over.
+func (s *pathStats) rollShortLoss(now time.Duration) {
+	if now-s.shortStart < shortLossBucket {
+		return
+	}
+	if now-s.shortStart < 2*shortLossBucket {
+		s.shortPrevRecv, s.shortPrevLost, s.shortPrevBytes = s.shortRecv, s.shortLost, s.shortBytes
+		s.shortPrevValid = true
+	} else {
+		s.shortPrevRecv, s.shortPrevLost, s.shortPrevBytes = 0, 0, 0
+		s.shortPrevValid = false
+	}
+	s.shortRecv, s.shortLost, s.shortBytes = 0, 0, 0
+	s.shortStart = now
+}
+
+// shortLossPercent is loss over roughly the last second.
+func (s *pathStats) shortLossPercent(now time.Duration) float64 {
+	if now-s.shortStart >= 2*shortLossBucket {
+		return 0 // nothing has arrived for a second; no fresh evidence either way
+	}
+	recv, lost := s.shortRecv+s.shortPrevRecv, s.shortLost+s.shortPrevLost
+	if recv+lost == 0 {
+		return 0
+	}
+	return float64(lost) / float64(recv+lost) * 100
+}
+
+// noteBytes counts the wire bytes of an arrival toward the short receive
+// rate. Called after observeTransit, which turns the buckets over.
+func (s *pathStats) noteBytes(n int) { s.shortBytes += uint64(n) }
+
+// shortRxKbps is what arrived on the path over roughly the last second.
+func (s *pathStats) shortRxKbps(now time.Duration) float64 {
+	cur := now - s.shortStart
+	if cur >= 2*shortLossBucket || cur < 0 {
+		return 0
+	}
+	bytes, span := s.shortBytes, cur
+	if s.shortPrevValid {
+		bytes += s.shortPrevBytes
+		span += shortLossBucket
+	}
+	if span < 100*time.Millisecond {
+		span = 100 * time.Millisecond // a bucket just turned over is not a rate
+	}
+	return float64(bytes) * 8 / 1000 / span.Seconds()
 }
 
 // lossWindow is how much recent history the reported loss rate covers.
@@ -192,9 +311,12 @@ func (s *pathStats) observeTransit(transit uint32, now time.Duration) (peerResta
 	}
 
 	s.queueDelay = rel - s.windowMin
+	s.observeStanding(rel, now)
 	s.received++
 	s.rollLossWindow(now)
 	s.winRecv++
+	s.rollShortLoss(now)
+	s.shortRecv++
 	return peerRestarted
 }
 
@@ -211,6 +333,8 @@ func (s *pathStats) rebaseline(transit uint32, now time.Duration) {
 	s.ewma, s.jitter = 0, 0
 	s.queueDelay = 0
 	s.winStart = now
+	s.haveStandCur, s.haveStandPrev = false, false
+	s.standing, s.standingAt, s.standStart = 0, 0, now
 }
 
 // observeLoss records a gap of n packets on this path, closing out any
@@ -218,6 +342,7 @@ func (s *pathStats) rebaseline(transit uint32, now time.Duration) {
 func (s *pathStats) observeLoss(n uint32) {
 	s.lost += uint64(n)
 	s.winLost += uint64(n)
+	s.shortLost += uint64(n)
 	s.runLen += int(n)
 }
 

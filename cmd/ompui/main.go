@@ -615,6 +615,34 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "omp_duplicates_dropped_total{node=%q} %d\n",
 		escape(snap.Node), snap.Scheduler.DuplicatesDropped)
 
+	fmt.Fprintf(w, "# HELP omp_bulk_cascade_active Whether bulk is being placed per packet by the cascade (1) or per flow (0).\n")
+	fmt.Fprintf(w, "# TYPE omp_bulk_cascade_active gauge\n")
+	fmt.Fprintf(w, "omp_bulk_cascade_active{node=%q} %g\n", escape(snap.Node), b2f(snap.Scheduler.BulkScheduler == "cascade"))
+	fmt.Fprintf(w, "# HELP omp_bulk_overflowed_total Bulk sent past every cascade path's allowance onto the least-queued path.\n")
+	fmt.Fprintf(w, "# TYPE omp_bulk_overflowed_total counter\n")
+	fmt.Fprintf(w, "omp_bulk_overflowed_total{node=%q} %d\n", escape(snap.Node), snap.Scheduler.BulkOverflowed)
+	fmt.Fprintf(w, "# HELP omp_wire_version Wire version spoken to the peer.\n# TYPE omp_wire_version gauge\n")
+	fmt.Fprintf(w, "omp_wire_version{node=%q} %d\n", escape(snap.Node), snap.Scheduler.WireVersion)
+	rs := snap.Scheduler.Resequencer
+	fmt.Fprintf(w, "# HELP omp_resequencer_hold_ms How long a missing bulk packet is currently waited for.\n# TYPE omp_resequencer_hold_ms gauge\n")
+	fmt.Fprintf(w, "omp_resequencer_hold_ms{node=%q} %g\n", escape(snap.Node), rs.HoldMs)
+	fmt.Fprintf(w, "# HELP omp_resequencer_buffered Bulk packets waiting behind gaps.\n# TYPE omp_resequencer_buffered gauge\n")
+	fmt.Fprintf(w, "omp_resequencer_buffered{node=%q} %d\n", escape(snap.Node), rs.Buffered)
+	fmt.Fprintf(w, "# HELP omp_resequencer_packets_total Resequencer outcomes: delivered, reordered (held behind a gap), late (arrived after its gap was given up on).\n# TYPE omp_resequencer_packets_total counter\n")
+	for _, c := range []struct {
+		name string
+		n    uint64
+	}{{"delivered", rs.Delivered}, {"reordered", rs.Reordered}, {"late", rs.Late}} {
+		fmt.Fprintf(w, "omp_resequencer_packets_total{node=%q,outcome=%q} %d\n", escape(snap.Node), c.name, c.n)
+	}
+	fmt.Fprintf(w, "# HELP omp_resequencer_gaps_total Gaps given up on, by reason.\n# TYPE omp_resequencer_gaps_total counter\n")
+	for _, c := range []struct {
+		name string
+		n    uint64
+	}{{"lost", rs.GapsLost}, {"timed_out", rs.GapsTimedOut}, {"forced", rs.GapsForced}} {
+		fmt.Fprintf(w, "omp_resequencer_gaps_total{node=%q,reason=%q} %d\n", escape(snap.Node), c.name, c.n)
+	}
+
 	fmt.Fprintf(w, "# HELP omp_class_packets_total Packets carried, by traffic class.\n")
 	fmt.Fprintf(w, "# TYPE omp_class_packets_total counter\n")
 	for _, c := range []struct {
@@ -654,6 +682,13 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		{"omp_path_transitions", "State changes within the flap window.", "gauge", func(p state.Path) float64 { return float64(p.Transitions) }},
 		{"omp_path_sending", "Whether traffic is currently going out of this path.", "gauge", func(p state.Path) float64 { return b2f(p.Sending) }},
 		{"omp_path_primary", "Whether this is the chosen path.", "gauge", func(p state.Path) float64 { return b2f(p.Primary) }},
+
+		// The bulk cascade, v0.2.
+		{"omp_path_cascade_position", "Place in the bulk fill order, 0 filled first; -1 when not in the cascade.", "gauge", func(p state.Path) float64 { return float64(p.CascadePosition) }},
+		{"omp_path_bulk_cap_kbps", "Bulk this path may currently take; 0 is uncapped.", "gauge", func(p state.Path) float64 { return p.BulkCapKbps }},
+		{"omp_path_bulk_kbps", "Bulk carried over the last evaluation.", "gauge", func(p state.Path) float64 { return p.BulkKbps }},
+		{"omp_path_tx_standing_queue_ms", "Standing queue in the send direction, as the peer reports it.", "gauge", func(p state.Path) float64 { return p.TxStandingQueueMs }},
+		{"omp_path_tx_short_loss_percent", "Send-direction loss over the last second, as the peer reports it.", "gauge", func(p state.Path) float64 { return p.TxShortLossPercent }},
 
 		// Cost tracking, step 10. Bytes rather than a band name, because
 		// the useful alert is on the number approaching the cap rather

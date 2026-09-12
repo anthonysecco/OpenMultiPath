@@ -2425,3 +2425,77 @@ distinguish "no opinion" from a genuine zero ceiling. A path reported at
 and `canCarry` still waves it through, because it never looks at
 `haveCeiling`. Pre-existing, not introduced here, and out of scope for what
 was asked - recorded so it is not rediscovered as new.
+
+## D-052 · v0.2: bulk per packet in a cascade, put back in order at the far end
+
+**Decision.** Bulk is placed per packet, not per flow. It fills paths in order of base delay,
+slowest first, with the path carrying the call always last, and spills onto the next path as
+each one congests. The far end puts every flow back in order before delivery. It is designed
+and recorded in full in `v0.2-design.md`, whose section 15 is the as-built record. This entry
+is the summary.
+
+**What it picks up and what it supersedes.**
+- **Picks up** D-009's deferred bulk aggregation and resequencer, and D-047's deferred
+  per-packet steering.
+- **Resolves D-046's rejected alternative,** per-packet routing by latency, with the loss
+  term and resequencer it said were missing.
+- **Supersedes D-031's gate and D-044's per-flow spread in cascade mode.** Both remain,
+  unchanged, in `bulk_scheduler: flow`, which is v0.1 exactly and the way back.
+
+**The owner's rule, set during implementation.** Real-time traffic on a path changes where
+that path sits in bulk's order and nothing else: it never throttles or holds bulk back. So
+the call's path runs the same controller as every other path, and the cascade never drops
+bulk. Past every path's allowance, the excess goes to the first path in the order.
+
+**Wire version 3.**
+- **Flow sequence:** 4 bytes on bulk data packets, a 12-bit flow bucket and a 20-bit
+  sequence.
+- **Report entries:** three more figures per path - the standing queue, loss over the last
+  second, and the receive rate.
+- **Versioned capability:** a bit per version. Reading the old single bit as "the newest
+  version I know" would have taken the tunnel down halfway through the upgrade. Verified
+  live: v0.2 home with v0.1 vehicle settled on version 2 and stayed up.
+- **Tunnel MTU** is 1288, and both units now pass it.
+
+**Why per packet now.** D-009 deferred this until field data showed it would pay. The
+evening's data does:
+- **Real links, three alternating rounds:** single-flow download 86-89 Mbit/s against 9-53
+  per flow; upload matched or beat flow in every round.
+- **Lab:** real Opus and VP8 calls kept their quality beside a saturating transfer.
+
+**What building it found, each a rule in `internal/relay/cascade.go` with its reason in a
+comment.**
+- **Order and gate on base delay**, not the scoring delay: the scoring delay carries our own
+  queue, and the cascade chased it.
+- **Ignore a thin path's readings:** idle Starlink reads up to 65 ms of "standing queue" on
+  single samples.
+- **Confirm congestion over two evaluations** before cutting.
+- **Cap a congested path near what the peer says actually arrived,** so BBR's probes spill
+  and it aggregates.
+- **Never drop at the ingress:** it made the tunnel a policer, and TCP never found the
+  second link.
+- **Exclude flapping paths:** a flapping Starlink stalled a spread upload from 68 Mbit to
+  0.1.
+- **Include the call's path in D-045's size bar:** a 3 Mbit Starlink tier was being filled
+  ahead of a 55 Mbit AT&T link.
+- **Hold gaps at least as long as gaps are observed to take:** half an RTT understates,
+  because the echo returns on another path.
+
+**Rejected.**
+- **A stricter queue target and slow recovery on the call's path.** Built, measured, and
+  removed by the owner's rule. On the real links it held the only good link to a fraction
+  of its rate.
+- **Walking bulk onto the call's path.** Same result.
+- **Dropping overflow when the first path's queue passed its target.** A policer again.
+- **Overflow to the least-queued path.** That path is usually the call's; the lab measured
+  116-166 ms audio gaps.
+
+**Open, for the road.**
+- Late packets at the resequencer when overflow outgrows the 200 ms hold cap.
+- Starlink's standing-queue noise under load.
+- The echo return-leg bias in every "half the round trip" figure.
+- Every controller constant, each reasoned from one lab and one evening on real links.
+
+**Test tooling** is `test/lab/`: a two-namespace lab driving both daemons over shaped links
+with GStreamer RTP, a per-stream RTP judge, and a standard-library RTP replayer for the
+vehicle.

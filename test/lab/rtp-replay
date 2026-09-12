@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""rtp-replay: send the RTP in a capture again, with its original timing.
+
+    rtp-replay <pcap> <dest-ip> [bind-ip]
+
+For measuring call quality on a box that has no media stack installed: capture
+real media once where GStreamer exists (omp-lab rtp), copy the pcap over, and
+replay its UDP payloads - each to the same destination port it was captured on
+- from the box being tested. Only the Python standard library, so it runs on
+the vehicle as it is.
+
+Reads classic pcap with raw-IP (TUN) or Ethernet link types.
+"""
+import socket
+import struct
+import sys
+import time
+
+
+def packets(path):
+    with open(path, "rb") as f:
+        head = f.read(24)
+        magic = struct.unpack("<I", head[:4])[0]
+        endian = "<" if magic in (0xA1B2C3D4, 0xA1B23C4D) else ">"
+        nano = magic in (0xA1B23C4D, 0x4D3CB2A1)
+        linktype = struct.unpack(endian + "I", head[20:24])[0]
+        while True:
+            rec = f.read(16)
+            if len(rec) < 16:
+                return
+            sec, frac, incl, _ = struct.unpack(endian + "IIII", rec)
+            data = f.read(incl)
+            t = sec + frac / (1e9 if nano else 1e6)
+            if linktype == 1:  # Ethernet
+                data = data[14:]
+            if len(data) < 28 or data[0] >> 4 != 4 or data[9] != 17:
+                continue
+            ihl = (data[0] & 0x0F) * 4
+            dport = struct.unpack(">H", data[ihl + 2:ihl + 4])[0]
+            yield t, dport, data[ihl + 8:]
+
+
+def main():
+    if len(sys.argv) < 3:
+        print(__doc__)
+        sys.exit(2)
+    pcap, dest = sys.argv[1], sys.argv[2]
+    bind = sys.argv[3] if len(sys.argv) > 3 else ""
+    socks = {}
+    start_wall, start_cap = None, None
+    sent = 0
+    for t, dport, payload in packets(pcap):
+        if start_cap is None:
+            start_cap, start_wall = t, time.monotonic()
+        delay = (t - start_cap) - (time.monotonic() - start_wall)
+        if delay > 0:
+            time.sleep(delay)
+        s = socks.get(dport)
+        if s is None:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if bind:
+                s.bind((bind, 0))
+            socks[dport] = s
+        s.sendto(payload, (dest, dport))
+        sent += 1
+    print(f"replayed {sent} packets", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
