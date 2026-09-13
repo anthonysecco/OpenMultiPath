@@ -136,11 +136,12 @@
   .field { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; margin-bottom: 12px; }
   .field label { font-size: 14px; }
   .field .hint { color: var(--dim); font-size: 12px; grid-column: 1 / -1; margin-top: -6px; }
-  input[type=number], select {
+  input[type=number], input[type=text], select {
     background: #0d1117; color: var(--text); border: 1px solid var(--line);
     border-radius: 6px; padding: 6px 9px; width: 130px; font: inherit;
     font-variant-numeric: tabular-nums;
   }
+  input[type=text] { width: 190px; }
   button {
     background: var(--accent); color: #04121f; border: 0; border-radius: 6px;
     padding: 8px 15px; font: inherit; font-weight: 650; cursor: pointer;
@@ -169,6 +170,7 @@
 <div class="layout">
   <nav class="tabs">
     <button class="tab-btn" data-view="home" type="button">Home</button>
+    <button class="tab-btn" data-view="flows" type="button">Flows</button>
     <button class="tab-btn" data-view="settings" type="button">Settings</button>
   </nav>
 
@@ -197,6 +199,22 @@
           <span class="muted" id="restart-note"></span>
         </div>
         <pre id="logs">Loading&hellip;</pre>
+      </section>
+    </div>
+
+    <div id="view-flows">
+      <section>
+        <h2>Flows</h2>
+        <div class="row" style="margin-bottom:10px">
+          <button id="dump-flows" type="button">Dump flows</button>
+          <span class="muted" id="flows-note">Reads the classifier's current table from the last state refresh - nothing is fetched until you press it.</span>
+        </div>
+        <div class="row" style="margin-bottom:10px">
+          <input type="text" id="flow-filter-a" placeholder="Filter A: IP or port">
+          <input type="text" id="flow-filter-b" placeholder="Filter B: IP or port">
+          <button class="secondary" id="flow-filter-clear" type="button">Clear</button>
+        </div>
+        <div id="flows-result"></div>
       </section>
     </div>
 
@@ -436,6 +454,36 @@ function classSplit(sc) {
   return `<p class="muted" title="${total.toLocaleString()} packets since start">Classified: ${shown}</p>`;
 }
 
+// Which traffic classes are placed on this path right now. Real-time and
+// transactional both ride a single chosen path at a time (never split), so
+// each is a plain on/off: real-time follows p.sending, which is true for
+// every path currently in the real-time send set - the primary, plus a
+// make-before-break handover target or duplicate copies when the
+// duplication mode calls for it; transactional follows p.primary alone,
+// since it never duplicates even during a handover. Bulk gets a third,
+// yellow state: cascade_position >= 0 means this path has a place in the
+// fill order, but bulk_kbps of 0 means nothing has spilled onto it yet
+// because the paths ahead of it in the cascade have not backed up - queued,
+// not idle.
+function badgesHTML(p) {
+  const badge = (label, cls, title) => `<span class="tag ${cls}" title="${title}">${label}</span>`;
+  const rt = p.sending
+    ? badge("Real-time", "good", "This path is currently carrying real-time traffic.")
+    : badge("Real-time", "", "This path is not currently carrying real-time traffic.");
+  const trans = p.primary
+    ? badge("Trans", "good", "This path is the primary, so it is carrying transactional traffic.")
+    : badge("Trans", "", "This path is not the primary, so it is not carrying transactional traffic - transactional never spreads or duplicates.");
+  let bulk;
+  if (p.cascade_position < 0) {
+    bulk = badge("Bulk", "", "This path has no place in the bulk cascade right now - either bulk placement is not running the cascade, or this path is not eligible.");
+  } else if (p.bulk_kbps > 0) {
+    bulk = badge("Bulk", "good", "This path is actively carrying bulk traffic right now.");
+  } else {
+    bulk = badge("Bulk", "warn", "This path has a place in the bulk cascade but nothing has spilled onto it yet - the paths ahead of it in the fill order have not backed up.");
+  }
+  return rt + trans + bulk;
+}
+
 function renderPaths(s) {
   // base_delay_ms is a fixed non-network budget folded into the scoring
   // delay. It has to be visible, and separable: shown alone the scoring
@@ -484,13 +532,14 @@ function renderPaths(s) {
     // unshaped. Home shows the figures the vehicle sent it. This end sends in
     // one direction - up from the vehicle, down from home - and "Shaped to"
     // is 95% of that direction's measurement, counted in full wire bytes.
-    const measuredAny = p.link_up_kbps > 0 || p.link_down_kbps > 0;
-    const linkSpeed = measuredAny
-      ? `↓ ${p.link_down_kbps > 0 ? rate(p.link_down_kbps) : "—"} · ↑ ${p.link_up_kbps > 0 ? rate(p.link_up_kbps) : "—"}`
-      : "unmeasured";
     const measuredAgo = p.link_measured_unix ? duration(Date.now() / 1000 - p.link_measured_unix) + " ago" : "";
-    const linkSpeedNote = measuredAny
+    const downMeasured = p.link_down_kbps > 0;
+    const upMeasured = p.link_up_kbps > 0;
+    const downLinkNote = downMeasured
       ? `measured ${measuredAgo}${owns ? "" : ", as reported by the vehicle"}; stands until the link is measured again or cleared`
+      : (owns ? "never measured" : "the vehicle has not measured this link");
+    const upLinkNote = upMeasured
+      ? `measured ${measuredAgo}${owns ? "" : ", as reported by the vehicle"}; stands until the link is measured again or cleared - see Shaped to below for what this end actually sends`
       : (owns ? "never measured, so assumed unlimited and not shaped - press Measure Link Speed below"
               : "the vehicle has not measured this link, so it is assumed unlimited and not shaped");
     const sendDir = owns ? "upload" : "download";
@@ -519,18 +568,24 @@ function renderPaths(s) {
       <div class="metric-group">
         <h3>Outbound</h3>
         <div class="metrics">
-        <div class="metric"><div class="k" title="One-way network delay in the send direction: half this path's RTT floor plus the peer's reported p95 tail. Measured by the peer, not by this end - send and receive are independent paths and routinely disagree.">Network</div>
-          <div class="v" title="one-way network delay in the send direction: half the ${fmt(p.rtt_floor_ms)} ms round-trip floor, plus the ${fmt(p.tx_spread_ms)} ms p95 tail the peer measured. The two directions' figures sum to about the round-trip floor, which is the symmetry assumption checking out.">${p.tx_reported ? fmt(p.tx_delay_ms - (cfg.base_delay_ms || 0)) + " ms" : noOut}</div></div>
-        <div class="metric"><div class="k" title="What the E-model scorer is actually fed for outbound delay: the network figure to the left, plus a fixed non-network allowance (codec framing, jitter buffer, the hairpin through home) set by Base delay. Not comparable to a raw round trip.">Score delay</div>
-          <div class="v" title="what the E-model is actually fed: the ${fmt(p.tx_delay_ms - (cfg.base_delay_ms || 0))} ms above plus a fixed ${cfg.base_delay_ms || 0} ms of non-network budget - codec framing, the far end's jitter buffer, and the hairpin through home. Both ends add that constant independently, so this figure is NOT comparable with the round trip.">${p.tx_reported ? fmt(p.tx_delay_ms) + " ms" : noOut}</div></div>
-        <div class="metric"><div class="k" title="The peer's measured 95th-percentile tail latency on packets this end sent it - the send direction, which cannot be observed locally.">p95 spread</div><div class="v">${p.tx_reported ? fmt(p.tx_spread_ms) + " ms" : noOut}</div></div>
-        <div class="metric"><div class="k" title="The peer's measured RFC 3550 interarrival jitter on this end's transmissions.">Jitter</div><div class="v">${p.tx_reported ? fmt(p.tx_jitter_ms) + " ms" : noOut}</div></div>
-        <div class="metric"><div class="k" title="The peer's measured queue buildup on this end's send direction - the only direct evidence of congestion on the path this end transmits on.">Queue delay</div><div class="v">${p.tx_reported ? fmt(p.tx_queue_delay_ms) + " ms" : noOut}</div></div>
+        <div class="metric"><div class="k" title="The link's speed in the send direction (${sendDir}), as last measured by Measure Link Speed. Never estimated from traffic: an unmeasured link is assumed unlimited. See Shaped to below for what this end actually sends.">Link speed</div>
+          <div class="v" title="${upLinkNote}">${upMeasured ? rate(p.link_up_kbps) : "unmeasured"}</div></div>
         <div class="metric"><div class="k" title="Loss rate the peer reports on this end's transmissions, over roughly the last minute. This is the figure a send decision actually needs - a round trip alone can't say which direction loss happened in.">Loss</div>
           <div class="v" style="${p.tx_reported ? `color:var(--${lossClass(p.tx_loss_percent)})` : ""}">${p.tx_reported ? fmt(p.tx_loss_percent, 2) + "%" : noOut}</div></div>
+        <div class="metric"><div class="k" title="The peer's measured RFC 3550 interarrival jitter on this end's transmissions.">Jitter</div><div class="v">${p.tx_reported ? fmt(p.tx_jitter_ms) + " ms" : noOut}</div></div>
+        <div class="metric"><div class="k" title="The peer's measured queue buildup on this end's send direction - the only direct evidence of congestion on the path this end transmits on.">Queue delay</div><div class="v">${p.tx_reported ? fmt(p.tx_queue_delay_ms) + " ms" : noOut}</div></div>
+        <div class="metric"><div class="k" title="One-way network delay in the send direction: half this path's RTT floor plus the peer's reported p95 tail. Measured by the peer, not by this end - send and receive are independent paths and routinely disagree.">Network</div>
+          <div class="v" title="one-way network delay in the send direction: half the ${fmt(p.rtt_floor_ms)} ms round-trip floor, plus the ${fmt(p.tx_spread_ms)} ms p95 tail the peer measured. The two directions' figures sum to about the round-trip floor, which is the symmetry assumption checking out.">${p.tx_reported ? fmt(p.tx_delay_ms - (cfg.base_delay_ms || 0)) + " ms" : noOut}</div></div>
+        <div class="metric"><div class="k" title="What the E-model scorer is actually fed for outbound delay: the network figure above, plus a fixed non-network allowance (codec framing, jitter buffer, the hairpin through home) set by Base delay. Not comparable to a raw round trip.">Score delay</div>
+          <div class="v" title="what the E-model is actually fed: the ${fmt(p.tx_delay_ms - (cfg.base_delay_ms || 0))} ms above plus a fixed ${cfg.base_delay_ms || 0} ms of non-network budget - codec framing, the far end's jitter buffer, and the hairpin through home. Both ends add that constant independently, so this figure is NOT comparable with the round trip.">${p.tx_reported ? fmt(p.tx_delay_ms) + " ms" : noOut}</div></div>
+        <div class="metric"><div class="k" title="The peer's measured 95th-percentile tail latency on packets this end sent it - the send direction, which cannot be observed locally.">p95 spread</div><div class="v">${p.tx_reported ? fmt(p.tx_spread_ms) + " ms" : noOut}</div></div>
         <div class="metric"><div class="k" title="The least transit above this path's floor over the last ~100 ms, as the peer measured it on this end's transmissions. A lone jitter spike does not move it; a queue that is really building does - with the path shaped under its measured speed, a queue here means the link has slowed since it was measured.">Standing queue</div><div class="v">${p.tx_reported ? fmt(p.tx_standing_queue_ms) + " ms" : noOut}</div></div>
         <div class="metric"><div class="k" title="Loss over the last second on this end's transmissions, as the peer measured it. The fast figure; the one-minute figure beside it is for judging the path.">Loss 1 s</div>
           <div class="v" style="${p.tx_reported ? `color:var(--${lossClass(p.tx_short_loss_percent)})` : ""}">${p.tx_reported ? fmt(p.tx_short_loss_percent, 1) + "%" : noOut}</div></div>
+        <div class="metric"><div class="k" title="Current outbound bit rate on this path: data, any duplicated copies, and protocol overhead (echoes, reports, MTU probes) combined.">Sending</div>
+          <div class="v" title="what is going onto this path right now">${rate(p.send_kbps)}</div></div>
+        <div class="metric"><div class="k" title="The most this end sends on the path: 95% of the measured link speed in its send direction, counting every header and tunnel overhead byte, so the queue forms here - where the call goes first - rather than in the carrier's modem. Unshaped when that direction was never measured.">Shaped to</div>
+          <div class="v" title="${shapedNote}">${shaped}</div></div>
         </div>
       </div>`;
 
@@ -561,18 +616,14 @@ function renderPaths(s) {
       <div class="metric-group">
         <h3>Quality</h3>
         <div class="metrics">
+          <div class="metric"><div class="k" title="Which traffic classes are currently placed on this path. Green means active now, grey means not currently placed here.">Badges</div>
+            <div class="v" style="display:flex;gap:6px;flex-wrap:wrap">${badgesHTML(p)}</div></div>
           <div class="metric"><div class="k" title="Mean Opinion Score (1-5), the R-factor at right converted to the scale a person reads at a glance. This is what a call would sound like if steered onto this path alone, right now.">Quality</div>
             <div class="v" style="color:var(--${mosClass(p.mos)})" title="${penalty}">${fmt(p.mos, 2)} MOS</div></div>
           <div class="metric"><div class="k" title="ITU-T G.107 R-factor (0-100): one-way delay and loss combined into the single number the scheduler actually ranks paths on, after penalties for burst loss, flapping, and budget.">Score</div>
             <div class="v" title="E-model R factor after penalties; the scheduler ranks on this">${fmt(p.score, 0)} R</div></div>
           <div class="metric"><div class="k" title="Most recent round-trip time, measured by echoing a timestamp back. The two ends' clocks never need to be synchronized for this to be valid.">RTT</div>
             <div class="v" title="round trip; floor ${fmt(p.rtt_floor_ms)} ms with nothing queued on it">${fmt(p.rtt_ms)} ms</div></div>
-          <div class="metric"><div class="k" title="Current outbound bit rate on this path: data, any duplicated copies, and protocol overhead (echoes, reports, MTU probes) combined.">Sending</div>
-            <div class="v" title="what is going onto this path right now">${rate(p.send_kbps)}</div></div>
-          <div class="metric"><div class="k" title="The link's speed as last measured by Measure Link Speed, down (home to vehicle) and up (vehicle to home). Never estimated from traffic: an unmeasured link is assumed unlimited.">Link speed</div>
-            <div class="v" title="${linkSpeedNote}">${linkSpeed}</div></div>
-          <div class="metric"><div class="k" title="The most this end sends on the path: 95% of the measured link speed in its send direction, counting every header and tunnel overhead byte, so the queue forms here - where the call goes first - rather than in the carrier's modem. Unshaped when that direction was never measured.">Shaped to</div>
-            <div class="v" title="${shapedNote}">${shaped}</div></div>
           <div class="metric"><div class="k" title="Largest physical packet size confirmed to cross this path by active probing. The tunnel's own MTU is the smallest of these across every path, so one small path caps everyone.">Path MTU</div><div class="v">${p.path_mtu || "—"}</div></div>
           <div class="metric"><div class="k" title="How many of the last 200 packets back the delay and jitter figures above. Below 20, treat this path's statistics as too thin to trust - especially before promoting it.">Samples</div><div class="v">${p.samples}</div></div>
           <div class="metric"><div class="k" title="Time since anything last arrived on this path. A live call needs this in the low single digits of seconds; a value that keeps climbing is a path going quiet.">Last seen</div>
@@ -583,11 +634,13 @@ function renderPaths(s) {
       <div class="metric-group">
         <h3>Inbound</h3>
         <div class="metrics">
-          <div class="metric"><div class="k" title="95th-percentile transit time above this path's own floor, over roughly the last 200 packets received here. Tail latency - what a call actually feels, not the average.">p95 spread</div><div class="v">${fmt(p.p95_spread_ms)} ms</div></div>
-          <div class="metric"><div class="k" title="RFC 3550 interarrival jitter: smoothed packet-to-packet variation in arrival timing, measured on packets received here.">Jitter</div><div class="v">${fmt(p.jitter_ms)} ms</div></div>
-          <div class="metric"><div class="k" title="How far the most recent packet's transit exceeds this path's own rolling-minimum delay - i.e. how full the buffer ahead of it is right now, inbound.">Queue delay</div><div class="v">${fmt(p.queue_delay_ms)} ms</div></div>
+          <div class="metric"><div class="k" title="The link's speed in the receive direction (${owns ? "download" : "upload"}), as last measured by Measure Link Speed. Never estimated from traffic: an unmeasured link is assumed unlimited.">Link speed</div>
+            <div class="v" title="${downLinkNote}">${downMeasured ? rate(p.link_down_kbps) : "unmeasured"}</div></div>
           <div class="metric"><div class="k" title="Loss rate over roughly the last minute, measured directly on packets arriving here.">Loss</div>
             <div class="v" style="color:var(--${lossClass(p.recent_loss_percent)})">${fmt(p.recent_loss_percent, 2)}%</div></div>
+          <div class="metric"><div class="k" title="RFC 3550 interarrival jitter: smoothed packet-to-packet variation in arrival timing, measured on packets received here.">Jitter</div><div class="v">${fmt(p.jitter_ms)} ms</div></div>
+          <div class="metric"><div class="k" title="How far the most recent packet's transit exceeds this path's own rolling-minimum delay - i.e. how full the buffer ahead of it is right now, inbound.">Queue delay</div><div class="v">${fmt(p.queue_delay_ms)} ms</div></div>
+          <div class="metric"><div class="k" title="95th-percentile transit time above this path's own floor, over roughly the last 200 packets received here. Tail latency - what a call actually feels, not the average.">p95 spread</div><div class="v">${fmt(p.p95_spread_ms)} ms</div></div>
         </div>
       </div>
 
@@ -945,6 +998,110 @@ async function loadLogs() {
 
 $("refresh-logs").addEventListener("click", loadLogs);
 
+// The class order the button dumps in, regardless of what order the
+// daemon happened to iterate its flow table in - real-time first, since
+// that is the traffic the whole project exists to protect, transactional
+// next, bulk last, and anything the classifier could not place at the
+// very end.
+const FLOW_CLASS_ORDER = ["real-time", "transactional", "bulk", "unclassified"];
+const flowClassRank = c => {
+  const i = FLOW_CLASS_ORDER.indexOf(c);
+  return i === -1 ? FLOW_CLASS_ORDER.length : i;
+};
+
+// A flow matches a filter term if the term appears in the endpoint's IP or
+// port - a bare substring match, so "192.168" narrows to a subnet and "443"
+// narrows to a port without needing two separate boxes for each.
+function flowSideMatches(term, ip, port) {
+  if (!term) return true;
+  return ip.includes(term) || String(port).includes(term);
+}
+
+// dumpFlows renders whatever the last state refresh carried in s.flows,
+// filtered by the A/B boxes above the table. It does not fetch anything
+// itself - flows ride the same once-a-second /api/state poll as everything
+// else on the page, and re-fetching on button press would just be racing
+// that poll for no benefit. The button exists because a flow table is the
+// one thing on this page big enough that nobody wants it rendered and
+// re-rendered every second whether they are looking at it or not.
+function dumpFlows() {
+  if (!lastState) {
+    $("flows-result").innerHTML = `<p class="muted">No state yet.</p>`;
+    return;
+  }
+  const flows = lastState.flows || [];
+  if (!flows.length) {
+    const why = (lastState.scheduler && lastState.scheduler.classifying === false)
+      ? "Classification is not running on this node - payloads are ciphertext below WireGuard."
+      : "No flows tracked right now.";
+    $("flows-result").innerHTML = `<p class="muted">${why}</p>`;
+    return;
+  }
+
+  const filterA = $("flow-filter-a").value.trim().toLowerCase();
+  const filterB = $("flow-filter-b").value.trim().toLowerCase();
+  const filtered = flows.filter(f =>
+    flowSideMatches(filterA, f.a.toLowerCase(), f.a_port) &&
+    flowSideMatches(filterB, f.b.toLowerCase(), f.b_port));
+
+  if (!filtered.length) {
+    $("flows-result").innerHTML = `<p class="muted">${flows.length} flows tracked, none match this filter.</p>`;
+    return;
+  }
+
+  const sorted = filtered.slice().sort((a, b) => {
+    const r = flowClassRank(a.class) - flowClassRank(b.class);
+    if (r !== 0) return r;
+    return (b.bytes || 0) - (a.bytes || 0);
+  });
+
+  const counts = {};
+  for (const f of sorted) counts[f.class] = (counts[f.class] || 0) + 1;
+  const summary = FLOW_CLASS_ORDER
+    .filter(c => counts[c])
+    .map(c => `${c} ${counts[c]}`).join(" · ");
+  const filterNote = filtered.length < flows.length
+    ? ` (${flows.length} tracked, filtered to ${filtered.length})` : "";
+
+  const rows = sorted.map(f => `<tr>
+      <td><span class="tag ${f.class === "real-time" ? "good" : f.class === "bulk" ? "warn" : ""}">${f.class}</span></td>
+      <td>${f.proto}</td>
+      <td>${f.a}:${f.a_port}</td>
+      <td>${f.b}:${f.b_port}</td>
+      <td>${f.decided ? "yes" : "still sampling"}</td>
+      <td>${bytes(f.bytes)}</td>
+      <td>${f.samples}</td>
+      <td>${duration(f.last_seen_seconds)} ago</td>
+    </tr>`).join("");
+
+  $("flows-result").innerHTML =
+    `<p class="muted" style="margin-bottom:8px">${sorted.length} flows - ${summary}${filterNote}</p>
+     <div style="overflow-x:auto"><table>
+       <thead><tr>
+         <th>Class</th><th>Proto</th><th>A</th><th>B</th>
+         <th title="Whether the classifier has committed to this verdict, or is still sampling behaviour and could still change its mind">Decided</th>
+         <th title="Bytes counted toward this flow while it was being sampled or watched for volume. A flow settled as real-time early stops being counted, so this understates a long call's true volume.">Bytes</th>
+         <th>Samples</th>
+         <th>Last seen</th>
+       </tr></thead>
+       <tbody>${rows}</tbody>
+     </table></div>`;
+}
+
+$("dump-flows").addEventListener("click", dumpFlows);
+
+// The filter boxes re-render live against whatever was last dumped, rather
+// than requiring another button press - narrowing a table already on
+// screen should feel instant, unlike the dump itself which is deliberately
+// a deliberate action.
+$("flow-filter-a").addEventListener("input", dumpFlows);
+$("flow-filter-b").addEventListener("input", dumpFlows);
+$("flow-filter-clear").addEventListener("click", () => {
+  $("flow-filter-a").value = "";
+  $("flow-filter-b").value = "";
+  dumpFlows();
+});
+
 $("restart").addEventListener("click", async () => {
   if (!confirm("Restart the daemon? The tunnel drops for a moment.")) return;
   $("restart-note").textContent = "Restarting…";
@@ -958,6 +1115,7 @@ $("restart").addEventListener("click", async () => {
 // tabs should never feel like a fresh load.
 function showView(view) {
   $("view-home").hidden = view !== "home";
+  $("view-flows").hidden = view !== "flows";
   $("view-settings").hidden = view !== "settings";
   document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.view === view));
 }

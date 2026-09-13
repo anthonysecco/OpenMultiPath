@@ -301,6 +301,12 @@ type session struct {
 	// is tested on its own without a scheduler attached.
 	sched *scheduler
 
+	// classifier is step 7, set once before the relay starts, read only
+	// for the flow dump in the snapshot. Zero value is a no-op classifier
+	// (see flowClassifier), same as when payloads are ciphertext below
+	// WireGuard.
+	classifier flowClassifier
+
 	// authKey authenticates the wire header when set. It is loaded from a
 	// file rather than the hot-reload configuration on purpose: the web
 	// interface serves that configuration over HTTP, and a shared secret
@@ -1592,6 +1598,7 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 	}
 	snap.Scheduler.ClassRealtime, snap.Scheduler.ClassTransactional,
 		snap.Scheduler.ClassBulk, snap.Scheduler.ClassUnknown = s.classTotals()
+	snap.Scheduler.Classifying = s.classifier.enabled()
 	snap.Scheduler.DuplicatesDropped = s.dupDropped.Load()
 	// Bulk rides exactly one path once it has been steered; more than one
 	// only happens in blind mode, where the distinction has stopped
@@ -1614,7 +1621,37 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 	if s.reseq != nil {
 		snap.Scheduler.Resequencer = s.reseq.stats()
 	}
+
+	for _, f := range s.classifier.snapshot(time.Now()) {
+		snap.Flows = append(snap.Flows, state.Flow{
+			A:               f.A.String(),
+			APort:           f.APort,
+			B:               f.B.String(),
+			BPort:           f.BPort,
+			Proto:           flowProtoName(f.Proto),
+			Class:           protocol.ClassName(f.Class),
+			Decided:         f.Decided,
+			Bytes:           f.Bytes,
+			Samples:         f.Samples,
+			LastSeenSeconds: f.LastSeenSeconds,
+		})
+	}
+
 	return snap
+}
+
+// flowProtoName names the two protocols the classifier ever sees a flow
+// for; anything else would mean parse() started admitting protocols it
+// does not today.
+func flowProtoName(proto uint8) string {
+	switch proto {
+	case 6:
+		return "tcp"
+	case 17:
+		return "udp"
+	default:
+		return fmt.Sprintf("%d", proto)
+	}
 }
 
 // lossPercent expresses loss against everything that was meant to arrive,

@@ -458,3 +458,58 @@ func (f *flow) nonRealtime() uint8 {
 	}
 	return protocol.ClassTransactional
 }
+
+// currentClass is what Classify would hand back for this flow's next
+// packet, without feeding it one - the same three-way answer, reconstructed
+// from state rather than a live decision.
+func (f *flow) currentClass() uint8 {
+	if f.decided {
+		if f.class == protocol.ClassRealtime {
+			return protocol.ClassRealtime
+		}
+		return f.nonRealtime()
+	}
+	// Still sampling: Classify's own default while undecided.
+	return protocol.ClassTransactional
+}
+
+// FlowSnapshot is one tracked conversation, for the web interface's flow
+// dump. It is a read-only copy - nothing about it feeds back into
+// classification.
+type FlowSnapshot struct {
+	A, B            netip.Addr
+	APort, BPort    uint16
+	Proto           uint8
+	Class           uint8
+	Decided         bool
+	Bytes           int64
+	Samples         int
+	LastSeenSeconds float64
+}
+
+// Snapshot returns every flow currently tracked, for a person to look at.
+//
+// It is not called on the hot path and must not be: the table is sized in
+// thousands of entries (ClassifyMaxFlows), and copying it out under the
+// lock is fine for something a button press asks for occasionally, not
+// something computed per packet.
+func (c *Classifier) Snapshot(now time.Time) []FlowSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]FlowSnapshot, 0, len(c.flows))
+	for k, f := range c.flows {
+		out = append(out, FlowSnapshot{
+			A:               k.A,
+			B:               k.B,
+			APort:           k.APort,
+			BPort:           k.BPort,
+			Proto:           k.Proto,
+			Class:           f.currentClass(),
+			Decided:         f.decided,
+			Bytes:           f.total,
+			Samples:         f.samples,
+			LastSeenSeconds: now.Sub(f.lastSeen).Seconds(),
+		})
+	}
+	return out
+}

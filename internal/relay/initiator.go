@@ -188,6 +188,7 @@ func RunInitiator(cfg InitiatorConfig) error {
 	// Step 7. Only runs when the endpoint hands back plaintext; see
 	// flowClassifier.
 	clf := newFlowClassifier(local, cfg.Settings)
+	sess.classifier = clf
 	sched.setClassifying(clf.enabled())
 	if clf.enabled() {
 		log.Printf("%s: classifying traffic (STUN, vendor prefixes, behaviour)", "initiator")

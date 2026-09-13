@@ -1,6 +1,8 @@
 package relay
 
 import (
+	"time"
+
 	"github.com/anthonysecco/OpenMultiPath/internal/classify"
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
@@ -48,4 +50,13 @@ func (f flowClassifier) flows() int {
 		return 0
 	}
 	return f.c.Flows()
+}
+
+// snapshot is every tracked flow, for the interface's on-demand dump. Nil
+// when classification is not running, same as everything else here.
+func (f flowClassifier) snapshot(now time.Time) []classify.FlowSnapshot {
+	if f.c == nil {
+		return nil
+	}
+	return f.c.Snapshot(now)
 }

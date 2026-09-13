@@ -54,6 +54,29 @@ type Snapshot struct {
 	Aggregate Aggregate     `json:"aggregate"`
 	Scheduler Scheduler     `json:"scheduler"`
 	Config    config.Config `json:"config"`
+
+	// Flows is every conversation step 7's classifier is currently
+	// tracking, for the web interface's flow dump. Empty, not omitted,
+	// when classification is not running (payloads are ciphertext below
+	// WireGuard) - the interface needs to say "not classifying" rather
+	// than "nothing to show".
+	Flows []Flow `json:"flows"`
+}
+
+// Flow is one conversation the classifier is tracking, for the flow dump.
+// A and B are read from the packet, in whichever order the classifier
+// happened to store them - not necessarily "local" and "remote".
+type Flow struct {
+	A               string  `json:"a"`
+	APort           uint16  `json:"a_port"`
+	B               string  `json:"b"`
+	BPort           uint16  `json:"b_port"`
+	Proto           string  `json:"proto"`
+	Class           string  `json:"class"`
+	Decided         bool    `json:"decided"`
+	Bytes           int64   `json:"bytes"`
+	Samples         int     `json:"samples"`
+	LastSeenSeconds float64 `json:"last_seen_seconds"`
 }
 
 // Scheduler is what the path selector currently believes.
@@ -95,6 +118,12 @@ type Scheduler struct {
 	ClassTransactional uint64 `json:"class_transactional"`
 	ClassBulk          uint64 `json:"class_bulk"`
 	ClassUnknown       uint64 `json:"class_unknown"`
+
+	// Classifying says whether step 7 is actually running. False means
+	// payloads are ciphertext below WireGuard, not that nothing has been
+	// seen yet - the two read identically in the class counters above, so
+	// the flow dump needs this to tell them apart.
+	Classifying bool `json:"classifying"`
 
 	// DuplicatesDropped is how many redundant copies arrived and were
 	// discarded - the measured cost of duplication, rather than an
