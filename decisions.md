@@ -2786,3 +2786,46 @@ with a once-a-second ping monitor, the same binary passed 120 of 120 and then it
 If a probation rollback coincides with a restart of the far end, reinstall before blaming
 the code.
 
+## D-056 · Reopen D-033: bulk may share real-time's path, in flow mode too
+
+**Decision.** `steerBulk`'s flow-mode selection (`internal/relay/scheduler.go`, v0.1's
+`bulk_scheduler: flow`) no longer excludes a path because real-time is on it. Bulk takes
+the best eligible path outright - non-red, and stable/sized/delivering enough for the
+load-balancing set - with no regard to whether that path is also carrying the call, on the
+primary, on a make-before-break overlap, or on a duplication target. This was the owner's
+call (2026-09-13): "bulk should be able to use the same path as real-time... bulk is lowest
+priority in the shaper, this way real-time packets are not dropped."
+
+**Reopening D-033, and why its reasoning no longer holds.** D-033 was written before the
+per-path shaper existed. At the time, both classes leaving on the same socket meant a
+download's packets could sit in front of the call's in the carrier's own queue, so the only
+way to protect real-time was to keep bulk off its path entirely. D-052 and D-055 changed
+what "sharing a path" means: the shaper (`internal/relay/shaper.go`) holds each path just
+under its measured speed and drains two strict-priority bands, real-time first, always -
+the queue a download builds is never in front of the call's packets, on any path, moving or
+not. D-033's avoidance was therefore solving a problem that had already moved one layer
+down and been solved there. Keeping it cost something real: a healthy, cheap link left
+half-idle the moment real-time touched it, and the bookkeeping (the `carrying` set, the
+active-call gate) needed to hold it out of rotation.
+
+**Cascade mode (D-052/S12) already agreed with this and is unchanged.** The cascade never
+excluded the call's path; it fills it last in the delay-ordered cascade, and a path carrying
+real-time is a fill-order fact rather than a veto. That was itself an explicit owner rule -
+"real-time traffic on a path must never prevent or throttle bulk; it only moves that path to
+last in bulk's fill order" - and this decision does not touch it. Flow mode is what still
+had the hard exclusion, as the fallback for `bulk_scheduler: flow`, pre-classification, and
+wire versions below 3.
+
+**What is unchanged.** Admission control (D-031, `applyAdmission`/`sharedQueueMs`) still
+starves bulk when the two classes share a path and that path is queueing in our send
+direction - sharing is now the common case rather than the last resort, which makes this
+gate more load-bearing, not less. Band still beats score (Green over Yellow over Red, never
+Red), and stickiness against score-only moves is unchanged. Bulk still never rides a red
+link. The spread/load-balancing set (D-044/D-045/D-046) was never gated on the call's path
+to begin with - only the single-steered fallback and the non-spread "best" pick were.
+
+**Accepted, knowingly.** Real-time's primary and bulk's single-steered target now converge
+far more often than before, since both rank paths by the same band-then-score order - bulk
+sharing the primary is the routine case, not the fallback. The place bulk still lands
+elsewhere is ordinary: a cheaper band, or stickiness carried from an earlier state.
+

@@ -59,13 +59,13 @@ type decision struct {
 	// txBulkSpread is the set of paths a bulk flow may be load-balanced
 	// across, one flow to one path by a hash of its 5-tuple (D-044). It is
 	// the paths that are stable (D-044), big enough beside the best of them
-	// (D-045), and actually delivering (D-046), minus the call's path while
-	// a call is live - so healthy links aggregate for a multi-flow download
-	// that would otherwise sit on one, while a link that would only drag the
-	// others down is left out. Empty falls back to txBulk,
-	// which keeps D-033's single-best choice for the forest-canopy case
-	// where the only bulk-worthy link is an unstable one. Per flow, not per
-	// packet: a single flow still rides a single path, so nothing reorders.
+	// (D-045), and actually delivering (D-046) - the call's path included
+	// (D-056 reopened D-033: bulk is lowest priority in the per-path shaper,
+	// which is what protects real-time, so nothing here needs to avoid it
+	// too). Empty falls back to txBulk, which keeps the single-best choice
+	// for the forest-canopy case where the only bulk-worthy link is an
+	// unstable one. Per flow, not per packet: a single flow still rides a
+	// single path, so nothing reorders.
 	txBulkSpread []uint8
 
 	// txTrans is the transactional set: the primary alone.
@@ -362,10 +362,9 @@ func (s *scheduler) txFor(class uint8, flow uint32) []uint8 {
 //     this case.
 //
 // Excluding a path here does not make it ineligible. Bulk still falls back to
-// the single steered path of D-033, which is deliberately unguarded - a
-// flapping link is a fine place for traffic that can wait, when the
-// alternative is putting it on the call's path. This gate governs only which
-// paths are worth *spreading across*.
+// the single steered path, which is deliberately unguarded - a flapping link
+// is a fine place for traffic that can wait even so. This gate governs only
+// which paths are worth *spreading across*.
 func deliveringForSpread(now time.Duration, sc scored, c config.Config) bool {
 	if rFactor(scoreInputs(sc.m, c)) < float64(c.SpreadMinR) {
 		return false
@@ -484,25 +483,17 @@ func (s *scheduler) admit(class uint8) bool {
 	return !s.cur.Load().withholdBulk
 }
 
-// steerBulk puts bulk on the best path real-time is not using, which is
-// the rest of step 8 and the thing that makes step 9 rare.
+// steerBulk puts bulk on the best eligible path, full stop - which of them
+// happens to be carrying real-time is not a factor (D-056).
 //
-// The rule is one sentence: bulk takes the best eligible path that
-// real-time is not on, and shares the primary only when real-time is using
-// all of them. The whole cost of bulk sharing the call's path is a
-// standing queue built by a download, arriving as delay in a meeting. The
-// whole cost of moving it is a slower page, and scope-v1.md calls web and
-// map traffic explicitly sacrificial. That ordering is not close.
-//
-// It is also, in one rule, two scenarios the walkthrough asks for
-// separately. "Pull bulk off Starlink immediately" on a canyon approach
-// happens because the degrading link stops being the primary. "Use
-// Starlink only for bulk, where intermittency costs nothing" under forest
-// canopy happens because an unstable path is still eligible - which is why
-// no capacity or stability test guards the target. A flapping link is a
-// perfectly good place to put traffic that can wait, and refusing to use
-// it would leave the download on the call's path instead, which is the
-// outcome this exists to prevent.
+// D-033 used to exclude every path real-time was on, sharing the primary
+// only when nothing else was usable. The owner's D-052/D-055 shaper already
+// made that redundant: real-time has a band of its own that always drains
+// first (shaper.go), so a path carrying the call is no worse a home for
+// bulk than any other - the queue a download builds behind it is never in
+// front of the call. Removing the exclusion also removes its cost: pulling
+// a healthy, cheap link out of rotation the moment real-time touched it,
+// and the bookkeeping needed to put it back.
 //
 // Nothing here is cost-aware yet. It does not need to be: the target is
 // taken from the eligible ranking, so once step 10 puts a billing penalty
@@ -523,16 +514,11 @@ func (s *scheduler) steerBulk(now time.Duration, d *decision, c config.Config, e
 	// ClassUnknown - which D-027 carries as bulk. Steering on that would
 	// not merely mislabel traffic, it would move *all* of it off the best
 	// path onto the second best, leaving the primary carrying probes and
-	// the call riding whatever was left over. Keeping the call off the
-	// download's path is only meaningful where the two can be told apart.
+	// nothing to steer by. buildTx already sprays both classes alike here;
+	// this function has no better information to act on.
 	if !s.classifying.Load() {
 		s.setBulkPath(0, false)
 		return
-	}
-
-	carrying := make(map[uint8]bool, len(d.tx))
-	for _, id := range d.tx {
-		carrying[id] = true
 	}
 
 	// The load-balancing set (D-044): stable, non-red, big enough, delivering.
@@ -557,20 +543,11 @@ func (s *scheduler) steerBulk(now time.Duration, d *decision, c config.Config, e
 	// receive direction while the damage was in the send direction. See
 	// deliveringForSpread.
 	//
-	// The call's path is reserved only while a call is actually flowing.
-	// D-033 keeps bulk off the primary to protect real-time, but with no
-	// call live there is nothing to protect and reserving it would strand a
-	// whole uplink - so an idle-of-calls tunnel lets bulk have every link,
-	// and a call starting pulls bulk back off its path within the window.
-	rtActive := s.sess != nil && s.sess.realtimeActive(now)
 	spreadable := func(sc scored) bool {
 		if sc.m.budget.Band == usage.Red || sc.mach.state != stateStable {
 			return false
 		}
-		if !deliveringForSpread(now, sc, c) {
-			return false
-		}
-		return !(rtActive && carrying[sc.m.id])
+		return deliveringForSpread(now, sc, c)
 	}
 
 	// The best measured speed among the candidates, which is the bar the
@@ -614,11 +591,12 @@ func (s *scheduler) steerBulk(now time.Duration, d *decision, c config.Config, e
 	best, haveBest := uint8(0), false
 	var bestBand usage.Band
 	for _, sc := range eligible {
-		if carrying[sc.m.id] || sc.m.budget.Band == usage.Red {
+		if sc.m.budget.Band == usage.Red {
 			continue
 		}
 		// eligible is sorted best-first, so the first path at a given
-		// band is also the best-scoring one at that band.
+		// band is also the best-scoring one at that band. Real-time may
+		// be on it; that is no longer disqualifying (D-056).
 		if !haveBest || sc.m.budget.Band < bestBand {
 			best, bestBand, haveBest = sc.m.id, sc.m.budget.Band, true
 		}
@@ -634,7 +612,7 @@ func (s *scheduler) steerBulk(now time.Duration, d *decision, c config.Config, e
 	// band changes a handful of times a month and means real money. So
 	// bulk holds its path against a better score and gives it up for a
 	// better band, and a link that turns red loses it immediately.
-	if s.haveBulkPath && !carrying[s.bulkPath] {
+	if s.haveBulkPath {
 		if m, ok := s.metricOf(s.bulkPath, eligible); ok &&
 			m.budget.Band != usage.Red &&
 			(!haveBest || m.budget.Band <= bestBand) {
@@ -649,9 +627,8 @@ func (s *scheduler) steerBulk(now time.Duration, d *decision, c config.Config, e
 		return
 	}
 
-	// Real-time is on everything usable, or everything else is red. Bulk
-	// shares the primary, as buildTx left it, and admission control
-	// decides whether it flows.
+	// Every path is red. Bulk shares the primary, as buildTx left it, and
+	// admission control decides whether it flows.
 	s.setBulkPath(0, false)
 }
 
@@ -664,9 +641,9 @@ func (s *scheduler) setBulkPath(id uint8, have bool) {
 	}
 	s.bulkPath, s.haveBulkPath = id, have
 	if have {
-		log.Printf("scheduler: bulk -> %s, off the call's path", s.pathName(id))
+		log.Printf("scheduler: bulk -> %s", s.pathName(id))
 	} else {
-		log.Printf("scheduler: bulk -> %s, sharing the call's path (nothing else usable)", s.pathName(s.primary))
+		log.Printf("scheduler: bulk -> %s, every path is red", s.pathName(s.primary))
 	}
 }
 

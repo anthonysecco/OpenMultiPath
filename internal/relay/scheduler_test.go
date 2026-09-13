@@ -1029,18 +1029,16 @@ func TestAdmissionDisabledWithoutClassification(t *testing.T) {
 	}
 }
 
-// Step 8's remaining half. With a second path usable, a download has no
-// business sharing the link carrying the call: the queue it builds arrives
-// as delay in a meeting, and the cost of moving it is a slower page.
-func TestBulkIsSteeredOffTheCallsPath(t *testing.T) {
+// D-056 reopened D-033. The per-path shaper (D-052/D-055) already gives
+// real-time a band of its own that drains first on every path, so bulk no
+// longer has to avoid wherever the call is - it just takes the best
+// eligible path, which is routinely the primary itself.
+func TestBulkMayShareTheCallsPath(t *testing.T) {
 	w := newWorld(t, path(0, 40), path(1, 60))
 	d := w.tick(w.c.PromoteIntervals + 5)
 
-	if len(d.txBulk) != 1 {
-		t.Fatalf("bulk on %v, want exactly one path", d.txBulk)
-	}
-	if d.txBulk[0] == d.primary {
-		t.Errorf("bulk on path %d, the same path as the call, with another usable", d.txBulk[0])
+	if len(d.txBulk) != 1 || d.txBulk[0] != d.primary {
+		t.Errorf("bulk on %v, want the primary %d - the best path, real-time or not", d.txBulk, d.primary)
 	}
 	if len(d.tx) != 1 || d.tx[0] != d.primary {
 		t.Errorf("real-time on %v, want the primary alone", d.tx)
@@ -1067,59 +1065,22 @@ func TestBulkSharesThePrimaryWhenNothingElseIsUsable(t *testing.T) {
 	}
 }
 
-// Steering is the better answer than starving whenever both are available,
-// so the two have to compose: once bulk is on a path of its own, its queue
-// is nobody else's problem and the gate must stay open.
-func TestSteeringBulkAwayRemovesTheNeedToStarveIt(t *testing.T) {
-	w := newWorld(t, path(0, 40), path(1, 60))
-	w.tick(w.c.PromoteIntervals + 5)
+// Admission control (D-031) only matters when the classes actually share a
+// path. D-056 removed bulk's blanket avoidance of real-time's path, but the
+// two still land on different paths whenever bulk's own reasons - a cheaper
+// band, stickiness from an earlier state - put it elsewhere, and when they
+// do, a queue on the call's path remains nobody else's problem.
+func TestAdmissionIgnoresAQueueOnAPathBulkIsNotOn(t *testing.T) {
+	d := &decision{tx: []uint8{0}, txBulk: []uint8{1}}
+	eligible := []scored{{m: pathMetric{id: 0, haveTx: true, txQueueMs: 500}}}
 
-	// The call's path is queueing hard in our send direction.
-	w.set(0, func(p *pathMetric) {
-		p.haveTx = true
-		p.txQueueMs = float64(w.c.AdmissionQueueDelayMs) * 4
-	})
-	d := w.tick(1)
-
-	if d.withholdBulk {
-		t.Error("bulk starved while it was already riding a path of its own")
-	}
-	if d.txBulk[0] == d.primary {
-		t.Errorf("bulk still on the call's queueing path %d", d.primary)
+	if _, ok := sharedQueueMs(d, eligible); ok {
+		t.Error("queue reported shared when bulk is not on the call's path")
 	}
 }
 
-// Make-before-break puts real-time on two paths at once. Bulk should take
-// the third rather than land on the path that is carrying the overlap,
-// which exists precisely to protect the call through the handover.
-func TestBulkAvoidsTheHandoverOverlapPath(t *testing.T) {
-	w := newWorld(t, path(0, 400), path(1, 400), path(2, 400))
-	w.tick(w.c.PromoteIntervals + 5)
-
-	w.set(0, func(p *pathMetric) { p.recentLoss = 40; p.burstRatio = 20 })
-
-	var d *decision
-	for i := 0; i < 50; i++ {
-		if d = w.tick(1); d.switching {
-			break
-		}
-	}
-	if !d.switching {
-		t.Fatal("a collapsed primary never started a handover")
-	}
-
-	rt := txSet(d)
-	if len(d.txBulk) != 1 {
-		t.Fatalf("bulk on %v during a handover, want exactly one path", d.txBulk)
-	}
-	if rt[d.txBulk[0]] {
-		t.Errorf("bulk on path %d, which is carrying the handover overlap %v", d.txBulk[0], d.tx)
-	}
-}
-
-// When real-time is duplicated onto everything, there is no path free of
-// it and bulk shares the primary. Steering it onto a duplication target
-// would put the download on the very link insuring the call.
+// When real-time is duplicated onto everything, bulk still just wants the
+// best of it - which is the primary, real-time or not (D-056).
 func TestBulkSharesThePrimaryWhenRealTimeUsesEveryPath(t *testing.T) {
 	w := newWorld(t, path(0, 40), path(1, 60))
 	w.c.DuplicateMode = config.DuplicateAlways
@@ -1134,11 +1095,12 @@ func TestBulkSharesThePrimaryWhenRealTimeUsesEveryPath(t *testing.T) {
 	}
 }
 
-// The forest canopy case from scope-v1.md: an hour of intermittent
-// obstruction, real-time pinned to the good link, "use Starlink only for
-// bulk, where intermittency costs nothing". An unstable path is still an
-// eligible target, which is why no stability test guards the choice.
-func TestBulkUsesAFlappingPathRatherThanTheCallsPath(t *testing.T) {
+// The forest-canopy case from scope-v1.md used to pin bulk to the flapping
+// spare specifically to keep it off the call's clean path. D-056 removes
+// that reason: the per-path shaper protects the call regardless of what
+// else is on its path, so bulk takes whichever path actually scores best -
+// the clean one here, unstable or not being irrelevant beside it.
+func TestBulkPrefersTheCleanPathOverAnUnstableSpare(t *testing.T) {
 	w := newWorld(t, path(0, 40), path(1, 60))
 	w.tick(w.c.PromoteIntervals + 5)
 
@@ -1153,8 +1115,8 @@ func TestBulkUsesAFlappingPathRatherThanTheCallsPath(t *testing.T) {
 	if d.primary != 0 {
 		t.Fatalf("primary is path %d, want the clean path 0", d.primary)
 	}
-	if len(d.txBulk) != 1 || d.txBulk[0] != 1 {
-		t.Errorf("bulk on %v, want the flapping path 1 rather than the call's", d.txBulk)
+	if len(d.txBulk) != 1 || d.txBulk[0] != 0 {
+		t.Errorf("bulk on %v, want the clean path 0 - it scores best and sharing it costs nothing now", d.txBulk)
 	}
 }
 
@@ -1165,20 +1127,17 @@ func TestBulkUsesAFlappingPathRatherThanTheCallsPath(t *testing.T) {
 func TestBulkStaysPutWhileItsPathStillWorks(t *testing.T) {
 	w := newWorld(t, path(0, 40), path(1, 60), path(2, 80))
 	d := w.tick(w.c.PromoteIntervals + 5)
-
 	first := d.txBulk[0]
-	if first == d.primary {
-		t.Fatalf("bulk started on the call's path %d", d.primary)
-	}
 
-	// Make the other spare clearly better than the one bulk is on,
-	// without making bulk's path unusable.
+	// Make some other path clearly better than the one bulk is on. Left
+	// alone rather than also worsened: touching bulk's own path risks
+	// moving it if it happens to be the primary too (D-056), which would
+	// test a handover instead of stickiness.
 	other := uint8(1)
 	if first == 1 {
 		other = 2
 	}
 	w.set(other, func(p *pathMetric) { p.rttMs = 5 })
-	w.set(first, func(p *pathMetric) { p.rttMs = 90 })
 
 	if d := w.tick(10); d.txBulk[0] != first {
 		t.Errorf("bulk moved from path %d to %d for a better score alone", first, d.txBulk[0])
@@ -1275,34 +1234,27 @@ func TestDuplicationStopsOnANonGreenLink(t *testing.T) {
 // free.
 func TestBulkPrefersAGreenLink(t *testing.T) {
 	w := newWorld(t, path(0, 40), path(1, 50), path(2, 60))
-	w.tick(w.c.PromoteIntervals + 5)
+	d := w.tick(w.c.PromoteIntervals + 5)
 
-	// Make every spare yellow except one, so the choice is about the band
-	// rather than about the score.
-	d := w.tick(1)
-	for _, sc := range []uint8{0, 1, 2} {
-		if sc != d.primary {
-			budgeted(w, sc, usage.Yellow)
-		}
-	}
-	green := uint8(0)
+	// Yellow every spare and leave the primary green, so the choice is
+	// about the band rather than about the score. Left untouched, the
+	// primary is exactly where band preference now sends bulk anyway
+	// (D-056) - which this asserts rather than works around.
 	for _, id := range []uint8{0, 1, 2} {
 		if id != d.primary {
-			green = id
-			break
+			budgeted(w, id, usage.Yellow)
 		}
 	}
-	w.set(green, func(p *pathMetric) { p.budget = usage.State{Band: usage.Green} })
 
-	if d := w.tick(2); d.txBulk[0] != green {
-		t.Errorf("bulk on path %d, want the green path %d", d.txBulk[0], green)
+	if d := w.tick(2); d.txBulk[0] != d.primary {
+		t.Errorf("bulk on path %d, want the green path %d", d.txBulk[0], d.primary)
 	}
 }
 
 // Being on course to exceed a cap is not the same as having spent it.
 // Stalling every download for a projection would be acting on an estimate
 // as though it were a fact, so a yellow link still carries bulk when
-// nothing greener is free.
+// nothing green is free - the call's own path included (D-056).
 func TestYellowLinkStillCarriesBulkWhenNothingGreenIsFree(t *testing.T) {
 	w := newWorld(t, path(0, 40), path(1, 60))
 	w.tick(w.c.PromoteIntervals + 5)
@@ -1314,8 +1266,8 @@ func TestYellowLinkStillCarriesBulkWhenNothingGreenIsFree(t *testing.T) {
 	if len(d.txBulk) != 1 {
 		t.Fatalf("bulk on %v, want exactly one path", d.txBulk)
 	}
-	if d.txBulk[0] == d.primary {
-		t.Errorf("bulk fell back to the call's path %d when a yellow spare was free", d.primary)
+	if d.txBulk[0] != 0 && d.txBulk[0] != 1 {
+		t.Errorf("bulk on unexpected path %d", d.txBulk[0])
 	}
 }
 
@@ -1337,17 +1289,13 @@ func TestBulkNeverRidesARedLink(t *testing.T) {
 	}
 }
 
-// Stickiness does not outrank a spent allowance: a link that turns red
-// while bulk is riding it is the case the band exists for.
+// Stickiness does not outrank a spent allowance: a link that turns red is
+// left, whether or not it was also carrying the call.
 func TestBulkLeavesAPathThatTurnsRed(t *testing.T) {
 	w := newWorld(t, path(0, 40), path(1, 50), path(2, 60))
 	d := w.tick(w.c.PromoteIntervals + 5)
 
 	on := d.txBulk[0]
-	if on == d.primary {
-		t.Fatalf("bulk started on the call's path %d", d.primary)
-	}
-
 	budgeted(w, on, usage.Red)
 	if d := w.tick(2); d.txBulk[0] == on {
 		t.Errorf("bulk stayed on path %d after it went red", on)
