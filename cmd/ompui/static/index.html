@@ -23,11 +23,42 @@
   }
   h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: .2px; }
   .role { color: var(--dim); font-size: 13px; }
-  main { padding: 18px; max-width: 1100px; margin: 0 auto; }
   section { margin-bottom: 26px; }
   h2 {
     font-size: 12px; text-transform: uppercase; letter-spacing: .09em;
     color: var(--dim); margin: 0 0 10px; font-weight: 600;
+  }
+
+  /* Home and Settings are the two places in the app; the tab list is a
+     column beside the content on a screen wide enough for that, and drops
+     to a bar along the bottom - thumb reach, not a menu to hunt for - on a
+     phone. */
+  .layout { display: flex; flex-direction: column; align-items: stretch; }
+  .tabs {
+    display: flex; flex-direction: row; gap: 4px;
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+    background: var(--panel); border-top: 1px solid var(--line);
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+  }
+  .tab-btn {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    background: transparent; border: 1px solid transparent; color: var(--dim);
+    padding: 9px 10px; border-radius: 6px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--accent); background: rgba(88, 166, 255, .12); }
+  main { padding: 18px 18px calc(18px + 52px); max-width: 1100px; margin: 0 auto; width: 100%; }
+
+  @media (min-width: 720px) {
+    .layout { flex-direction: row; align-items: flex-start; }
+    .tabs {
+      position: sticky; top: 0; align-self: flex-start;
+      flex-direction: column; width: 168px; flex: none;
+      border-top: 0; border-right: 1px solid var(--line);
+      padding: 18px 10px;
+    }
+    .tab-btn { justify-content: flex-start; }
+    main { padding: 18px; }
   }
 
   /* The staleness banner is the most important thing on the page: every
@@ -39,16 +70,32 @@
   .fresh { background: #10281a; color: var(--good); border-color: #1c4429 !important; }
   .stale { background: #2d1618; color: var(--bad); border-color: #5c2326 !important; }
 
+  /* The overlay card is the one full-width band at the top: aggregate
+     numbers and the scheduler's current decision, together, since both
+     describe the same overlay rather than separate subsystems. */
+  .overlay-card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 16px 18px; margin-bottom: 26px;
+  }
   .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
-  .card .label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+  .card { background: #0d1117; border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .card .label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; cursor: help; }
   .card .value { font-size: 26px; font-weight: 650; margin-top: 3px; font-variant-numeric: tabular-nums; }
   .card .sub { color: var(--dim); font-size: 12px; margin-top: 2px; }
 
+  /* The scheduler status sits inside the overlay card, under the aggregate
+     numbers, so it reads as one divider rather than a card of its own. */
+  .sched-block { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .sched-block.bad .path-name { color: var(--bad); }
+
+  /* One column per path, side by side so the same metric can be read
+     straight across. Wraps to fewer columns, then one, as the viewport
+     narrows - never a sideways scroll. */
+  #paths { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); align-items: start; }
   .path {
     background: var(--panel); border: 1px solid var(--line);
     border-left: 4px solid var(--line); border-radius: 8px;
-    padding: 14px 16px; margin-bottom: 12px;
+    padding: 14px 16px;
   }
   .path.alive { border-left-color: var(--good); }
   .path.dead  { border-left-color: var(--bad); }
@@ -70,8 +117,6 @@
     font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
     color: var(--dim); margin: 0 0 10px; font-weight: 600;
   }
-  .dir { display: inline-block; padding: 0 4px; border-radius: 3px; background: rgba(127,127,127,.18);
-         font-size: 9px; letter-spacing: .04em; vertical-align: 1px; }
   .metric .v { font-size: 17px; font-variant-numeric: tabular-nums; margin-top: 1px; }
 
   .tag {
@@ -121,46 +166,55 @@
   <span class="role" id="uptime"></span>
 </header>
 
-<main>
-  <div id="freshness" class="stale">Waiting for the daemon&hairsp;&hellip;</div>
+<div class="layout">
+  <nav class="tabs">
+    <button class="tab-btn" data-view="home" type="button">Home</button>
+    <button class="tab-btn" data-view="settings" type="button">Settings</button>
+  </nav>
 
-  <section>
-    <h2>Aggregate</h2>
-    <div class="cards" id="aggregate"></div>
-  </section>
+  <main>
+    <div id="view-home">
+      <div id="freshness" class="stale">Waiting for the daemon&hairsp;&hellip;</div>
 
-  <section>
-    <h2>Scheduling</h2>
-    <div id="scheduler"></div>
-  </section>
+      <section>
+        <h2>Overlay</h2>
+        <div class="overlay-card">
+          <div class="cards" id="aggregate"></div>
+          <div id="scheduler"></div>
+        </div>
+      </section>
 
-  <section>
-    <h2>Paths</h2>
-    <div id="paths"></div>
-  </section>
+      <section>
+        <h2>Paths</h2>
+        <div id="paths"></div>
+      </section>
 
-  <section>
-    <h2>Settings</h2>
-    <form id="config">
-      <div id="fields"></div>
-      <div class="row">
-        <button type="submit">Save</button>
-        <span class="muted">Applied to the running daemon within a few seconds. Out-of-range values are corrected.</span>
-        <span class="saved" id="saved" hidden>Saved</span>
-      </div>
-    </form>
-  </section>
-
-  <section>
-    <h2>Daemon log</h2>
-    <div class="row" style="margin-bottom:10px">
-      <button class="secondary" id="refresh-logs" type="button">Refresh</button>
-      <button class="secondary" id="restart" type="button">Restart daemon</button>
-      <span class="muted" id="restart-note"></span>
+      <section>
+        <h2>Daemon log</h2>
+        <div class="row" style="margin-bottom:10px">
+          <button class="secondary" id="refresh-logs" type="button">Refresh</button>
+          <button class="secondary" id="restart" type="button">Restart daemon</button>
+          <span class="muted" id="restart-note"></span>
+        </div>
+        <pre id="logs">Loading&hellip;</pre>
+      </section>
     </div>
-    <pre id="logs">Loading&hellip;</pre>
-  </section>
-</main>
+
+    <div id="view-settings">
+      <section>
+        <h2>Settings</h2>
+        <form id="config">
+          <div id="fields"></div>
+          <div class="row">
+            <button type="submit">Save</button>
+            <span class="muted">Applied to the running daemon within a few seconds. Out-of-range values are corrected.</span>
+            <span class="saved" id="saved" hidden>Saved</span>
+          </div>
+        </form>
+      </section>
+    </div>
+  </main>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -233,8 +287,12 @@ function lossClass(pct) {
   return "good";
 }
 
-function card(label, value, sub) {
-  return `<div class="card"><div class="label">${label}</div>` +
+// title is the hover explanation, on the label exactly like a path's
+// metrics - the overlay card is read at a glance far more often than any
+// one path, so it is the last place that should require memorising what a
+// number means.
+function card(label, value, sub, title) {
+  return `<div class="card"><div class="label"${title ? ` title="${title}"` : ""}>${label}</div>` +
          `<div class="value">${value}</div>` +
          (sub ? `<div class="sub">${sub}</div>` : "") + `</div>`;
 }
@@ -248,14 +306,20 @@ function renderAggregate(s) {
     : "paths not yet measured";
 
   $("aggregate").innerHTML =
-    card("Paths alive", `${a.paths_alive}/${a.paths_total}`) +
-    card("Loss (recent)", fmt(a.recent_loss_percent, 2) + "%", "last minute") +
+    card("Paths alive", `${a.paths_alive}/${a.paths_total}`, "",
+      "Paths that have delivered something recently, out of every path configured. A path can be configured but not currently bound, or bound and silent - either way it does not count as alive.") +
+    card("Loss (recent)", fmt(a.recent_loss_percent, 2) + "%", "last minute",
+      "Loss across every path combined, over roughly the last minute. The number to watch for a call in progress right now.") +
     card("Loss (lifetime)", fmt(a.loss_percent, 2) + "%",
-         `${a.lost.toLocaleString()} of ${(a.received + a.lost).toLocaleString()}`) +
+         `${a.lost.toLocaleString()} of ${(a.received + a.lost).toLocaleString()}`,
+      "Loss across every path combined, since the daemon started. Unlike the recent figure, an old incident never ages out of this one - read it as history, not current health.") +
     card("Best RTT", a.best_rtt_ms ? fmt(a.best_rtt_ms) + " ms" : "—",
-         "lowest across live paths") +
-    card("Received", a.received.toLocaleString()) +
-    card("Tunnel MTU", s.tunnel_mtu || "—", mtuSub);
+         "lowest across live paths",
+      "The lowest round trip currently measured across live paths - what the tunnel could do right now if it were steering perfectly onto the fastest one.") +
+    card("Received", a.received.toLocaleString(), "",
+      "Total packets delivered across every path since the daemon started.") +
+    card("Tunnel MTU", s.tunnel_mtu || "—", mtuSub,
+      "The MTU the tunnel interface is actually set to. The paths themselves may support more (see the note below) - applying that is still a manual step, so the two can disagree.");
 }
 
 // A path's state is the first thing to read when the choice looks wrong,
@@ -288,9 +352,9 @@ function renderScheduler(s) {
   // miss.
   if (sc.blind) {
     $("scheduler").innerHTML =
-      `<div class="path dead"><div class="path-head">
-         <span class="path-name">No usable path</span>
-         <span class="tag bad">sending on everything</span>
+      `<div class="sched-block bad"><div class="path-head">
+         <span class="path-name" title="No path is currently meeting the scheduler's own bar for usable. This is the fail-to-a-working-state behaviour: rather than pick a bad path and commit to it, every path still bound gets a copy.">No usable path</span>
+         <span class="tag bad" title="Traffic is duplicated across every link that is still bound, in the hope that at least one copy gets through, rather than being sent on one guess or dropped.">sending on everything</span>
        </div>
        <p class="muted">${sc.reason || ""} Every path is down, so traffic is being duplicated across
        every link that is still bound rather than dropped.</p></div>`;
@@ -298,25 +362,25 @@ function renderScheduler(s) {
   }
 
   if (sc.primary === undefined || sc.primary < 0) {
-    $("scheduler").innerHTML = `<p class="muted">No path chosen yet.</p>`;
+    $("scheduler").innerHTML = `<div class="sched-block"><p class="muted">No path chosen yet.</p></div>`;
     return;
   }
 
   const handover = sc.switching
-    ? `<span class="tag warn">handing over to ${named(sc.switching_to)}</span>`
+    ? `<span class="tag warn" title="A make-before-break handover: both the old and new path carry traffic together for a short overlap, so the switch costs a moment of duplication rather than a moment of silence.">handing over to ${named(sc.switching_to)}</span>`
     : "";
 
   const order = (sc.ranking || []).map((id, i) =>
     `${i + 1}. ${named(id)}`).join("&nbsp; ");
 
   $("scheduler").innerHTML =
-    `<div class="path alive"><div class="path-head">
-       <span class="path-name">Carrying traffic on ${named(sc.primary)}</span>
+    `<div class="sched-block"><div class="path-head">
+       <span class="path-name" title="The path currently carrying real-time and transactional traffic - the scheduler's current choice, picked on the Score shown on that path's own card.">Carrying traffic on ${named(sc.primary)}</span>
        ${handover}
-       <span class="tag">${sc.duplicate_mode || ""}</span>
+       <span class="tag" title="${(DUPLICATE_HINTS[sc.duplicate_mode] || "").replace(/"/g, "&quot;")}">${sc.duplicate_mode || ""}</span>
      </div>
      <p class="muted">${sc.reason || ""}</p>
-     ${order ? `<p class="muted">Ranked: ${order}</p>` : ""}
+     ${order ? `<p class="muted" title="Every path the scheduler currently considers eligible, best first. This is also the fallback order a recovery script would fall through if the scheduler itself were the thing that had died.">Ranked: ${order}</p>` : ""}
      ${bulkPlacement(s, named)}
      ${classSplit(sc)}
      </div>`;
@@ -340,11 +404,11 @@ function bulkPlacement(s, named) {
     .filter(p => p.cascade_position >= 0)
     .sort((a, b) => a.cascade_position - b.cascade_position)
     .map(p => {
-      const cap = p.bulk_cap_kbps > 0 ? `capped ${rate(p.bulk_cap_kbps)}` : "uncapped";
+      const cap = p.shaped_kbps > 0 ? `shaped ${rate(p.shaped_kbps)}` : "unshaped";
       return `${named(p.id)}${p.cascade_protected ? " (call's path)" : ""} ${cap}`;
     }).join(" → ");
-  const dropped = sc.bulk_overflowed ? ` · ${sc.bulk_overflowed.toLocaleString()} past every allowance` : "";
-  return `<p class="muted" title="Bulk fills the slowest path first and spills onto faster ones only as each congests, the call's path last. A cap is how much bulk a path may currently take, set from the standing queue and loss the far end reports.">Bulk: cascade ${members}${dropped}${reseq}</p>`;
+  const dropped = sc.bulk_overflowed ? ` · ${sc.bulk_overflowed.toLocaleString()} with every path backed up` : "";
+  return `<p class="muted" title="Bulk fills the slowest path first and spills onto faster ones only once each path's shaper backs up, the call's path last. A path is shaped to 95% of its measured link speed; an unmeasured path is unshaped, so it never spills.">Bulk: cascade ${members}${dropped}${reseq}</p>`;
 }
 
 // What the classifier has decided, since the daemon started.
@@ -415,49 +479,73 @@ function renderPaths(s) {
     const penalty = (p.r_factor - p.score) >= 1
       ? `penalised ${fmt(p.r_factor - p.score, 0)} R` : "raw quality";
 
-    // Capacity. limit_kbps - the ceiling discounted for how long it has
-    // gone unconfirmed - is the only bandwidth figure the scheduler itself
-    // ever acts on (D-049), so it is the only one shown: a number the
-    // interface trusts more than the code does would be worse than no
-    // number at all. No ceiling ever observed means no opinion, shown as
-    // "unknown" rather than a floor from clean carriage that could as
-    // easily have been one lucky burst as real sustained capacity.
-    const capacity = p.ceiling_known ? rate(p.limit_kbps) : "unknown";
+    // Link speed (D-055). Measured by the flow test on the vehicle and never
+    // estimated: a link nobody has measured is shown as exactly that, and is
+    // unshaped. Home shows the figures the vehicle sent it. This end sends in
+    // one direction - up from the vehicle, down from home - and "Shaped to"
+    // is 95% of that direction's measurement, counted in full wire bytes.
+    const measuredAny = p.link_up_kbps > 0 || p.link_down_kbps > 0;
+    const linkSpeed = measuredAny
+      ? `↓ ${p.link_down_kbps > 0 ? rate(p.link_down_kbps) : "—"} · ↑ ${p.link_up_kbps > 0 ? rate(p.link_up_kbps) : "—"}`
+      : "unmeasured";
+    const measuredAgo = p.link_measured_unix ? duration(Date.now() / 1000 - p.link_measured_unix) + " ago" : "";
+    const linkSpeedNote = measuredAny
+      ? `measured ${measuredAgo}${owns ? "" : ", as reported by the vehicle"}; stands until the link is measured again or cleared`
+      : (owns ? "never measured, so assumed unlimited and not shaped - press Measure Link Speed below"
+              : "the vehicle has not measured this link, so it is assumed unlimited and not shaped");
+    const sendDir = owns ? "upload" : "download";
+    const shaped = p.shaped_kbps > 0 ? rate(p.shaped_kbps) : "unshaped";
+    const shapedNote = p.shaped_kbps > 0
+      ? `95% of the measured ${sendDir}, counting every header and tunnel byte; ${(p.shaper_backlog_bytes || 0).toLocaleString()} bytes queued now, ${(p.shaper_dropped || 0).toLocaleString()} packets dropped at the queue limit since the daemon started`
+      : `no ${sendDir} measurement, so nothing is held back`;
 
-    // What ages is the confidence, never the value: an idle hour is not
-    // evidence that a link shrank. The undiscounted ceiling and the
-    // discount currently applied are both shown, rather than folded
-    // silently into the headline.
-    const capacityNote = p.ceiling_known
-      ? (p.limit_kbps < p.ceiling_kbps * 0.99
-          ? `ceiling ${rate(p.ceiling_kbps)} measured ${duration(p.ceiling_age_seconds)} ago; discounted to ${rate(p.limit_kbps)} while it goes unconfirmed`
-          : `ceiling measured ${duration(p.ceiling_age_seconds)} ago, where queueing set in, at full confidence`)
-      : "nothing has ever loaded this path enough to see where it queues, so nothing is assumed about what it can carry";
+    // Inbound and outbound are measured in different places and routinely
+    // disagree, so each gets its own metric-group rather than being
+    // interleaved: everything in "Inbound" is measured here, on packets
+    // arriving; everything in "Outbound" is what the far end reports about
+    // our transmissions, and is what the scheduler ranks on. A path can be
+    // fine one way and unusable the other, and grouping is what makes that
+    // visible at a glance instead of requiring a label on every row.
+    //
+    // The group always renders, with every row in the same place, whether
+    // or not there is anything to report (D-052 review: a group that
+    // appears on some path columns and not others is the thing that breaks
+    // side-by-side comparison). When the far end is not reporting, a row
+    // shows a dash rather than the raw field - the underlying number is
+    // still whatever it last was and would read as a real, if oddly good
+    // or zero, measurement.
+    const noOut = `<span class="muted" title="Not shown: the far end is not currently reporting on this path (see the “no outbound report” tag above), so there is nothing honest to put here.">—</span>`;
+    const outboundGroup = `
+      <div class="metric-group">
+        <h3>Outbound</h3>
+        <div class="metrics">
+        <div class="metric"><div class="k" title="One-way network delay in the send direction: half this path's RTT floor plus the peer's reported p95 tail. Measured by the peer, not by this end - send and receive are independent paths and routinely disagree.">Network</div>
+          <div class="v" title="one-way network delay in the send direction: half the ${fmt(p.rtt_floor_ms)} ms round-trip floor, plus the ${fmt(p.tx_spread_ms)} ms p95 tail the peer measured. The two directions' figures sum to about the round-trip floor, which is the symmetry assumption checking out.">${p.tx_reported ? fmt(p.tx_delay_ms - (cfg.base_delay_ms || 0)) + " ms" : noOut}</div></div>
+        <div class="metric"><div class="k" title="What the E-model scorer is actually fed for outbound delay: the network figure to the left, plus a fixed non-network allowance (codec framing, jitter buffer, the hairpin through home) set by Base delay. Not comparable to a raw round trip.">Score delay</div>
+          <div class="v" title="what the E-model is actually fed: the ${fmt(p.tx_delay_ms - (cfg.base_delay_ms || 0))} ms above plus a fixed ${cfg.base_delay_ms || 0} ms of non-network budget - codec framing, the far end's jitter buffer, and the hairpin through home. Both ends add that constant independently, so this figure is NOT comparable with the round trip.">${p.tx_reported ? fmt(p.tx_delay_ms) + " ms" : noOut}</div></div>
+        <div class="metric"><div class="k" title="The peer's measured 95th-percentile tail latency on packets this end sent it - the send direction, which cannot be observed locally.">p95 spread</div><div class="v">${p.tx_reported ? fmt(p.tx_spread_ms) + " ms" : noOut}</div></div>
+        <div class="metric"><div class="k" title="The peer's measured RFC 3550 interarrival jitter on this end's transmissions.">Jitter</div><div class="v">${p.tx_reported ? fmt(p.tx_jitter_ms) + " ms" : noOut}</div></div>
+        <div class="metric"><div class="k" title="The peer's measured queue buildup on this end's send direction - the only direct evidence of congestion on the path this end transmits on.">Queue delay</div><div class="v">${p.tx_reported ? fmt(p.tx_queue_delay_ms) + " ms" : noOut}</div></div>
+        <div class="metric"><div class="k" title="Loss rate the peer reports on this end's transmissions, over roughly the last minute. This is the figure a send decision actually needs - a round trip alone can't say which direction loss happened in.">Loss</div>
+          <div class="v" style="${p.tx_reported ? `color:var(--${lossClass(p.tx_loss_percent)})` : ""}">${p.tx_reported ? fmt(p.tx_loss_percent, 2) + "%" : noOut}</div></div>
+        <div class="metric"><div class="k" title="The least transit above this path's floor over the last ~100 ms, as the peer measured it on this end's transmissions. A lone jitter spike does not move it; a queue that is really building does - with the path shaped under its measured speed, a queue here means the link has slowed since it was measured.">Standing queue</div><div class="v">${p.tx_reported ? fmt(p.tx_standing_queue_ms) + " ms" : noOut}</div></div>
+        <div class="metric"><div class="k" title="Loss over the last second on this end's transmissions, as the peer measured it. The fast figure; the one-minute figure beside it is for judging the path.">Loss 1 s</div>
+          <div class="v" style="${p.tx_reported ? `color:var(--${lossClass(p.tx_short_loss_percent)})` : ""}">${p.tx_reported ? fmt(p.tx_short_loss_percent, 1) + "%" : noOut}</div></div>
+        </div>
+      </div>`;
 
-    // Inbound and outbound are labelled apart because they are measured in
-    // different places and routinely disagree. Everything unlabelled is
-    // measured here, on packets arriving; the outbound figures are what the
-    // far end reports about our transmissions, and are the ones the
-    // scheduler ranks on. A path can be fine one way and unusable the other,
-    // and until these were shown separately that was invisible.
-    const inLabel = p.tx_reported ? `<span class="dir">in</span>` : "";
-    const outRows = p.tx_reported ? `
-        <div class="metric"><div class="k" title="One-way network delay in the send direction: half this path's RTT floor plus the peer's reported p95 tail. Measured by the peer, not by this end - send and receive are independent paths and routinely disagree.">Network <span class="dir">out</span></div>
-          <div class="v" title="one-way network delay in the send direction: half the ${fmt(p.rtt_floor_ms)} ms round-trip floor, plus the ${fmt(p.tx_spread_ms)} ms p95 tail the peer measured. The two directions' figures sum to about the round-trip floor, which is the symmetry assumption checking out.">${fmt(p.tx_delay_ms - (cfg.base_delay_ms || 0))} ms</div></div>
-        <div class="metric"><div class="k" title="What the E-model scorer is actually fed for outbound delay: the network figure to the left, plus a fixed non-network allowance (codec framing, jitter buffer, the hairpin through home) set by Base delay. Not comparable to a raw round trip.">Score delay <span class="dir">out</span></div>
-          <div class="v" title="what the E-model is actually fed: the ${fmt(p.tx_delay_ms - (cfg.base_delay_ms || 0))} ms above plus a fixed ${cfg.base_delay_ms || 0} ms of non-network budget - codec framing, the far end's jitter buffer, and the hairpin through home. Both ends add that constant independently, so this figure is NOT comparable with the round trip.">${fmt(p.tx_delay_ms)} ms</div></div>
-        <div class="metric"><div class="k" title="The peer's measured 95th-percentile tail latency on packets this end sent it - the send direction, which cannot be observed locally.">p95 spread <span class="dir">out</span></div><div class="v">${fmt(p.tx_spread_ms)} ms</div></div>
-        <div class="metric"><div class="k" title="The peer's measured RFC 3550 interarrival jitter on this end's transmissions.">Jitter <span class="dir">out</span></div><div class="v">${fmt(p.tx_jitter_ms)} ms</div></div>
-        <div class="metric"><div class="k" title="The peer's measured queue buildup on this end's send direction - the only direct evidence of congestion on the path this end transmits on.">Queue delay <span class="dir">out</span></div><div class="v">${fmt(p.tx_queue_delay_ms)} ms</div></div>
-        <div class="metric"><div class="k" title="Loss rate the peer reports on this end's transmissions, over roughly the last minute. This is the figure a send decision actually needs - a round trip alone can't say which direction loss happened in.">Loss <span class="dir">out</span></div>
-          <div class="v" style="color:var(--${lossClass(p.tx_loss_percent)})">${fmt(p.tx_loss_percent, 2)}%</div></div>
-        <div class="metric"><div class="k" title="The least transit above this path's floor over the last ~100 ms, as the peer measured it on this end's transmissions. A lone jitter spike does not move it; a queue that is really building does. This is what the bulk cascade paces on.">Standing queue <span class="dir">out</span></div><div class="v">${fmt(p.tx_standing_queue_ms)} ms</div></div>
-        <div class="metric"><div class="k" title="Loss over the last second on this end's transmissions, as the peer measured it. The fast figure the bulk cascade reacts to; the one-minute figure beside it is for judging the path.">Loss 1 s <span class="dir">out</span></div>
-          <div class="v" style="color:var(--${lossClass(p.tx_short_loss_percent)})">${fmt(p.tx_short_loss_percent, 1)}%</div></div>` : "";
-
-    const bulkRow = p.cascade_position >= 0 ? `
-        <div class="metric"><div class="k" title="This path's place in the bulk cascade: bulk fills place 1 first and spills to the next place only once a path congests. The call's path is always last, and otherwise treated like any path - a call never holds bulk back. The cap is how much bulk the path takes before the rest spills on - uncapped until its queue or loss says it is full.">Bulk ${p.cascade_position + 1}${p.cascade_protected ? " · call's path" : ""}</div>
-          <div class="v" title="${p.bulk_cap_kbps > 0 ? "capped at " + rate(p.bulk_cap_kbps) : "uncapped"}">${rate(p.bulk_kbps)}${p.bulk_cap_kbps > 0 ? " / " + rate(p.bulk_cap_kbps) : ""}</div></div>` : "";
+    const inCascade = p.cascade_position >= 0;
+    const noBulk = `<span class="muted" title="Not placed: bulk is not being spread onto this path right now - either it is not eligible, or the scheduler is not running the cascade (see Bulk placement in the overlay card above).">—</span>`;
+    const bulkGroup = `
+      <div class="metric-group">
+        <h3>Bulk</h3>
+        <div class="metrics">
+        <div class="metric"><div class="k" title="This path's place in the bulk cascade: bulk fills place 1 first and spills to the next place only once that path's shaper backs up. The call's path is always last, and otherwise treated like any path - a call never holds bulk back.">Position</div>
+          <div class="v" title="${inCascade ? (p.cascade_protected ? "carries real-time and transactional traffic too, so it is always filled last" : "filled " + (p.cascade_position + 1) + (p.cascade_position === 0 ? "st" : p.cascade_position === 1 ? "nd" : p.cascade_position === 2 ? "rd" : "th") + " in the fill order") : ""}">${inCascade ? (p.cascade_position + 1) + (p.cascade_protected ? " · call's path" : "") : noBulk}</div></div>
+        <div class="metric"><div class="k" title="How much bulk this path is carrying right now, and what its shaper holds the whole path to - bulk spills onto the next path once that is backed up. An unmeasured path is unshaped and never spills.">Carried / shaped</div>
+          <div class="v" title="${inCascade ? (p.shaped_kbps > 0 ? "shaped to " + rate(p.shaped_kbps) + " for everything on the path, the call included" : "unshaped: link speed never measured") : ""}">${inCascade ? rate(p.bulk_kbps) + (p.shaped_kbps > 0 ? " / " + rate(p.shaped_kbps) : " / unshaped") : noBulk}</div></div>
+        </div>
+      </div>`;
 
     const bindRow = owns
       ? `<div class="metric"><div class="k" title="Times this path's socket has gone down and come back since the daemon started - an interface bounce, DHCP renewal, or address change on this physical link specifically.">Link drops</div>
@@ -471,7 +559,7 @@ function renderPaths(s) {
         ${tags}
       </div>
       <div class="metric-group">
-        <h3>Live</h3>
+        <h3>Quality</h3>
         <div class="metrics">
           <div class="metric"><div class="k" title="Mean Opinion Score (1-5), the R-factor at right converted to the scale a person reads at a glance. This is what a call would sound like if steered onto this path alone, right now.">Quality</div>
             <div class="v" style="color:var(--${mosClass(p.mos)})" title="${penalty}">${fmt(p.mos, 2)} MOS</div></div>
@@ -479,23 +567,32 @@ function renderPaths(s) {
             <div class="v" title="E-model R factor after penalties; the scheduler ranks on this">${fmt(p.score, 0)} R</div></div>
           <div class="metric"><div class="k" title="Most recent round-trip time, measured by echoing a timestamp back. The two ends' clocks never need to be synchronized for this to be valid.">RTT</div>
             <div class="v" title="round trip; floor ${fmt(p.rtt_floor_ms)} ms with nothing queued on it">${fmt(p.rtt_ms)} ms</div></div>
-          <div class="metric"><div class="k" title="95th-percentile transit time above this path's own floor, over roughly the last 200 packets received here. Tail latency - what a call actually feels, not the average.">p95 spread ${inLabel}</div><div class="v">${fmt(p.p95_spread_ms)} ms</div></div>
-          <div class="metric"><div class="k" title="RFC 3550 interarrival jitter: smoothed packet-to-packet variation in arrival timing, measured on packets received here.">Jitter ${inLabel}</div><div class="v">${fmt(p.jitter_ms)} ms</div></div>
-          <div class="metric"><div class="k" title="How far the most recent packet's transit exceeds this path's own rolling-minimum delay - i.e. how full the buffer ahead of it is right now, inbound.">Queue delay ${inLabel}</div><div class="v">${fmt(p.queue_delay_ms)} ms</div></div>
-          <div class="metric"><div class="k" title="Loss rate over roughly the last minute, measured directly on packets arriving here.">Loss ${inLabel}</div>
-            <div class="v" style="color:var(--${lossClass(p.recent_loss_percent)})">${fmt(p.recent_loss_percent, 2)}%</div></div>
-          ${outRows}
-          ${bulkRow}
           <div class="metric"><div class="k" title="Current outbound bit rate on this path: data, any duplicated copies, and protocol overhead (echoes, reports, MTU probes) combined.">Sending</div>
             <div class="v" title="what is going onto this path right now">${rate(p.send_kbps)}</div></div>
-          <div class="metric"><div class="k" title="Estimated usable ceiling: the send rate at which this path's own queue was last seen to build, discounted the longer that measurement goes unconfirmed. The only bandwidth figure the scheduler itself acts on.">Capacity</div>
-            <div class="v" title="${capacityNote}">${capacity}</div></div>
+          <div class="metric"><div class="k" title="The link's speed as last measured by Measure Link Speed, down (home to vehicle) and up (vehicle to home). Never estimated from traffic: an unmeasured link is assumed unlimited.">Link speed</div>
+            <div class="v" title="${linkSpeedNote}">${linkSpeed}</div></div>
+          <div class="metric"><div class="k" title="The most this end sends on the path: 95% of the measured link speed in its send direction, counting every header and tunnel overhead byte, so the queue forms here - where the call goes first - rather than in the carrier's modem. Unshaped when that direction was never measured.">Shaped to</div>
+            <div class="v" title="${shapedNote}">${shaped}</div></div>
           <div class="metric"><div class="k" title="Largest physical packet size confirmed to cross this path by active probing. The tunnel's own MTU is the smallest of these across every path, so one small path caps everyone.">Path MTU</div><div class="v">${p.path_mtu || "—"}</div></div>
           <div class="metric"><div class="k" title="How many of the last 200 packets back the delay and jitter figures above. Below 20, treat this path's statistics as too thin to trust - especially before promoting it.">Samples</div><div class="v">${p.samples}</div></div>
           <div class="metric"><div class="k" title="Time since anything last arrived on this path. A live call needs this in the low single digits of seconds; a value that keeps climbing is a path going quiet.">Last seen</div>
             <div class="v">${p.last_seen_seconds < 0 ? "never" : duration(p.last_seen_seconds)}</div></div>
         </div>
       </div>
+
+      <div class="metric-group">
+        <h3>Inbound</h3>
+        <div class="metrics">
+          <div class="metric"><div class="k" title="95th-percentile transit time above this path's own floor, over roughly the last 200 packets received here. Tail latency - what a call actually feels, not the average.">p95 spread</div><div class="v">${fmt(p.p95_spread_ms)} ms</div></div>
+          <div class="metric"><div class="k" title="RFC 3550 interarrival jitter: smoothed packet-to-packet variation in arrival timing, measured on packets received here.">Jitter</div><div class="v">${fmt(p.jitter_ms)} ms</div></div>
+          <div class="metric"><div class="k" title="How far the most recent packet's transit exceeds this path's own rolling-minimum delay - i.e. how full the buffer ahead of it is right now, inbound.">Queue delay</div><div class="v">${fmt(p.queue_delay_ms)} ms</div></div>
+          <div class="metric"><div class="k" title="Loss rate over roughly the last minute, measured directly on packets arriving here.">Loss</div>
+            <div class="v" style="color:var(--${lossClass(p.recent_loss_percent)})">${fmt(p.recent_loss_percent, 2)}%</div></div>
+        </div>
+      </div>
+
+      ${outboundGroup}
+      ${bulkGroup}
 
       <div class="metric-group">
         <h3>Cumulative</h3>
@@ -512,58 +609,33 @@ function renderPaths(s) {
   }).join("");
 }
 
-// diagBlock is the on-demand link tests for one path: the iperf test and UDP
-// flood of the tunnel uplink to home, the speedtest of the carrier's own
-// internet capacity, and the scheduler-pinned UDP flood (D-048). All are
+// diagBlock is the on-demand link tests for one path: ompd's own flow test
+// (internal/diag/flowtest.go) and a public-internet speedtest. Both are
 // shown only on the end that owns the path and only while the link is up -
-// the first three pin to the interface with the same SO_BINDTODEVICE the
-// daemon uses and there is nothing to bind to on a link that is down, and
-// the pinned test cannot force traffic onto a socket that is not up either.
-// Each test's state lives in diagRuns[id] - .iperf, .speed, .udp, .pinned -
-// rather than in the DOM, so the once-a-second refresh that rebuilds every
-// card does not wipe a test in progress or its result, and running one test
-// does not clear another's result.
+// the flow test pins to the interface with the same SO_BINDTODEVICE the
+// daemon uses, and there is nothing to bind to on a link that is down.
+// Each test's state lives in diagRuns[id] - .speed, .udp - rather than in
+// the DOM, so the once-a-second refresh that rebuilds every card does not
+// wipe a test in progress or its result, and running one test does not
+// clear another's result.
 function diagBlock(owns, p) {
   if (!owns || !p.bound) return "";
   const d = diagRuns[p.id] || {};
   return `<div class="diag">
     <div class="diag-row">
-      <button class="diag-btn" ${d.iperf && d.iperf.running ? "disabled" : ""} onclick="runBandwidthTest(${p.id})">
-        ${d.iperf && d.iperf.running ? "Testing…" : "Test uplink (iperf)"}</button>
-      <span class="muted" title="A real saturating upload over the tunnel to home, in parallel streams so it reads the tunnel's actual capacity rather than a single stream's window-limited floor. Spends uplink data - a diagnostic, not something to leave running on a metered link.">tunnel uplink to home, parallel · spends uplink data</span>
-      <div class="diag-result">${iperfResultHTML(d.iperf)}</div>
-    </div>
-    <div class="diag-row">
       <button class="diag-btn" ${d.speed && d.speed.running ? "disabled" : ""} onclick="runSpeedtest(${p.id})">
-        ${d.speed && d.speed.running ? "Testing…" : "Speedtest (internet)"}</button>
-      <span class="muted" title="A public-internet speed test over this link's own carrier, bypassing the tunnel - a different measurement from the iperf test. It runs download AND upload and spends tens of MB of real, possibly metered, data each run.">carrier internet, down + up · spends tens of MB</span>
+        ${d.speed && d.speed.running ? "Testing…" : "speedtest.net"}</button>
       <div class="diag-result">${speedResultHTML(d.speed)}</div>
     </div>
     <div class="diag-row">
-      <button class="diag-btn" ${d.udp && d.udp.running ? "disabled" : ""} onclick="runUdpFlood(${p.id})">
-        ${d.udp && d.udp.running ? "Flooding…" : "Flood uplink (UDP)"}</button>
-      <span class="muted" title="A UDP flood over the tunnel to home: iperf sends as fast as it can and reports what got through plus the loss above that. Unlike TCP it does not back off, so it finds the raw forwarding ceiling - and it saturates the link for the duration, disrupting anything else on it, and spends data at the full offered rate. A deliberate stress test.">tunnel, unlimited UDP · saturates the link · spends data fast</span>
+      <button class="diag-btn" ${d.udp && d.udp.running ? "disabled" : ""} onclick="runUdpFlood(${p.id})"
+        title="Floods the link in each direction for 5 seconds and saves the result as its link speed. ompd then shapes this link to 95% of it, at both ends.">
+        ${d.udp && d.udp.running ? "Measuring…" : "Measure Link Speed"}</button>
+      ${(p.link_up_kbps > 0 || p.link_down_kbps > 0) ? `<button class="diag-btn" ${d.udp && d.udp.running ? "disabled" : ""} onclick="clearLinkSpeed(${p.id})"
+        title="Forget this link's measured speed. It is then assumed unlimited and not shaped at either end until measured again.">Clear Link Speed</button>` : ""}
       <div class="diag-result">${udpResultHTML(d.udp)}</div>
     </div>
-    <div class="diag-row">
-      <button class="diag-btn" ${d.pinned && d.pinned.running ? "disabled" : ""} onclick="runPinnedFlood(${p.id})">
-        ${d.pinned && d.pinned.running ? "Flooding…" : "Flood via scheduler (forced)"}</button>
-      <span class="muted" title="The same UDP flood, but sent through ompd's own classification and scheduling instead of bound straight to the interface, with the daemon told to force this one flow onto this path regardless of what its load-balancing gates would normally allow. The 'Flood uplink' button above measures what the carrier will give any traffic; this measures what ompd's own scheduler actually does with it - including a path currently excluded from load balancing, which is usually the one worth asking about.">through ompd, forced path · saturates the link · spends data fast</span>
-      <div class="diag-result">${pinnedResultHTML(d.pinned)}</div>
-    </div>
   </div>`;
-}
-
-function iperfResultHTML(d) {
-  if (!d) return "";
-  if (d.running) return `<span class="muted">saturating the tunnel…</span>`;
-  if (d.error) return `<span style="color:var(--bad)">iperf: ${d.error}</span>`;
-  if (d.mbps == null) return "";
-  const est = d.est || {};
-  const estStr = est.ceiling_known ? rate(est.limit_kbps) : "unmeasured";
-  return `<strong>${d.mbps.toFixed(1)} Mbps</strong> up to home (aggregate)`
-    + (d.retransmits ? ` · ${d.retransmits} retransmits` : "")
-    + ` · estimator says ${estStr}`;
 }
 
 function speedResultHTML(d) {
@@ -572,62 +644,61 @@ function speedResultHTML(d) {
   if (d.error) return `<span style="color:var(--bad)">speedtest: ${d.error}</span>`;
   if (d.down == null) return "";
   const mb = d.bytes ? ` · spent ${(d.bytes / 1e6).toFixed(0)} MB` : "";
-  return `<strong>↓ ${d.down.toFixed(1)}</strong> / <strong>↑ ${d.up.toFixed(1)} Mbps</strong>`
+  return `<strong>↓ ${rate(d.down * 1000)}</strong> / <strong>↑ ${rate(d.up * 1000)}</strong>`
     + ` · ${d.ping.toFixed(0)} ms`
     + (d.server ? ` · ${d.server}` : "") + mb;
 }
 
+// linkSpeedRate mirrors rate()'s magnitude-based Mbps/Kbps switch, but takes
+// an already-Mbps value (what the flow test reports) and capitalizes "Kbps"
+// - this measurement's own convention, kept separate from rate() rather than
+// changing what every other metric on the page shows.
+function linkSpeedRate(mbps) {
+  if (mbps == null) return "—";
+  if (mbps >= 1) return fmt(mbps, mbps >= 10 ? 1 : 2) + " Mbps";
+  return fmt(mbps * 1000, 0) + " Kbps";
+}
+
+// Only the measured (delivered) speed is shown directly - offered rate and
+// loss are real but expected to look alarming (this test offers load far
+// above what any link can carry on purpose, so 90%+ loss is the normal,
+// healthy result - see D-053's addendum on why loss isn't color-coded here),
+// so they live in the hover tooltip rather than in the line itself.
 function udpResultHTML(d) {
   if (!d) return "";
-  if (d.running) return `<span class="muted">flooding the tunnel…</span>`;
+  if (d.running) return `<span class="muted">measuring…</span>`;
   if (d.error) return `<span style="color:var(--bad)">flood: ${d.error}</span>`;
-  if (d.delivered == null) return "";
-  const lossColor = d.loss >= 5 ? "var(--bad)" : d.loss >= 1 ? "var(--warn)" : "var(--good)";
-  // No byte figure: iperf's "offered" bytes count everything written to the
-  // socket, most of which a -b 0 flood drops at the local send queue before
-  // it ever reaches the carrier, so reporting it as data spent overstates the
-  // real cost many times over. The rates and loss are the honest result.
-  return `<strong>${d.delivered.toFixed(1)} Mbps</strong> delivered`
-    + ` of ${d.offered.toFixed(0)} offered`
-    + ` · <span style="color:${lossColor}">${d.loss.toFixed(1)}% loss</span>`
-    + ` · ${d.jitter.toFixed(1)} ms jitter`;
+  if (d.cleared) return `<span class="muted">link speed cleared; this link is unshaped until measured again</span>`;
+  if (d.upDelivered == null) return "";
+  const detail = (label, delivered, offered, loss) =>
+    `${label} ${linkSpeedRate(delivered)} of ${linkSpeedRate(offered)} offered, ${loss.toFixed(1)}% loss`;
+  const tip = detail("↓", d.downDelivered, d.downOffered, d.downLoss)
+    + "\n" + detail("↑", d.upDelivered, d.upOffered, d.upLoss);
+  const saved = d.saveError
+    ? ` · <span style="color:var(--bad)">not saved: ${d.saveError}</span>`
+    : d.saved ? ` · <span class="muted">saved; shaping to ↓ ${rate(d.saved.shaped_down_kbps)} · ↑ ${rate(d.saved.shaped_up_kbps)}</span>` : "";
+  return `<span title="${tip}">`
+    + `↓ <strong>${linkSpeedRate(d.downDelivered)}</strong> · `
+    + `↑ <strong>${linkSpeedRate(d.upDelivered)}</strong></span>` + saved;
 }
 
-function pinnedResultHTML(d) {
-  if (!d) return "";
-  if (d.running) return `<span class="muted">forcing the flow onto this path…</span>`;
-  if (d.error) return `<span style="color:var(--bad)">pinned flood: ${d.error}</span>`;
-  if (d.delivered == null) return "";
-  const lossColor = d.loss >= 5 ? "var(--bad)" : d.loss >= 1 ? "var(--warn)" : "var(--good)";
-  return `<strong>${d.delivered.toFixed(1)} Mbps</strong> delivered`
-    + ` of ${d.offered.toFixed(0)} offered`
-    + ` · <span style="color:${lossColor}">${d.loss.toFixed(1)}% loss</span>`
-    + ` · ${d.jitter.toFixed(1)} ms jitter`
-    + ` <span class="muted">(through ompd, forced)</span>`;
-}
-
-// runBandwidthTest and runSpeedtest each trigger their test and record the
-// outcome under diagRuns[id], leaving the other test's result untouched.
-async function runBandwidthTest(id) {
+async function clearLinkSpeed(id) {
   const d = diagRuns[id] || (diagRuns[id] = {});
-  d.iperf = { running: true };
-  if (lastState) renderPaths(lastState);
   try {
-    const r = await fetch("/api/diag/bandwidth", {
+    const r = await fetch("/api/linkspeed/clear", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path_id: id, seconds: 10 }),
+      body: JSON.stringify({ path_id: id }),
     });
-    const b = await r.json().catch(() => ({}));
-    if (!r.ok) d.iperf = { error: b.error || ("HTTP " + r.status) };
-    else if (b.error) d.iperf = { error: b.error, est: b.estimate };
-    else d.iperf = { mbps: b.result.mbps, retransmits: b.result.retransmits, est: b.estimate };
+    d.udp = r.ok ? { cleared: true } : { error: (await r.text()) || ("HTTP " + r.status) };
   } catch (e) {
-    d.iperf = { error: String(e) };
+    d.udp = { error: String(e) };
   }
   if (lastState) renderPaths(lastState);
 }
 
+// runSpeedtest and the flood tests below each trigger their test and record
+// the outcome under diagRuns[id], leaving the other tests' results untouched.
 async function runSpeedtest(id) {
   const d = diagRuns[id] || (diagRuns[id] = {});
   d.speed = { running: true };
@@ -660,41 +731,18 @@ async function runUdpFlood(id) {
     const r = await fetch("/api/diag/bandwidth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path_id: id, seconds: 5, udp: true, target_mbps: 0 }),
+      body: JSON.stringify({ path_id: id, seconds: 5 }),
     });
     const b = await r.json().catch(() => ({}));
     if (!r.ok) d.udp = { error: b.error || ("HTTP " + r.status) };
     else if (b.error) d.udp = { error: b.error };
     else d.udp = {
-      delivered: b.result.mbps, offered: b.result.offered_mbps,
-      loss: b.result.loss_percent, jitter: b.result.jitter_ms,
-      bytes: b.result.bytes,
+      upDelivered: b.result.upload_mbps, upOffered: b.result.upload_offered_mbps, upLoss: b.result.upload_loss_percent,
+      downDelivered: b.result.download_mbps, downOffered: b.result.download_offered_mbps, downLoss: b.result.download_loss_percent,
+      saved: b.saved, saveError: b.save_error,
     };
   } catch (e) {
     d.udp = { error: String(e) };
-  }
-  if (lastState) renderPaths(lastState);
-}
-
-async function runPinnedFlood(id) {
-  const d = diagRuns[id] || (diagRuns[id] = {});
-  d.pinned = { running: true };
-  if (lastState) renderPaths(lastState);
-  try {
-    const r = await fetch("/api/diag/bandwidth-pinned", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path_id: id, seconds: 5, target_mbps: 0 }),
-    });
-    const b = await r.json().catch(() => ({}));
-    if (!r.ok) d.pinned = { error: b.error || ("HTTP " + r.status) };
-    else if (b.error) d.pinned = { error: b.error };
-    else d.pinned = {
-      delivered: b.result.mbps, offered: b.result.offered_mbps,
-      loss: b.result.loss_percent, jitter: b.result.jitter_ms,
-    };
-  } catch (e) {
-    d.pinned = { error: String(e) };
   }
   if (lastState) renderPaths(lastState);
 }
@@ -790,16 +838,10 @@ const FIELDS = [
   ["mbb_max_ms", "Handover maximum overlap", "ms",
    "Longest to keep paying for two copies while waiting for the new path to be confirmed."],
 
-  ["cascade_queue_target_ms", "Bulk spill queue", "ms",
-   "Standing queue in the send direction at which a path counts as full, and bulk starts spilling onto the next path in the fill order. The same on every path, the call's included."],
-  ["cascade_loss_percent", "Bulk spill loss", "%",
-   "Send-direction loss over the last second that counts as a path being full even with no queue - a link dropping traffic at the radio never queues."],
-  ["cascade_recover_intervals", "Bulk cap recovery", "intervals",
-   "Clean evaluations before a path's bulk cap grows again."],
   ["cascade_order_hysteresis_ms", "Bulk order margin", "ms",
    "How much slower a path must be before it is filled ahead of the one in front of it. Stops two similar links trading places."],
   ["cascade_report_interval_ms", "Fast report interval", "ms",
-   "How often a node receiving spread bulk reports its paths back, so the sender can pace. The ordinary report is once a second and only on idle paths."],
+   "How often a node receiving spread bulk reports its paths back, so the sender's view of a busy path stays fresh. The ordinary report is once a second and only on idle paths."],
   ["resequencer_hold_margin_ms", "Resequencer margin", "ms",
    "Added to the measured delay difference between paths to give how long a missing bulk packet is waited for."],
   ["resequencer_max_hold_ms", "Resequencer maximum hold", "ms",
@@ -807,16 +849,12 @@ const FIELDS = [
 
   ["report_interval_ms", "Path report interval", "ms",
    "How often each end tells the other what it measured on the other's transmissions. This is the far end's only way to see its own send direction."],
-  ["bw_onset_ms", "Capacity onset", "ms",
-   "Queueing in the send direction that counts as the link starting to fill. The rate at that moment becomes the path's estimated ceiling."],
-  ["bw_min_load_kbps", "Capacity minimum load", "kbps",
-   "Below this a path is carrying too little for its behaviour to mean anything, and nothing is concluded either way. An idle path never sets a ceiling."],
-  ["bw_headroom_percent", "Capacity headroom", "%",
-   "Margin a path must have spare before traffic is steered onto it. Arriving exactly at the estimated ceiling is arriving at the wall."],
+  ["bw_headroom_percent", "Duplication headroom", "%",
+   "Margin a measured path must have spare, below its shaped speed, before a duplicate copy of the call or a handover is steered onto it. An unmeasured path always qualifies."],
   ["spread_min_r", "Load-balancing minimum quality", "R",
    "Lowest measured quality, in R points, a link needs before downloads and web traffic are spread onto it. Scored on what the far end reports actually arriving, so a link losing most of what it is sent is excluded even while it looks healthy from this side. Well below the call threshold on purpose - bulk tolerates far more than a call. Zero spreads across every healthy link regardless of quality."],
   ["bulk_spread_min_share_percent", "Load-balancing minimum share", "%",
-   "Smallest share of the fastest link's capacity a path needs before downloads and web traffic are spread onto it. A link far smaller than the one beside it still takes its half of the flows, and every flow that lands there runs at the small link's speed. Zero spreads across every healthy link regardless of size."],
+   "Smallest share of the fastest link's measured speed a path needs before downloads and web traffic are spread onto it. Unmeasured links always qualify. A link far smaller than the one beside it still takes its half of the flows, and every flow that lands there runs at the small link's speed. Zero spreads across every healthy link regardless of size."],
 ];
 
 // The one setting that is not a number. Duplication is the difference
@@ -831,7 +869,7 @@ const DUPLICATE_HINTS = {
 
 // How bulk is placed, and the v0.2 kill switch.
 const BULK_HINTS = {
-  "cascade": "Bulk per packet: slowest path first, spilling onto faster ones as each fills, the call's path last. The default. Needs both ends on v0.2.",
+  "cascade": "Bulk per packet: slowest path first, spilling onto faster ones as each path's shaper backs up, the call's path last. The default. Needs both ends on v0.2.",
   "flow": "v0.1: one flow to one path, and a gate that stops bulk when the call's path queues. The way back if the cascade misbehaves.",
 };
 
@@ -914,6 +952,18 @@ $("restart").addEventListener("click", async () => {
   $("restart-note").textContent = res.ok ? "Restarted." : "Failed: " + await res.text();
   setTimeout(loadLogs, 1500);
 });
+
+// Which of the two views is showing. Everything keeps polling underneath
+// regardless of which is active - state is cheap to fetch and switching
+// tabs should never feel like a fresh load.
+function showView(view) {
+  $("view-home").hidden = view !== "home";
+  $("view-settings").hidden = view !== "settings";
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.view === view));
+}
+document.querySelectorAll(".tab-btn").forEach(b =>
+  b.addEventListener("click", () => showView(b.dataset.view)));
+showView("home");
 
 refreshState();
 loadConfig();

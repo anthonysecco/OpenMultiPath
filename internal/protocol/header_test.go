@@ -252,7 +252,7 @@ func TestCapabilityIsAdvertisedOnOldPackets(t *testing.T) {
 // version 1. This is the packet an un-upgraded vehicle sends.
 func TestLegacyPeerStaysOnVersionOne(t *testing.T) {
 	wire := (&Header{Type: TypeData, PathID: 1}).AppendTo(nil, 1, nil)
-	wire[1] &^= flagCapable | flagCapableV3 // as an old build would have left it
+	wire[1] &^= flagCapable | flagCapableV3 | flagCapableV4 // as an old build would have left it
 
 	_, _, negotiated, err := Parse(wire, nil)
 	if err != nil {
@@ -334,7 +334,7 @@ func TestAuthIgnoredWhenNoKeyConfigured(t *testing.T) {
 // Emitting version 3 at it would have every packet rejected mid-upgrade.
 func TestVersionTwoPeerIsNotSentVersionThree(t *testing.T) {
 	wire := (&Header{Type: TypeData, PathID: 1}).AppendTo(nil, 2, nil)
-	wire[1] &^= flagCapableV3 // what a version 2 build leaves clear
+	wire[1] &^= flagCapableV3 | flagCapableV4 // what a version 2 build leaves clear
 
 	_, _, negotiated, err := Parse(wire, nil)
 	if err != nil {
@@ -350,6 +350,7 @@ func TestVersionTwoPeerIsNotSentVersionThree(t *testing.T) {
 func TestVersionThreeIsNegotiatedFromAnOlderPacket(t *testing.T) {
 	for _, v := range []uint8{1, 2} {
 		wire := (&Header{Type: TypeData, PathID: 1}).AppendTo(nil, v, nil)
+		wire[1] &^= flagCapableV4 // what a version 3 build leaves clear
 		_, _, negotiated, err := Parse(wire, nil)
 		if err != nil {
 			t.Fatalf("version %d: Parse: %v", v, err)

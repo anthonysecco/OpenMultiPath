@@ -28,15 +28,15 @@ func exchange(t *testing.T, from, to *session, pkt []byte, delivered *[][]byte) 
 	}
 }
 
-// Two version 3 builds reach version 3 from a cold start, and bulk then
-// carries the flow sequence while everything else does not.
+// Two current builds reach the current version from a cold start, and bulk
+// then carries the flow sequence while everything else does not.
 func TestTwoVersionThreeSessionsNegotiateAndStampFlows(t *testing.T) {
 	a, b := newTestSession(), newTestSession()
 	var got [][]byte
 	exchange(t, a, b, a.stamp(0, a.nextGlobalSeq(), protocol.ClassUnknown, []byte("hello"), nil), &got)
 	exchange(t, b, a, b.stamp(0, b.nextGlobalSeq(), protocol.ClassUnknown, []byte("hello"), nil), &got)
-	if a.emitVersion() != 3 || b.emitVersion() != 3 {
-		t.Fatalf("negotiated %d and %d, want 3 and 3", a.emitVersion(), b.emitVersion())
+	if a.emitVersion() != protocol.Version || b.emitVersion() != protocol.Version {
+		t.Fatalf("negotiated %d and %d, want %d", a.emitVersion(), b.emitVersion(), protocol.Version)
 	}
 
 	flow := uint32(0xABCDE)

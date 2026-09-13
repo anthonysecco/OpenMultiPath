@@ -619,6 +619,9 @@ duplication is nearly free; on a 512k link, 40 kbps of audio is 8% of capacity a
 
 ## D-023 · Reactive bandwidth ceiling, not active probing
 
+> **Superseded by D-055** (2026-09-13). Link speed is now measured by the flow test, not
+> estimated from queueing; the estimator described here has been removed.
+
 **Decision.** Estimate each path's usable capacity from queueing onset during real
 traffic, not from dedicated bandwidth probes. When a path is carrying real load and the
 link underneath starts to fill, record the send rate at that moment, less a margin, as
@@ -2126,6 +2129,8 @@ handed to a link that is visibly not delivering.
 
 ## D-047 · Narrow the capacity estimate to the job it can do
 
+> **Superseded by D-055** (2026-09-13): the estimator this revises has been removed.
+
 **Problem.** D-046 established that the bandwidth estimator is wrong in two
 directions, and the session that produced it showed how far: AT&T logged
 `ceiling 2343kbps` while carrying 133 Mbps, and `ceiling unknown` while
@@ -2296,6 +2301,8 @@ routing - failing exactly the test it was run to be. Made explicit instead.
 
 ## D-049 · Remove the bandwidth numbers nothing reads, show the UI the one that gates
 
+> **Superseded by D-055** (2026-09-13): the estimator this revises has been removed.
+
 **Problem.** `bwView` carried five kbps figures - `sendKbps`, `peakKbps`,
 `provenKbps`, `ceilingKbps`, `limitKbps` - and the UI's "Capacity" tile
 collapsed three of them into one headline number, with the other two visible
@@ -2347,6 +2354,8 @@ number nothing in the system actually trusts.
 
 ## D-050 · Discount the ceiling for loss, not just the number D-049 removed
 
+> **Superseded by D-055** (2026-09-13): the estimator this revises has been removed.
+
 **Problem.** D-049 made `limitKbps` the only bandwidth figure the UI shows,
 on the reasoning that it's also the only one anything gates on. The very
 next live test broke that trust: a pinned flood (D-048) offered Starlink
@@ -2390,6 +2399,8 @@ at the scheduling layer that reads it.
 
 ## D-051 · Loss alone is sufficient to establish a ceiling, not just revise one
 
+> **Superseded by D-055** (2026-09-13): the estimator this revises has been removed.
+
 **Problem.** D-050's discount fixed the ceiling's *value* wherever one gets
 set, but a live test immediately found it doesn't fix *whether* one gets set
 at all. Re-running the pinned flood against Starlink after D-050 - offered
@@ -2427,6 +2438,11 @@ and `canCarry` still waves it through, because it never looks at
 was asked - recorded so it is not rediscovered as new.
 
 ## D-052 · v0.2: bulk per packet in a cascade, put back in order at the far end
+
+> **Revised by D-055** (2026-09-13): the per-path controller that set each path's bulk
+> allowance from standing queue and loss is gone. A path is full when its shaper, held to
+> 95% of the measured link speed, backs up. The fill order, resequencer and owner's rule
+> all stand.
 
 **Decision.** Bulk is placed per packet, not per flow. It fills paths in order of base delay,
 slowest first, with the path carrying the call always last, and spills onto the next path as
@@ -2499,3 +2515,274 @@ comment.**
 **Test tooling** is `test/lab/`: a two-namespace lab driving both daemons over shaped links
 with GStreamer RTP, a per-stream RTP judge, and a standard-library RTP replayer for the
 vehicle.
+
+## D-053 · Replace the raw-link iperf3 flood with an ompd-native UDP test
+
+**Decision.** The "Flood uplink (UDP)" button (D-040) no longer shells out to iperf3.
+`internal/diag/flowtest.go` is a from-scratch client and server that measure the same
+thing - the tunnel's raw forwarding ceiling, outside ompd's own classification and
+scheduling - in both directions from one button press, and `cmd/omp-flowtest` /
+`deploy/omp-flowtest.service` replace `omp-iperf.service` on the home end. This is
+principle 1 pointed at the project's own iperf3 dependency: one fewer external binary
+either end has to have installed, for the one test that stood a good chance of being
+replaced cheaply.
+
+**What stays on iperf3, and why.** The scheduler-pinned test (D-048,
+`omp-iperf-overlay.service`) is untouched. It answers a different question - what ompd's
+own load balancer does with a path under load - by riding through the daemon's real
+classification path, which this replacement was never trying to touch. The public-internet
+speedtest (companion to D-040, `librespeed-cli`) is also untouched; it is a different tool
+for a different measurement (the carrier's own capacity, not the tunnel's).
+
+**Protocol, deliberately smaller than iperf3's.** One UDP socket per side, five message
+types (start/ack, data, reportReq/report), no parallel streams (this was always a
+single-flow UDP test - streams only ever mattered for iperf3's TCP mode, which this does
+not have), and no jitter. Loss and throughput are what a flood test exists to produce;
+nothing downstream of this reads jitter, and RFC 3550's estimator needs many samples to
+mean anything, which a 5-second one-off run does not have. Each direction runs as its own
+sequential phase - upload, then download - rather than concurrently, so neither direction
+steals bandwidth from the other's measurement window.
+
+**reportReq/report is always client-initiated and retried, in both directions - found the
+hard way.** The first version had the server push the download-direction report
+unprompted, the instant its own flood loop ended, on the reasoning that it already knows
+exactly when that is. First real-link test (AT&T, path 0, on `omp-remote1`): the upload
+phase succeeded and the download phase failed outright with "server never reported what it
+sent" - that lone packet, fired the instant a saturating 5-second flood stops, is exactly
+the moment a real link is most likely to still be dropping things, and it was. Changed to
+the same reportReq/report round trip the upload phase already used (the server remembers
+its last completed run's tally - one slot, not a map, since ompui's `diagMu` keeps this
+single-flight - and answers whenever a matching reportReq arrives, retried by the client up
+to `reportAttempts` times). Worth keeping as a general note: a single unprompted "here is what just happened" packet,
+sent at the exact moment a link is most stressed, is a design that assumes the link is
+working right when it is least likely to be - precisely what principle 3 rules out, even
+though the sender genuinely does know its own timing perfectly. A retried request/response
+degrades gracefully; a one-shot push does not.
+
+**No configured send rate.** The UI used to ask iperf3 for a fixed 1 Gbps (`-b`). A Go
+loop cannot pace to that precision - at ~1200 B packets, 1 Gbps is on the order of 10^5
+packets/sec, faster than `time.Sleep` between individual sends can be trusted to hit - and
+a pacer that quietly falls short would read as the *link's* ceiling instead of the
+pacer's. The new test always sends flat out for the fixed duration instead: every real
+path this project targets is one to two orders of magnitude below what a modern CPU can
+push over one socket, so "as fast as this process can write" already clears every real
+ceiling by a wide margin, which is all a flood test needs.
+
+**Fixing a self-inflicted loss reading.** The first loopback test showed ~6% loss with
+nothing between the two processes but the kernel - not the link failing, the receive
+socket's default buffer (a few hundred KB) filling faster than the reader could drain it
+at flood rate, indistinguishable from the packet counters' point of view from loss the
+link actually caused. Both ends now set a 4 MiB `SO_RCVBUF` on every flowtest socket
+(`setFlowReadBuffer`) - best-effort, since a sandbox that refuses it should still run the
+test, just closer to what a small default buffer would have shown.
+
+**Result shape.** `FlowResult` carries `{upload,download} x {mbps, offered_mbps,
+loss_percent}` - "offered" is always a number one side actually measured sending, never an
+assumed target, so it cannot overstate what the test really pushed. `handleDiagBandwidth`
+(cmd/ompui/main.go) needed no other change: `diagMu`'s single-flight, the path-bound check,
+and the estimator comparison in the response all stayed exactly as D-040 built them - only
+the server address (new `-flowtest-server`, default `10.20.1.1:5202`) and the call into
+`internal/diag` changed.
+
+**The rate reported is the physical-link rate, not the payload rate.** The goal stated for
+this test is the underlying link speed, and every byte this code can see directly is
+smaller than that: by the time either socket hands over a data packet, the kernel has
+already stripped the UDP/IPv4 header around it and, since this test binds straight to the
+wg interface, WireGuard's own encapsulation around that. `mbps()` adds both back per
+packet - 28 bytes of inner UDP/IPv4 plus WireGuard's standard 60-byte IPv4 tunnel overhead
+(32-byte transport header/auth tag + 28-byte outer UDP/IPv4), 88 bytes/packet total, the
+same figure behind WireGuard's own MTU guidance (1500 -> 1460). This is specific to this
+test's own framing (`FlowPacketSize` payload, one UDP/IPv4 datagram, one WireGuard hop) and
+does not belong on the pinned test (D-048): that one rides through `omp0` first and picks
+up ompd's own header on top of this, a different overhead this change does not touch.
+Neither number was previously corrected this way - not this test's iperf3 predecessor, nor
+the passive estimator, which D-049 already documented as counting bytes handed to the local
+socket rather than bytes the physical link carried. This closes that gap for the one
+measurement that can afford to (an active test that already knows exactly what it sent),
+not for the passive path.
+
+**Addendum (2026-09-13).** Three refinements after the owner reviewed the first working
+version:
+
+- **A 500 ms pause between the upload and download phases** (`interPhaseGap`,
+  `RunFlowTest`). The upload phase's flood leaves the link's queue draining; starting the
+  download flood straight into that skews the second direction's reading with the first
+  direction's leftover congestion rather than measuring it cleanly.
+- **UI shows download above upload.** Display order only - the test itself still runs
+  upload then download (`uploadPhase` before `downloadPhase` in `RunFlowTest`); nothing
+  about the wire protocol changed.
+- **Loss is no longer color-coded in the flood result.** The per-path passive metrics
+  color loss because low loss there is the healthy case. This test offers load far above
+  what any link can carry on purpose, so 90%+ loss is the *expected*, healthy result - a
+  "bad" color on every normal run would be noise, not signal.
+
+## D-054 · Remove the scheduler-pinned test outright; iperf3 is gone from the project
+
+**Decision.** "Flood via scheduler (forced)" (D-048) is removed - button, `ompui` handler,
+and the daemon-side mechanism it depended on - rather than ported onto the flowtest
+protocol D-053 built. iperf3 (the client it shelled out to, `omp-iperf-overlay.service` on
+the home end) leaves the project entirely with it: nothing anywhere in the codebase invokes
+it any more.
+
+**Why remove rather than port.** D-053 already replaced the *raw-link* iperf3 flood with an
+ompd-native one because that tool answers a self-contained question - what can this tunnel
+carry - with no dependency on the daemon's own code. The scheduler-pinned test is a
+different shape: its entire reason to exist is forcing traffic through ompd's real
+classification and scheduling path, which means porting it would mean re-adding a second
+active-test protocol's worth of daemon-side plumbing (the pin file, `watchDiagPin`,
+`flowHashTuple`, the `txFor`/`txForPacket` override) for a diagnostic that answers a
+narrower question than the one D-053 already covers well. Simpler to have one flood test
+than two, especially once the cheaper one already tells you what a link can carry - keeping
+the second only pays for itself if something is actively using it to debug a live gate
+exclusion, which nothing was.
+
+**Removed, daemon side (`internal/relay`):** the `pin` field and `diagPin` type on
+`scheduler`, `nowFn` (existed solely to check the pin's deadline), `pinnedPath`,
+`flowHashTuple`, `watchDiagPin`, the override checks in both `txFor` and
+`txForPacket`/cascade, and the `go sched.watchDiagPin(diag.PinPath)` call in
+`initiator.go`. All of it was reachable only from the removed button - nothing else in the
+scheduler ever consulted a pin.
+
+**Removed, ompui side:** `handleDiagBandwidthPinned`, `overlaySourceIP`, `diagPinSrcPort`,
+the `-overlay-iperf-server` flag and `overlayIperfServer` field, and the
+`/api/diag/bandwidth-pinned` route.
+
+**Removed outright:** `internal/diag/bandwidth.go` and its test (the iperf3 client -
+D-053 had already stopped calling it for the raw-link test, and this was its only
+remaining caller), `internal/diag/diagpin.go` (the pin file protocol, D-048), and
+`deploy/omp-iperf-overlay.service`.
+
+**Result: a smaller diagnostic surface.** Two on-demand link tests remain per path -
+`internal/diag/flowtest.go`'s own UDP flow test ("Measure Link Speed") and the
+carrier-facing speedtest (`speedtest.net`, `librespeed-cli`) - both entirely open-source
+and neither depending on ompd's own classification or scheduling code, which keeps the
+D-040 boundary this whole diagnostic family was built to respect.
+
+## D-055 · Measured link speed, shaped to 95%, replaces every speed estimator
+
+**Decision.** A link's speed is what the flow test (D-053) last measured, never an estimate.
+Every queue-based estimator in ompd is removed: D-023's reactive ceiling (`bandwidth.go`,
+with D-047/D-049/D-050/D-051's revisions) and the cascade's per-path allowance controller
+(D-052). Each end shapes its sends on a link to **95% of the measured speed in its own send
+direction**, counting every byte the physical link carries. A link never measured is
+unlimited and unshaped. This was the owner's call (2026-09-13).
+
+**Reopening D-023, and why its reasoning no longer holds.** D-023 rejected active
+measurement for two reasons: probes are unreliable on a link whose capacity moves, and on a
+metered link they spend what they measure. The first was not borne out by the alternative.
+The passive estimator measured demand as much as capacity, and was wrong in both directions
+on the real links: `ceiling 2343kbps` while carrying 133 Mbps (D-047), and "unknown" at
+170 Mbps. Every consumer inherited the error, and four decisions in a row patched it. The
+second reason is answered by how the measurement is taken. Nothing probes on a cadence: the
+flow test runs when a person presses "Measure Link Speed", exactly as D-040 wanted.
+
+**Future enhancement, expected.** Detect link speed dynamically from real traffic and loss,
+to *supplement* the measured figure from the flow test, not replace it. The measured number
+goes stale when the vehicle moves - a canyon, a different cell - and today only a fresh
+measurement or a clear fixes that. This is recorded rather than built because a passive
+estimator is exactly what was just removed for being wrong. The next one should start from
+the measured figure as its anchor, not from nothing.
+
+**Where the measurement lives.** ompui saves a successful flow test to
+`/var/lib/openmultipath/linkspeed.json` (`internal/linkspeed`), keyed by interface name so
+a measurement follows its link if `-paths` is reordered. ompui is the file's only writer
+(D-032). Rules:
+- A failed run saves nothing; the last good figure stands.
+- A direction that delivered nothing keeps its previous figure. Zero means "never measured",
+  which is unlimited, and one bad run has not shown that.
+- "Clear Link Speed" removes a link's entry: the way back from a measurement taken at a bad
+  moment, short of measuring again.
+
+The vehicle's ompd watches the file (`-linkspeed`, polled like the config). An unreadable
+file keeps the speeds already in use rather than dropping to unshaped.
+
+**Getting the speeds to home: wire version 4, sent only on change.** Home shapes to the
+download figure but cannot measure it; the vehicle owns the links. Two packet types carry
+it (`internal/protocol/linkspeed.go`):
+- `TypeLinkSpeed` carries the complete set and a digest of its contents.
+- `TypeLinkSpeedAck` names the digest home now holds.
+
+The vehicle sends a changed set on every path once a second until home acknowledges it, then
+sends nothing. Per the owner, a link whose speeds never change costs no probe data. It is
+deliberately not a one-shot push: D-053 found a lone unacknowledged packet is exactly what a
+stressed link drops. Other properties:
+- **Content digest, not a counter.** A vehicle restarting with the same file produces the
+  digest home already holds.
+- **Resent after a peer restart,** detected by the same transit swing that resets sequence
+  tracking. The restarted end has forgotten the set.
+- **Capability bit.** Version 4 takes flag bit 7, the last one; a version 5 will have to
+  advertise another way. Older builds ignore non-data types anyway, so the bit exists only
+  so the vehicle never repeats a set at a peer that cannot answer.
+
+**Shaping inside ompd, not tc/CAKE.** CLAUDE.md says not to reinvent shaping, so this was
+checked before being built. tc was rejected for three reasons, each sufficient:
+1. **It would shape its own measurement.** The flow test binds straight to the wg
+   interface. A kernel shaper there would cap each re-measurement at 95% of the last, and
+   repeated measurements would ratchet a link down toward nothing. ompd's shaper sits above
+   that socket, so the flow test bypasses it.
+2. **Home cannot tell the links apart.** Home has one `wgm` and one NIC for every path;
+   shaping them separately in tc means classifying on the vehicle's CGNAT addresses, which
+   move.
+3. **The priority needs the class,** and only ompd has it (D-020's argument for one
+   process).
+
+The shaper (`internal/relay/shaper.go`) is a token bucket per path. Details:
+- **Counts IP-layer wire bytes:** ompd's packet + UDP/IPv4, and above WireGuard, WireGuard's
+  16-byte padding, 32-byte framing and outer UDP/IPv4 (`protocol.IPWireBytes`). The flow test
+  now counts the padding too, so both sides count bytes identically.
+- **Strict priority for real-time.** Shaping below link rate moves the queue from the
+  carrier's modem, where nothing can reorder it, into ompd, where the call goes first. Bulk
+  still gets every byte the call does not use - ordering, not a throttle - so D-052's owner
+  rule holds.
+- **Packets are queued unbuilt and stamped as they leave.** Stamping at enqueue would put
+  per-path sequences out of wire order whenever real-time overtook bulk, which the far end
+  counts as loss. It would also put this box's queue into the far end's transit
+  measurements, so a busy download would read as a degrading path and move the call.
+- **Measurement traffic is never queued** but is charged to the bucket.
+- **Sizes:** a 10 ms bucket; a 100 ms queue limit per band (floor 32 packets), past which
+  packets drop; and a spill threshold of 10 ms of backlog.
+
+**The cascade spills on shaper backlog.** Bulk fills the slowest path first, as before, and
+moves on when that path's shaper has more than 10 ms queued. With every path backed up it
+overflows onto the first path, never dropping at the ingress. D-045's size gate and the
+duplication/handover `canCarry` gate read the shaped speed instead of the estimate. Removed
+settings: `bw_onset_ms`, `bw_onset_dwell_ms`, `bw_min_load_kbps`, `cascade_queue_target_ms`,
+`cascade_loss_percent` and `cascade_recover_intervals`. A config file still carrying them
+loads fine. `bw_headroom_percent` stays, as duplication headroom. The resequencer's tail
+cap, which was the cascade's queue target, is now a 40 ms constant.
+
+**Accepted, knowingly.**
+- **An unmeasured link never spills.** If it is first in the fill order, all bulk goes to
+  it until it is measured. That is the literal meaning of "unmeasured is unlimited", and the
+  UI says so on the card.
+- **Stale measurements.** Above: the future enhancement.
+- **WireGuard is assumed from `-tun`.** The shaper assumes WireGuard overhead whenever
+  `-tun` is set. True of the deployed D-020 shape; in the lab, whose paths are plain veths,
+  it overcounts, which is the safe direction.
+- **Unauthenticated payload.** The link speed payload is not covered by the header's auth
+  tag. In the D-020 shape WireGuard authenticates the whole packet. In the loopback shape a
+  spoofed set could throttle a link, and nothing deployed runs that shape.
+
+**Verified on the real links** (2026-09-13, both nodes, D-020 shape). Flow test results:
+- **AT&T:** 85.3 Mbps up / 123.8 Mbps down.
+- **Starlink:** 624 kbps each way. Its standby tier now falls under D-045's size gate.
+
+Each set reached home and was acknowledged within the same second. A TCP transfer through
+the tunnel, measured on AT&T's NIC at the IP layer mid-run:
+
+| Direction | Link | Shaped to (95%) | Measured on the NIC |
+|---|---|---|---|
+| Upload | 85.3 | 81.0 | 78.95, shaper backlogged |
+| Download | 123.8 | 117.6 | 110.3, home's shaper backlogged |
+| Upload, deliberately low measurement | 20.0 | 19.0 | 18.56 |
+| Download, deliberately low measurement | 30.0 | 28.5 | 27.87, 0 retransmits |
+
+All figures are Mbps. The small gap under each limit is the conservative padding count.
+
+**Found deploying it.** The first home install was rolled back by omp-watchdog 35 s in,
+after four failed tunnel pings. It was not the build. The vehicle's own watchdog logged the
+tunnel down for over a minute afterwards, with the *old* binaries at both ends. Reinstalled
+with a once-a-second ping monitor, the same binary passed 120 of 120 and then its probation.
+If a probation rollback coincides with a restart of the far end, reinstall before blaming
+the code.
+

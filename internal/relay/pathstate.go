@@ -99,11 +99,14 @@ type pathMetric struct {
 	// nothing it carries is billed to this vehicle.
 	budget usage.State
 
-	// bw is how much this path can carry, as far as anything has been able
-	// to establish. Deliberately not part of the state machine: a small
-	// link is not a degraded link, and a path that can only do 512k is
-	// still perfectly healthy at 512k.
-	bw bwView
+	// sendKbps is what this end is putting onto the path now, in wire
+	// bytes, and shapedKbps the most it will: 95% of the link's measured
+	// speed in this direction, or 0 for a link never measured, which is
+	// unlimited (D-055). Deliberately not part of the state machine: a
+	// small link is not a degraded link, and a path that can only do 512k
+	// is still perfectly healthy at 512k.
+	sendKbps   float64
+	shapedKbps float64
 
 	// The far end's measurement of our send direction on this path, and
 	// whether it is recent enough to act on. haveTx false means nobody has
@@ -120,15 +123,6 @@ type pathMetric struct {
 	txJitterMs   float64
 	txLoss       float64
 	txBurstRatio float64
-
-	// The version 3 figures the cascade paces on: the standing queue and
-	// loss over the last second, both in the send direction. txAge is how
-	// long ago the report carrying them arrived, or -1 if none ever has -
-	// the controller treats "went quiet" and "never said" differently.
-	txStandingMs float64
-	txShortLoss  float64
-	txRxKbps     float64 // what the peer received on this path over the last second
-	txAge        time.Duration
 
 	// rttFloorMs is the round trip with nothing queued on it, which is the
 	// only part of the delay that can be split symmetrically with a clear

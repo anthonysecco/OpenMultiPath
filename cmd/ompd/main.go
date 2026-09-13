@@ -20,6 +20,7 @@ import (
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/linkdisco"
+	"github.com/anthonysecco/OpenMultiPath/internal/linkspeed"
 	"github.com/anthonysecco/OpenMultiPath/internal/relay"
 )
 
@@ -44,6 +45,7 @@ func main() {
 	statePath := flag.String("state", "/var/lib/openmultipath/state.json", "where to write the snapshot the web interface reads")
 	recordPath := flag.String("record", "/var/lib/openmultipath/history.jsonl", "where to append the rotating telemetry history; empty disables recording")
 	usagePath := flag.String("usage", "/var/lib/openmultipath/usage.json", "initiator only: where to keep per-link billing-cycle totals; empty disables cost tracking")
+	linkSpeedPath := flag.String("linkspeed", linkspeed.DefaultPath, "initiator only: the measured link speeds ompui saves after a flow test; each link is shaped to 95% of its measurement and the set is passed to home (D-055). A missing file leaves every link unshaped")
 	configPath := flag.String("config", "/etc/openmultipath/config.json", "adjustable settings, reloaded when the file changes")
 	wgInterface := flag.String("wg-interface", "wg0", "tunnel interface, read for its current MTU")
 	node := flag.String("node", hostname(), "this box's name, shown in the web interface")
@@ -101,6 +103,8 @@ func main() {
 			Settings:     holder,
 			AuthKey:      authKey,
 			Tun:          relay.TunConfig{Name: *tunName, Addr: *tunAddr, MTU: *tunMTU},
+
+			LinkSpeedPath: *linkSpeedPath,
 		}
 		if err := relay.RunInitiator(cfg); err != nil {
 			log.Fatal(err)

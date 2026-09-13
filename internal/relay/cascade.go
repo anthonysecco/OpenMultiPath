@@ -23,18 +23,24 @@ import (
 //     nothing, and spills onto the next faster path only once that one is
 //     full, and so on down to the path carrying the call, which is always
 //     last;
-//   - how much each path takes is set by a controller per path, reading the
-//     standing queue and short-window loss the far end reports on our send
-//     direction, and cutting at once and growing back only after a clean run;
+//   - a path is full when its shaper is backed up (D-055): it is held to 95%
+//     of its measured speed, and bulk queued behind that past shaperRoom goes
+//     on to the next path. A path never measured is unshaped, so it never
+//     reads full and never spills - an unmeasured link is taken as unlimited;
 //   - the far end puts each flow back in order (reseq.go).
+//
+// There used to be a controller per path here, cutting each path's allowance
+// on the standing queue and loss the far end reported and growing it back
+// after a clean run. D-055 removed it: a link's speed is what it measured,
+// not what its queue suggests.
 //
 // Real-time traffic on a path changes only where that path sits in the fill
 // order: last. It never throttles or holds bulk back. The call's path is
-// filled by the same controller as every other path, and past every path's
-// allowance bulk overflows onto whichever path is least queued rather than
-// being dropped here. That is the owner's rule (2026-09-12), and it replaces
-// admission control's gate outright in cascade mode (S7); flow mode keeps
-// the gate, being v0.1 exactly.
+// filled like every other path, and with every path backed up bulk overflows
+// onto the first path in the order rather than being dropped here. That is
+// the owner's rule (2026-09-12), and it replaces admission control's gate
+// outright in cascade mode (S7); flow mode keeps the gate, being v0.1
+// exactly.
 //
 // It is only ever active when every one of these holds: the operator has not
 // switched it off (bulk_scheduler), the peer can resequence (wire version 3),
@@ -45,141 +51,15 @@ import (
 
 // cascadeMember is one path the cascade may put bulk on, in fill order.
 type cascadeMember struct {
-	id        uint8
-	protected bool    // carries real-time or transactional traffic; always last
-	capKbps   float64 // how much bulk it may take; 0 is unlimited
-	sentKbps  float64 // bulk it carried over the last evaluation
+	id         uint8
+	protected  bool    // carries real-time or transactional traffic; always last
+	shapedKbps float64 // what its shaper holds it to; 0 is unshaped
+	sentKbps   float64 // bulk it carried over the last evaluation
 }
 
-// capDemand is what the controller knows about the demand on one path over
-// the last evaluation.
-type capDemand struct {
-	sentKbps float64
-	// exhausted means at least one bulk packet found this path's allowance
-	// spent and went on to a later path, or was dropped. That is direct
-	// evidence the path could have carried more if its cap allowed.
-	exhausted bool
-}
-
-// capCtl is the controller for one path's bulk allowance.
-type capCtl struct {
-	capKbps    float64 // 0 is unlimited
-	clean      int
-	lastCut    time.Duration
-	haveCut    bool
-	queueAtCut float64 // the standing queue the last cut was made against
-	cutFrom    float64 // the delivered rate the last cut was made from
-	lastQueue  float64 // the standing queue at the previous evaluation
-	haveQueue  bool
-	overFor    int // consecutive evaluations over the target or loss line
-
-	// blameless marks an allowance cut while almost no bulk was on the
-	// path: the queue was someone else's - a download still classed as
-	// transactional, a page load - and bulk was only kept off while it
-	// stood. Once the path is clean it goes back to uncapped rather than
-	// crawling up from the floor, because nothing ever showed bulk was the
-	// problem.
-	blameless  bool
-	lastMember time.Duration
-
-	// The best delivered rate over the current and previous peak windows.
-	// See cascadePeakHeadroom.
-	peakCur, peakPrev float64
-	peakAt            time.Duration
-}
-
-// The controller's gains. Deliberately constants rather than settings: every
-// one is a guess, and the road will say which of them needs to move before a
-// knob for it is worth the space in the interface.
-const (
-	// cascadeMinCapKbps is the floor a cut stops at. An allowance only sets
-	// how much of the bulk a path takes before the rest spills on; it never
-	// stops bulk, so a low floor costs nothing but a little spill.
-	cascadeMinCapKbps = 64
-
-	// cascadeGrowth is the per-evaluation growth once a path has been clean
-	// for long enough - about 1.6x a second at the default cadence - and
-	// cascadeFastGrowth the growth while the allowance is still under half
-	// the rate the last cut was made from. The lab took ten seconds to climb
-	// back from a deep cut at the slow rate, for capacity it had already
-	// shown it had.
-	cascadeGrowth     = 1.10
-	cascadeFastGrowth = 1.30
-
-	// cascadeDemandShare is how close to its cap a path must be running for
-	// the cap to grow. An allowance nobody is pushing against is not
-	// evidence of headroom.
-	cascadeDemandShare = 0.9
-
-	// cascadeUnlimitedKbps is where a growing cap stops being a cap.
-	cascadeUnlimitedKbps = 10_000_000
-
-	// cascadeTrimQueueMs is the standing queue above which a still-rising
-	// queue trims a path's allowance to what it is delivering. Low on
-	// purpose: a BBR sender keeps a bottleneck's queue to a few
-	// milliseconds, and a trim that waited for half the target never fired
-	// under one, leaving the first path's allowance above its link and
-	// nothing ever spilling to the second.
-	cascadeTrimQueueMs = 5
-
-	// cascadePeakHeadroom bounds a path's allowance, once it has been seen
-	// to congest, to this much above the best it has actually delivered over
-	// the last one to two seconds (cascadePeakWindow).
-	//
-	// This is what lets a sender that keeps queues short aggregate at all.
-	// BBR paces at the rate it has seen delivered and probes a quarter above
-	// it now and then; if the first path's allowance floats above what that
-	// link can carry, the probe's extra just queues there briefly and
-	// nothing ever spills, so the second link stays idle forever. Held to a
-	// tenth above what arrives, the probe's extra spills onto the next path,
-	// arrives, and the sender's next estimate is the two links together. The
-	// lab measured exactly that failure before this: a BBR flow at one
-	// link's rate with a second idle beside it.
-	//
-	// Below the probe gain on purpose, and loose enough that a path with
-	// room grows its allowance a tenth a second as it proves it.
-	cascadePeakHeadroom = 1.10
-	cascadePeakWindow   = time.Second
-
-	// cascadeConfirmIntervals is how many evaluations running a path must
-	// read over its queue target or loss line before it is cut. One report is
-	// one reading, and on Starlink
-	// one reading is noise: idle, the send direction read 8.6 ms of standing
-	// queue at the median, 24.6 at p90 and 64.7 at worst, against a 40 ms
-	// target. D-023 needed a dwell for the same link and the same reason.
-	cascadeConfirmIntervals = 2
-
-	// cascadeLossCut is the cut for loss with no queue behind it.
-	cascadeLossCut = 0.8
-
-	// cascadeCutSpacing is the least time between two cuts on one path. A
-	// cut takes a round trip and a report to show up in what the far end
-	// measures; cutting again before then cuts for the same queue twice.
-	cascadeCutSpacing = 500 * time.Millisecond
-
-	// cascadeDrainGrace is how long a queue that is already shrinking after
-	// a cut is left to drain before being cut for again. A deep buffer
-	// filled by a TCP flow's overshoot takes seconds to empty even at a rate
-	// well under the link's; cutting on every report while it does ratchets
-	// the allowance to the floor for a queue that was already going away.
-	// Found in the network namespace lab, where it held a 20 Mbit link to
-	// 12 Mbit.
-	cascadeDrainGrace = 2 * time.Second
-
-	// cascadeStaleReports is how many cascade report intervals a report may
-	// be late before the controller stops acting on it and holds.
-	cascadeStaleReports = 3
-
-	// cascadeSwapTicks is how many evaluations running a slower path must
-	// have been slower before it overtakes the one ahead.
-	cascadeSwapTicks = 5
-
-	// cascadeForgetAfter is how long a path may be out of the cascade before
-	// its controller starts again from unlimited. A link that has been gone
-	// that long has probably moved cell, and the old cap belongs to the old
-	// one.
-	cascadeForgetAfter = 30 * time.Second
-)
+// cascadeSwapTicks is how many evaluations running a slower path must have
+// been slower before it overtakes the one ahead.
+const cascadeSwapTicks = 5
 
 // cascadeInactive says why the cascade is not running, or "" when it may.
 func (s *scheduler) cascadeInactive(d *decision, c config.Config) string {
@@ -240,7 +120,6 @@ func (s *scheduler) buildCascade(now time.Duration, d *decision, c config.Config
 		s.setCascadeActive(false, why)
 		s.cascadeOrder = nil
 		s.swapFor = nil
-		s.caps = nil
 		return
 	}
 
@@ -269,14 +148,14 @@ func (s *scheduler) buildCascade(now time.Duration, d *decision, c config.Config
 	// AT&T link waited behind it.
 	var bestKbps float64
 	for _, sc := range eligible {
-		if healthyForCascade(now, sc, c) && sc.m.bw.limitKbps > bestKbps {
-			bestKbps = sc.m.bw.limitKbps
+		if healthyForCascade(now, sc, c) && sc.m.shapedKbps > bestKbps {
+			bestKbps = sc.m.shapedKbps
 		}
 	}
 	var members []scored
 	for _, sc := range eligible {
 		if protected[sc.m.id] || !healthyForCascade(now, sc, c) ||
-			undersizedForSpread(sc.m.bw.limitKbps, bestKbps, c) || !inReach(sc) {
+			undersizedForSpread(sc.m.shapedKbps, bestKbps, c) || !inReach(sc) {
 			continue
 		}
 		members = append(members, sc)
@@ -290,27 +169,12 @@ func (s *scheduler) buildCascade(now time.Duration, d *decision, c config.Config
 	// members; a flapping one waits until it stops.
 
 	order := s.orderCascade(c, members)
-
-	if s.caps == nil {
-		s.caps = make(map[uint8]*capCtl)
-	}
 	sent := s.bulkRates(now)
-	exhausted := s.exhaustedSince()
 
 	d.cascade = d.cascade[:0]
 	d.cascadeIDs = d.cascadeIDs[:0]
 	add := func(id uint8, prot bool) {
-		ctl := s.caps[id]
-		if ctl == nil || now-ctl.lastMember > cascadeForgetAfter {
-			ctl = &capCtl{}
-			s.caps[id] = ctl
-		}
-		ctl.lastMember = now
-		sc := byID[id]
-		before := ctl.capKbps
-		ctl.update(now, sc.m, capDemand{sentKbps: sent[id], exhausted: exhausted[id]}, c)
-		s.logCap(id, prot, before, ctl.capKbps)
-		d.cascade = append(d.cascade, cascadeMember{id: id, protected: prot, capKbps: ctl.capKbps, sentKbps: sent[id]})
+		d.cascade = append(d.cascade, cascadeMember{id: id, protected: prot, shapedKbps: byID[id].m.shapedKbps, sentKbps: sent[id]})
 		d.cascadeIDs = append(d.cascadeIDs, id)
 	}
 	for _, id := range order {
@@ -322,10 +186,10 @@ func (s *scheduler) buildCascade(now time.Duration, d *decision, c config.Config
 		}
 	}
 
-	// Where bulk goes once every allowance is spent: the first path in fill
-	// order. Past its allowance a download queues where it would have gone
-	// first anyway, and the call's path takes only its own share - unless it
-	// is the only path, when it takes everything.
+	// Where bulk goes once every path is backed up: the first path in fill
+	// order. A download queues where it would have gone first anyway, and the
+	// call's path takes only its own share - unless it is the only path, when
+	// it takes everything.
 	d.overflowIdx = 0
 
 	d.cascadeOn = len(d.cascade) > 0
@@ -421,213 +285,6 @@ func (s *scheduler) bulkRates(now time.Duration) map[uint8]float64 {
 	return out
 }
 
-// exhaustedSince reports which paths turned a bulk packet away for want of
-// allowance since the last evaluation.
-func (s *scheduler) exhaustedSince() map[uint8]bool {
-	out := make(map[uint8]bool)
-	for i := range s.exhaustedCount {
-		n := s.exhaustedCount[i].Load()
-		if n != s.lastExhausted[i] {
-			out[uint8(i)] = true
-		}
-		s.lastExhausted[i] = n
-	}
-	return out
-}
-
-// update advances one path's controller by an evaluation
-// (v0.2-design.md, section 5.4).
-//
-// Every path runs the same controller against the same target, the call's path
-// included: real-time on a path decides its place in the order, not how much
-// bulk it may carry.
-func (ctl *capCtl) update(now time.Duration, m pathMetric, demand capDemand, c config.Config) {
-	sentKbps := demand.sentKbps
-	delivered := bulkDeliveredKbps(m, sentKbps)
-	// No evidence at all: do not throttle. The same answer admission control
-	// gave, and for the same reason - the failure of a pacing mechanism with
-	// nothing to go on should be traffic flowing.
-	if m.txAge < 0 || !m.haveTx {
-		ctl.capKbps, ctl.clean = 0, 0
-		return
-	}
-	// Evidence gone quiet: hold. Not growing on a path nobody can currently
-	// see is the cautious half; not cutting on silence is the other, since
-	// the path machine is what judges a path that has stopped answering.
-	if m.txAge > cascadeStaleReports*c.CascadeReportInterval() {
-		return
-	}
-	// Bounded by what has actually been delivered, whatever the rules below
-	// decide - but only on fresh evidence, like everything else here.
-	defer ctl.boundByPeak(now, delivered)
-
-	target := float64(c.CascadeQueueTargetMs)
-	need := c.CascadeRecoverIntervals
-	queue, loss := m.txStandingMs, m.txShortLoss
-	// A path carrying next to nothing is measured on next to nothing: its
-	// "standing queue" is a single report's worth of samples, and its loss a
-	// handful of packets. Read as congestion, that cut idle links to the floor
-	// on the real vehicle, where they then never carried enough bulk to be
-	// measured properly - both links at 64 kbps and a download at a tenth of
-	// what flow placement managed. The bandwidth estimator ignores a path
-	// under the same load for the same reason.
-	if m.bw.sendKbps < float64(c.BWMinLoadKbps) {
-		queue, loss = 0, 0
-	}
-	queued := queue > target
-	lossy := loss >= float64(c.CascadeLossPercent)
-	rising := ctl.haveQueue && queue > ctl.lastQueue
-	ctl.lastQueue, ctl.haveQueue = queue, true
-
-	if queued || lossy {
-		ctl.clean = 0
-		ctl.overFor++
-		if ctl.overFor < cascadeConfirmIntervals {
-			return
-		}
-		if ctl.haveCut {
-			since := now - ctl.lastCut
-			if since < cascadeCutSpacing {
-				return
-			}
-			// Already draining from the last cut: give it time.
-			if queued && !lossy && queue < ctl.queueAtCut && since < cascadeDrainGrace {
-				return
-			}
-		}
-		f := cascadeLossCut
-		if queued {
-			f = clampFloat(1-0.5*(queue-target)/target, 0.5, 0.9)
-		}
-		// Cut from what actually arrived, not what was offered (D-050): a
-		// link losing a third of its traffic has not got the capacity it was
-		// handed.
-		base := delivered
-		if ctl.capKbps > 0 && ctl.capKbps < base {
-			base = ctl.capKbps
-		}
-		// Seeded, the first time, from the bandwidth estimate where it has
-		// one and it is lower. Its only job here (section 5.4).
-		if ctl.capKbps == 0 && m.bw.limitKbps > 0 && m.bw.limitKbps < base {
-			base = m.bw.limitKbps
-		}
-		ctl.capKbps = base * f
-		if ctl.capKbps < cascadeMinCapKbps {
-			ctl.capKbps = cascadeMinCapKbps
-		}
-		ctl.lastCut, ctl.haveCut, ctl.queueAtCut, ctl.cutFrom = now, true, queue, base
-		ctl.blameless = sentKbps < 2*cascadeMinCapKbps
-		return
-	}
-
-	// A queue that is building, but short of the target, means this path is
-	// being given more than it delivers: an allowance above what arrives
-	// only lets the queue climb until a cut. Trimming it to what is being
-	// delivered makes the excess spill onto the next path at the link's real
-	// rate instead. The lab showed the difference: without it a single flow
-	// sat on one 20 Mbit link with a second idle.
-	if rising && queue > cascadeTrimQueueMs && sentKbps >= 2*cascadeMinCapKbps {
-		if ctl.capKbps == 0 || ctl.capKbps > delivered {
-			ctl.capKbps = delivered
-		}
-	}
-	ctl.overFor = 0
-	if queue > target/2 {
-		return // near the line: neither cut nor grow
-	}
-	ctl.clean++
-	if ctl.blameless && ctl.clean >= need {
-		ctl.capKbps, ctl.blameless = 0, false
-		return
-	}
-	// Grow only an allowance something is pushing against: packets turned
-	// away from it onto another path, or running close to it.
-	inUse := demand.exhausted || sentKbps >= cascadeDemandShare*ctl.capKbps
-	if ctl.capKbps == 0 || ctl.clean < need || !inUse {
-		return
-	}
-	if ctl.capKbps < ctl.cutFrom/2 {
-		ctl.capKbps *= cascadeFastGrowth
-	} else {
-		ctl.capKbps *= cascadeGrowth
-	}
-	if ctl.capKbps >= cascadeUnlimitedKbps {
-		ctl.capKbps = 0
-	}
-}
-
-// boundByPeak folds this evaluation's delivered rate into the peak windows
-// and, once the path has congested at least once, holds its allowance to
-// cascadePeakHeadroom above the recent peak. Before any congestion a path
-// stays uncapped: filling the slowest link first until it shows it is full
-// is S3.
-func (ctl *capCtl) boundByPeak(now time.Duration, delivered float64) {
-	if now-ctl.peakAt >= cascadePeakWindow {
-		ctl.peakPrev, ctl.peakCur, ctl.peakAt = ctl.peakCur, 0, now
-	}
-	if delivered > ctl.peakCur {
-		ctl.peakCur = delivered
-	}
-	peak := ctl.peakCur
-	if ctl.peakPrev > peak {
-		peak = ctl.peakPrev
-	}
-	switch {
-	case !ctl.haveCut || ctl.blameless || ctl.capKbps == 0 && ctl.clean > 0:
-		return
-	case peak < cascadeMinCapKbps:
-		return // nothing delivered lately; leave the allowance to the rules above
-	}
-	ceiling := peak * cascadePeakHeadroom
-	if ctl.capKbps == 0 || ctl.capKbps > ceiling {
-		ctl.capKbps = ceiling
-	}
-}
-
-// bulkDeliveredKbps is how much of the bulk put onto a path over the last
-// evaluation actually arrived. From the sender's side alone it is what was
-// sent less the loss reported, which reads high whenever the link's buffer
-// is absorbing the excess without dropping it - exactly while the link is
-// full. The peer's receive rate (version 3) cannot read high that way, so
-// when there is one the estimate is the lower of the two: the receive rate
-// less whatever else is riding the path.
-func bulkDeliveredKbps(m pathMetric, sentKbps float64) float64 {
-	delivered := sentKbps * (1 - m.txShortLoss/100)
-	if m.txRxKbps <= 0 || !m.haveTx {
-		return delivered
-	}
-	other := m.bw.sendKbps - sentKbps
-	if other < 0 {
-		other = 0
-	}
-	if rx := m.txRxKbps - other; rx < delivered {
-		delivered = rx
-	}
-	if delivered < 0 {
-		delivered = 0
-	}
-	return delivered
-}
-
-// logCap reports a path's allowance changing between unlimited and capped,
-// which is the transition worth reading at 2am. Every cut and growth step
-// would bury the journal on the box hardest to reach.
-func (s *scheduler) logCap(id uint8, protected bool, before, after float64) {
-	if before == after {
-		return
-	}
-	which := "bulk path"
-	if protected {
-		which = "call's path"
-	}
-	switch {
-	case before == 0 && after > 0:
-		log.Printf("cascade: %s (%s) bulk limited to %.0f kbps", s.pathName(id), which, after)
-	case before > 0 && after == 0:
-		log.Printf("cascade: %s (%s) uncapped again", s.pathName(id), which)
-	}
-}
-
 // setCascadeActive logs the cascade starting and stopping.
 func (s *scheduler) setCascadeActive(on bool, why string) {
 	if s.cascadeLogged && s.cascadeWasOn == on && s.cascadeWhyLogged == why {
@@ -645,45 +302,23 @@ func (s *scheduler) setCascadeActive(on bool, why string) {
 	}
 }
 
-// pickCascade chooses the one path a bulk packet of size bytes goes out of
+// pickCascade chooses the one path a bulk packet goes out of
 // (v0.2-design.md, section 5.3). It never drops.
 //
-// Allowances decide the split, not the total. When every path has spent its
-// allowance the packet goes to the least-queued path (decision.overflowIdx),
-// and the sending TCP finds the aggregate's limit from the links themselves,
-// as it would anywhere. The first version dropped here whenever every
-// allowance was spent, which made the tunnel a policer: TCP read the drops as
-// the aggregate being full, never pushed past the first link, and the lab
-// measured a two-link cascade carrying less than one link did per flow.
-//
-// Owned by the single goroutine reading the local endpoint: the token state
-// is touched nowhere else, which is what lets this take no lock.
+// The first path in fill order whose shaper has room takes it (D-055). When
+// every path is backed up the packet goes to the first in the order
+// (decision.overflowIdx), and the sending TCP finds the aggregate's limit from
+// the shaper's queue, as it would at any router. The first version of the
+// cascade dropped here whenever every allowance was spent, which made the
+// tunnel a policer: TCP read the drops as the aggregate being full, never
+// pushed past the first link, and the lab measured a two-link cascade carrying
+// less than one link did per flow.
 func (s *scheduler) pickCascade(d *decision, size int) ([]uint8, bool) {
-	now := s.clock()
 	for i, m := range d.cascade {
-		id := m.id
-		if m.capKbps <= 0 {
-			s.bulkBytes[id].Add(uint64(size))
+		if s.hasRoom == nil || s.hasRoom(m.id) {
+			s.bulkBytes[m.id].Add(uint64(size))
 			return d.cascadeIDs[i : i+1], true
 		}
-		rate := m.capKbps * 125 // bytes a second
-		depth := rate / 100     // 10 ms of it: see cascadeBucketNote
-		if depth < cascadeMinBucketBytes {
-			depth = cascadeMinBucketBytes
-		}
-		if elapsed := now - s.tokensAt[id]; elapsed > 0 {
-			s.tokens[id] += rate * elapsed.Seconds()
-			s.tokensAt[id] = now
-		}
-		if s.tokens[id] > depth {
-			s.tokens[id] = depth
-		}
-		if s.tokens[id] >= float64(size) {
-			s.tokens[id] -= float64(size)
-			s.bulkBytes[id].Add(uint64(size))
-			return d.cascadeIDs[i : i+1], true
-		}
-		s.exhaustedCount[id].Add(1)
 	}
 	if len(d.cascade) == 0 {
 		return nil, false // not reachable: txForPacket only calls this with a cascade
@@ -694,18 +329,6 @@ func (s *scheduler) pickCascade(d *decision, size int) ([]uint8, bool) {
 	return d.cascadeIDs[i : i+1], true
 }
 
-// cascadeBucketNote: the token buckets hold only 10 ms of allowance. A deeper
-// bucket absorbs a sender's short excursions above the allowance - BBR's
-// probe is a quarter above its rate for about a round trip - so they never
-// spill onto the next path and the sender never sees that there was more
-// capacity to be had. The lab measured a 100 ms bucket hiding every probe.
-// A shallow bucket spills packet trains too, which costs nothing: spill is
-// what the cascade is for, and every later path has its own allowance.
-//
-// cascadeMinBucketBytes lets a path at the floor still pass a full-sized
-// packet or two.
-const cascadeMinBucketBytes = 3000
-
 // txForPacket is what the data path calls: the paths one packet goes out of,
 // or false when it is to be dropped at the ingress. It differs from txFor only
 // while the cascade is active, where bulk is placed per packet and
@@ -714,9 +337,6 @@ func (s *scheduler) txForPacket(class uint8, flow uint32, size int) ([]uint8, bo
 	d := s.cur.Load()
 	if !d.cascadeOn || class == protocol.ClassRealtime {
 		return s.txFor(class, flow), true
-	}
-	if pin := s.pinnedPath(flow); pin != nil {
-		return pin, true
 	}
 	if class == protocol.ClassBulk {
 		return s.pickCascade(d, size)
@@ -737,9 +357,9 @@ func describeCascade(d *decision, name func(uint8) string) string {
 	}
 	parts := make([]string, 0, len(d.cascade))
 	for _, m := range d.cascade {
-		cap := "uncapped"
-		if m.capKbps > 0 {
-			cap = fmt.Sprintf("cap %.0f kbps", m.capKbps)
+		cap := "unshaped"
+		if m.shapedKbps > 0 {
+			cap = fmt.Sprintf("shaped to %.0f kbps", m.shapedKbps)
 		}
 		tag := ""
 		if m.protected {

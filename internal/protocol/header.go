@@ -11,7 +11,7 @@
 //	  0       version (high 4 bits) | type (low 4 bits)
 //	  1       flags: bit0 echo block present, bits1-2 class, bit3 report
 //	          block, bit4 auth tag, bit5 can read version 2, bit6 can read
-//	          version 3, bit7 reserved
+//	          version 3, bit7 can read version 4
 //	  2       path id
 //	  3-6     global sequence, assigned once before path selection
 //	  7-10    per-path sequence, assigned at transmit on one specific path
@@ -100,8 +100,15 @@ import (
 // can put a flow spread across several paths back in order, and two faster
 // figures on each path report for the controller that decides how much bulk
 // each path takes. See v0.2-design.md.
+//
+// Version 4 changes no existing layout. It adds two packet types,
+// TypeLinkSpeed and TypeLinkSpeedAck, which carry the vehicle's measured link
+// speeds to home (D-055; see linkspeed.go). Older builds already ignore any
+// type that is not data, so the version exists only so a sender knows the
+// far end will answer - without it the vehicle would repeat an unanswerable
+// message forever.
 const (
-	Version    = 3
+	Version    = 4
 	MinVersion = 1
 )
 
@@ -111,6 +118,11 @@ const (
 	TypeData   uint8 = 0
 	TypeProbe  uint8 = 1
 	TypeReport uint8 = 2
+
+	// TypeLinkSpeed and TypeLinkSpeedAck are version 4. Both carry their
+	// content as payload; see linkspeed.go.
+	TypeLinkSpeed    uint8 = 3
+	TypeLinkSpeedAck uint8 = 4
 )
 
 // Traffic classes, set by internal/classify from the inner packet.
@@ -199,8 +211,8 @@ const (
 )
 
 // carriesFlowSeq is the rule for where the flow sequence field appears. It is
-// implied rather than flagged: every input is already in the base header, and
-// it keeps the last flag bit free for the next version's capability.
+// implied rather than flagged: every input is already in the base header,
+// which kept the last flag bit free for version 4's capability.
 func carriesFlowSeq(version, typ, class uint8) bool {
 	return version >= 3 && typ == TypeData && class == ClassBulk
 }
@@ -269,6 +281,11 @@ const (
 	// flagCapableV3 says "I can read version 3". A version 3 build sets both
 	// bits, so a version 2 peer still sees the one it understands.
 	flagCapableV3 = 1 << 6
+
+	// flagCapableV4 says "I can read version 4". It is the last flag bit, so
+	// a version 5 will have to advertise some other way - an extension
+	// block, or a capability carried in a packet type older builds ignore.
+	flagCapableV4 = 1 << 7
 )
 
 var (
@@ -431,7 +448,7 @@ func (h *Header) AppendTo(dst []byte, version uint8, key []byte) []byte {
 
 	// Advertised on every packet, whatever version this one is encoded as.
 	// See flagCapable: it is what lets the two ends find each other.
-	flags := byte(flagCapable | flagCapableV3)
+	flags := byte(flagCapable | flagCapableV3 | flagCapableV4)
 	if len(h.Echo) > 0 {
 		flags |= flagEcho
 	}
@@ -529,6 +546,9 @@ func Parse(b []byte, key []byte) (Header, []byte, uint8, error) {
 	}
 	if b[1]&flagCapableV3 != 0 && negotiated < 3 {
 		negotiated = 3
+	}
+	if b[1]&flagCapableV4 != 0 && negotiated < 4 {
+		negotiated = 4
 	}
 	if negotiated > Version {
 		negotiated = Version

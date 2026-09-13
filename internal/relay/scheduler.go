@@ -3,14 +3,11 @@ package relay
 import (
 	"fmt"
 	"log"
-	"net"
-	"os"
 	"sort"
 	"sync/atomic"
 	"time"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
-	"github.com/anthonysecco/OpenMultiPath/internal/diag"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 	"github.com/anthonysecco/OpenMultiPath/internal/usage"
 )
@@ -209,36 +206,21 @@ type scheduler struct {
 	switchingTo    uint8
 	switchingSince time.Duration
 
-	// pin is an operator-requested override (D-048): force one flow onto
-	// one path, bypassing D-044's hash and every gate above it. Set by
-	// watchDiagPin from a file ompui writes, read by txFor on the data
-	// path, so it needs its own synchronisation rather than living with
-	// the fields above that the evaluation goroutine owns alone.
-	pin atomic.Pointer[diagPin]
-
-	// nowFn is where txFor gets wall-clock time to check the pin's
-	// deadline. A field rather than a bare time.Now() so a test can hold
-	// it still; every other clock read in this file goes through the
-	// session's synthetic elapsed time, but the pin's deadline comes from
-	// ompui as a wall-clock Unix timestamp, since ompui has no way to know
-	// the daemon's synthetic clock.
-	nowFn func() time.Time
-
 	// peerResequences reports whether the far end can put a spread flow
 	// back in order, which is wire version 3. The cascade never runs
 	// without it.
 	peerResequences func() bool
 
-	// clockFn is the session clock, read per packet by the cascade's token
-	// buckets. A field so tests can drive it.
-	clockFn func() time.Duration
+	// hasRoom reports whether a path's shaper can take more bulk before
+	// the cascade spills onto the next path (D-055). The session's shapers
+	// in every real build; a field so tests can say which paths are full.
+	hasRoom func(id uint8) bool
 
 	// The cascade's evaluation state, owned by the evaluation goroutine:
 	// the fill order held across evaluations, the swaps waiting out their
-	// hysteresis, each path's controller, and the counters last read.
+	// hysteresis, and the counters last read.
 	cascadeOrder  []uint8
 	swapFor       map[[2]uint8]int
-	caps          map[uint8]*capCtl
 	lastBulkBytes [256]uint64
 	lastBulkAt    time.Duration
 
@@ -251,42 +233,9 @@ type scheduler struct {
 	// here.
 	bulkBytes [256]atomic.Uint64
 
-	// tokens and tokensAt are the cascade's token buckets, owned by the one
-	// goroutine reading the local endpoint.
-	tokens   [256]float64
-	tokensAt [256]time.Duration
-
-	// overflowed counts bulk sent past every allowance onto the least-queued
-	// path; see pickCascade.
+	// overflowed counts bulk sent with every path in the cascade backed up;
+	// see pickCascade.
 	overflowed atomic.Uint64
-
-	// exhaustedCount is, per path, how many bulk packets found its allowance
-	// spent; lastExhausted the count the evaluation last read. Demand
-	// evidence for the controller.
-	exhaustedCount [256]atomic.Uint64
-	lastExhausted  [256]uint64
-}
-
-// clock is the session clock, for the data path.
-func (s *scheduler) clock() time.Duration {
-	if s.clockFn != nil {
-		return s.clockFn()
-	}
-	if s.sess != nil {
-		return s.sess.elapsed()
-	}
-	return 0
-}
-
-// diagPin is a matched, resolved pin: the exact hash the target flow's
-// packets will produce, the path to force them onto, and the deadline
-// after which the pin stops applying even if nothing ever clears the file.
-// The deadline is the backstop - see diag.PinRequest - for ompui crashing
-// or being killed mid-test, so a stuck pin cannot silently outlive it.
-type diagPin struct {
-	flow    uint32
-	path    uint8
-	expires time.Time
 }
 
 func newScheduler(sess *session, cfg *config.Holder, candidates func() []uint8) *scheduler {
@@ -296,10 +245,10 @@ func newScheduler(sess *session, cfg *config.Holder, candidates func() []uint8) 
 		candidates: candidates,
 		source:     sess.metrics,
 		machines:   make(map[uint8]*machine),
-		nowFn:      time.Now,
 	}
 	if sess != nil {
 		s.peerResequences = func() bool { return sess.emitVersion() >= 3 }
+		s.hasRoom = func(id uint8) bool { return sess.shaperFor(id).hasRoom() }
 	}
 	s.cur.Store(emptyDecision)
 	return s
@@ -362,15 +311,6 @@ func (s *scheduler) txFor(class uint8, flow uint32) []uint8 {
 		return s.txPaths(class)
 	}
 
-	// D-048's operator override, checked before any gate below: the whole
-	// point is to answer what a specific link does under load, including a
-	// link the gates currently exclude, which requires routing around them
-	// rather than through them. Scoped to exactly the one flow ompui named
-	// and expiring on its own even if the file that set it is never
-	// cleared - see diagPin.
-	if pin := s.pinnedPath(flow); pin != nil {
-		return pin
-	}
 	// Bulk and transactional both load-balance per flow across the healthy
 	// set. Transactional joins bulk here because pinning it to the primary
 	// leaves a second link idle for exactly the multi-connection traffic -
@@ -392,20 +332,6 @@ func (s *scheduler) txFor(class uint8, flow uint32) []uint8 {
 		return d.tx
 	}
 	return d.txTrans
-}
-
-// pinnedPath is D-048's operator override for one flow, or nil. The pin
-// expires on its own even if the file that set it is never cleared.
-func (s *scheduler) pinnedPath(flow uint32) []uint8 {
-	p := s.pin.Load()
-	if p == nil || p.flow != flow {
-		return nil
-	}
-	if s.nowFn().Before(p.expires) {
-		return []uint8{p.path}
-	}
-	s.pin.Store(nil)
-	return nil
 }
 
 // deliveringForSpread reports whether a path is actually getting bytes to the
@@ -473,17 +399,17 @@ func (s *scheduler) pathName(id uint8) string {
 // it is not losing packets and its jitter is fine. It is simply small, and
 // stability has no term for size.
 //
-// Unknown is permission, as everywhere a limit is read (D-023): a path with no
-// measured ceiling is never excluded, because never having watched a link fill
-// up is not evidence that it is small. A zero best means no candidate has an
-// opinion and the gate is off entirely. Between them these two cases are also
+// Unknown is permission, as everywhere a limit is read (D-055): a path whose
+// speed has never been measured is never excluded, because an unmeasured link
+// is not evidence of a small one. A zero best means no candidate has been
+// measured and the gate is off entirely. Between them these two cases are also
 // what keeps the gate from ever emptying a non-empty spread - the best
 // candidate is 100% of itself, and the share bound tops out at 100.
-func undersizedForSpread(limitKbps, bestKbps float64, c config.Config) bool {
-	if limitKbps <= 0 || bestKbps <= 0 {
+func undersizedForSpread(shapedKbps, bestKbps float64, c config.Config) bool {
+	if shapedKbps <= 0 || bestKbps <= 0 {
 		return false
 	}
-	return limitKbps*100 < bestKbps*float64(c.BulkSpreadMinSharePercent)
+	return shapedKbps*100 < bestKbps*float64(c.BulkSpreadMinSharePercent)
 }
 
 // flowHash is a stable hash of an inner IPv4 packet's 5-tuple, used to pin a
@@ -510,79 +436,6 @@ func flowHash(p []byte) uint32 {
 		}
 	}
 	return h
-}
-
-// flowHashTuple computes exactly what flowHash would compute for a packet
-// with this 5-tuple, without needing a real packet to hash. Used only to
-// resolve a diag.PinRequest (D-048): ompui knows the 5-tuple its own probe
-// traffic will carry before it sends a single packet, and this lets it ask
-// the daemon to recognise that flow by the same hash the data path already
-// computes, rather than adding a second way to identify a flow.
-//
-// Kept byte-for-byte identical to flowHash on purpose - see
-// TestFlowHashTupleMatchesFlowHash - so the two can never quietly drift
-// apart.
-func flowHashTuple(src, dst net.IP, proto uint8, srcPort, dstPort uint16) uint32 {
-	const (
-		offset = 2166136261
-		prime  = 16777619
-	)
-	s4, d4 := src.To4(), dst.To4()
-	if s4 == nil || d4 == nil {
-		return 0
-	}
-	h := uint32(offset)
-	for _, b := range s4 {
-		h = (h ^ uint32(b)) * prime
-	}
-	for _, b := range d4 {
-		h = (h ^ uint32(b)) * prime
-	}
-	h = (h ^ uint32(proto)) * prime
-	if proto == 6 || proto == 17 {
-		for _, b := range [4]byte{byte(srcPort >> 8), byte(srcPort), byte(dstPort >> 8), byte(dstPort)} {
-			h = (h ^ uint32(b)) * prime
-		}
-	}
-	return h
-}
-
-// watchDiagPin polls path for an operator-requested pin (D-048), the same
-// way config.Holder.Watch polls settings - mtime and size, not "newer", for
-// the reasons given there: a restored backup or a clock stepped backwards
-// must not hide a real change.
-//
-// Nothing calls this on the responder. Only the initiator chooses among
-// more than one physical path, so only it has a hash for an override to
-// replace.
-func (s *scheduler) watchDiagPin(path string) {
-	var last time.Time
-	var lastSize int64
-	var seen bool
-	for range time.Tick(500 * time.Millisecond) {
-		fi, err := os.Stat(path)
-		if err != nil {
-			if seen {
-				s.pin.Store(nil)
-				seen = false
-			}
-			continue
-		}
-		if seen && fi.ModTime().Equal(last) && fi.Size() == lastSize {
-			continue
-		}
-		last, lastSize, seen = fi.ModTime(), fi.Size(), true
-
-		req, err := diag.ReadPin(path)
-		if err != nil {
-			log.Printf("diag pin: %v, ignoring", err)
-			continue
-		}
-		flow := flowHashTuple(net.ParseIP(req.SrcIP), net.ParseIP(req.DstIP), req.Protocol, req.SrcPort, req.DstPort)
-		expires := time.Unix(req.ExpiresUnix, 0)
-		s.pin.Store(&diagPin{flow: flow, path: req.PathID, expires: expires})
-		log.Printf("diag pin: forcing flow %d onto %s until %s", flow, s.pathName(req.PathID), expires.Format(time.RFC3339))
-	}
 }
 
 // admit reports whether a packet of this class should be sent at all.
@@ -720,21 +573,21 @@ func (s *scheduler) steerBulk(now time.Duration, d *decision, c config.Config, e
 		return !(rtActive && carrying[sc.m.id])
 	}
 
-	// The best measured ceiling among the candidates, which is the bar the
+	// The best measured speed among the candidates, which is the bar the
 	// others have to be worth a fraction of (D-045). Taken over the
 	// candidates and not over eligible: a path real-time is holding is not
 	// in the running for bulk, so its capacity must not set a bar that
 	// knocks out the links that are.
 	var bestKbps float64
 	for _, sc := range eligible {
-		if spreadable(sc) && sc.m.bw.limitKbps > bestKbps {
-			bestKbps = sc.m.bw.limitKbps
+		if spreadable(sc) && sc.m.shapedKbps > bestKbps {
+			bestKbps = sc.m.shapedKbps
 		}
 	}
 
 	d.txBulkSpread = d.txBulkSpread[:0]
 	for _, sc := range eligible {
-		if !spreadable(sc) || undersizedForSpread(sc.m.bw.limitKbps, bestKbps, c) {
+		if !spreadable(sc) || undersizedForSpread(sc.m.shapedKbps, bestKbps, c) {
 			continue
 		}
 		d.txBulkSpread = append(d.txBulkSpread, sc.m.id)
@@ -1154,14 +1007,14 @@ func (s *scheduler) offeredKbps(eligible []scored) float64 {
 		return 0
 	}
 	if m, ok := s.metricOf(s.primary, eligible); ok {
-		return m.bw.sendKbps
+		return m.sendKbps
 	}
 	return 0
 }
 
 // canTake reports whether a path may be offered this much on top of what it
-// is already doing. A path with no capacity estimate always may - the gate
-// refuses on evidence, never on ignorance.
+// is already doing. A path whose speed was never measured always may - the
+// gate refuses on evidence, never on ignorance.
 func (s *scheduler) canTake(sc scored, loadKbps float64, c config.Config) bool {
 	// Duplication is the first thing sacrificed to a budget, and by some
 	// distance the easiest: a second copy is by definition redundant, so
@@ -1172,7 +1025,23 @@ func (s *scheduler) canTake(sc scored, loadKbps float64, c config.Config) bool {
 	if sc.m.budget.Band != usage.Green {
 		return false
 	}
-	return sc.m.bw.canCarry(loadKbps, c)
+	return canCarry(sc.m, loadKbps, c)
+}
+
+// canCarry reports whether a path may be offered loadKbps on top of what it
+// is already sending, with the configured headroom on top, against its shaped
+// speed (D-055).
+//
+// A path never measured always may. This is a soft gate: it exists to keep a
+// mirrored call off a link measured too small to hold it, not to make a path
+// ineligible, and every caller keeps its own fallback for when it would leave
+// nothing at all.
+func canCarry(m pathMetric, loadKbps float64, c config.Config) bool {
+	if m.shapedKbps <= 0 {
+		return true
+	}
+	needed := (m.sendKbps + loadKbps) * (1 + float64(c.BWHeadroomPercent)/100)
+	return needed <= m.shapedKbps
 }
 
 // adopt takes a path as primary with no overlap. Used only when there is no

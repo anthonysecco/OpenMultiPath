@@ -87,6 +87,7 @@ up() {
 	echo $! > "$DIR/home/pid"
 	inrv "$bin" -role initiator -tun omp0 -tun-addr 10.30.0.2/24 -tun-mtu 1288 \
 		-remote "10.20.1.1:$PORT" -paths rv-p0,rv-p1 -state "$DIR/rv/state.json" -record "" -usage "" \
+		-linkspeed "$DIR/rv/linkspeed.json" \
 		-config "$DIR/rv/config.json" -auth-key "$DIR/none" -wg-interface omp0 -node lab-rv \
 		>"$DIR/rv/ompd.log" 2>&1 &
 	echo $! > "$DIR/rv/pid"

@@ -1,7 +1,6 @@
 package relay
 
 import (
-	"net"
 	"testing"
 	"time"
 
@@ -25,6 +24,9 @@ type world struct {
 	// Paths are asymmetric and this is a real failure, so it needs to be
 	// expressible - it is what a handover to a one-way path looks like.
 	mute map[uint8]bool
+
+	// full names paths whose shaper is backed up, for the cascade's spill.
+	full map[uint8]bool
 }
 
 func newWorld(t *testing.T, paths ...pathMetric) *world {
@@ -427,8 +429,8 @@ func TestDuplicationSkipsAPathTooSmallForTheLoad(t *testing.T) {
 
 	// Path 1 carries the transfer at 6 Mbps. Path 0 is the satellite link,
 	// idle, with a ceiling measured back when something did use it.
-	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 6000, limitKbps: 40000, haveCeiling: true} })
-	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 10, limitKbps: 512, haveCeiling: true} })
+	w.set(1, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 6000, 40000 })
+	w.set(0, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 10, 512 })
 	w.tick(w.c.PromoteIntervals + 5)
 
 	// Path 1 goes bad enough to be called unstable, which is what turns
@@ -454,8 +456,8 @@ func TestDuplicationUsesAPathWithTheCapacity(t *testing.T) {
 	w.c.DuplicateMode = config.DuplicateUnstable
 	w.s.cfg = config.NewHolder(w.c)
 
-	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 6000, limitKbps: 40000, haveCeiling: true} })
-	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 10, limitKbps: 25000, haveCeiling: true} })
+	w.set(1, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 6000, 40000 })
+	w.set(0, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 10, 25000 })
 	w.tick(w.c.PromoteIntervals + 5)
 
 	w.set(1, func(p *pathMetric) { p.recentLoss = 3 })
@@ -475,7 +477,7 @@ func TestDuplicationAllowedWhenCapacityIsUnknown(t *testing.T) {
 	w.c.DuplicateMode = config.DuplicateUnstable
 	w.s.cfg = config.NewHolder(w.c)
 
-	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 6000, limitKbps: 40000, haveCeiling: true} })
+	w.set(1, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 6000, 40000 })
 	// Path 0: never loaded, so limitKbps is zero - no opinion.
 	w.tick(w.c.PromoteIntervals + 5)
 
@@ -492,8 +494,8 @@ func TestDuplicationAllowedWhenCapacityIsUnknown(t *testing.T) {
 // trade the transfer for a nicer set of numbers.
 func TestHandoverBlockedByCapacityWhenMerelyOpportunistic(t *testing.T) {
 	w := newWorld(t, path(0, 20), path(1, 60))
-	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 6000, limitKbps: 40000, haveCeiling: true} })
-	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 10, limitKbps: 512, haveCeiling: true} })
+	w.set(1, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 6000, 40000 })
+	w.set(0, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 10, 512 })
 
 	// Start with path 1 as primary by making path 0 briefly unavailable.
 	w.set(0, func(p *pathMetric) { p.bound = false })
@@ -514,8 +516,8 @@ func TestHandoverBlockedByCapacityWhenMerelyOpportunistic(t *testing.T) {
 // principle 5, fail to a working state.
 func TestHandoverToASmallPathStillHappensBelowTheFloor(t *testing.T) {
 	w := newWorld(t, path(0, 20), path(1, 60))
-	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 6000, limitKbps: 40000, haveCeiling: true} })
-	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 10, limitKbps: 512, haveCeiling: true} })
+	w.set(1, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 6000, 40000 })
+	w.set(0, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 10, 512 })
 
 	w.set(0, func(p *pathMetric) { p.bound = false })
 	w.tick(w.c.PromoteIntervals + 5)
@@ -548,8 +550,8 @@ func TestHandoverToASmallPathStillHappensBelowTheFloor(t *testing.T) {
 func TestTiedQualityLeavesTheCallAndSpreadsBulkAnyway(t *testing.T) {
 	w := newWorld(t, path(0, 30), path(1, 35))
 	w.s.setClassifying(true)
-	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 3, limitKbps: 506, haveCeiling: true} })
-	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 5, limitKbps: 2071, haveCeiling: true} })
+	w.set(0, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 3, 506 })
+	w.set(1, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 5, 2071 })
 
 	// Establish path 0 as primary the way the field case did.
 	w.set(1, func(p *pathMetric) { p.bound = false })
@@ -580,8 +582,8 @@ func TestTiedQualityLeavesTheCallAndSpreadsBulkAnyway(t *testing.T) {
 // is not displaced by a smaller path, however good it looks.
 func TestCapacityNeverMovesOntoASmallerPath(t *testing.T) {
 	w := newWorld(t, path(0, 30), path(1, 35))
-	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 3, limitKbps: 506, haveCeiling: true} })
-	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 5, limitKbps: 2071, haveCeiling: true} })
+	w.set(0, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 3, 506 })
+	w.set(1, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 5, 2071 })
 
 	w.set(0, func(p *pathMetric) { p.bound = false })
 	w.tick(w.c.PromoteIntervals + 5)
@@ -598,7 +600,7 @@ func TestCapacityNeverMovesOntoASmallerPath(t *testing.T) {
 // displace a working primary on a number nobody has.
 func TestUnmeasuredCapacityDoesNotMovePrimary(t *testing.T) {
 	w := newWorld(t, path(0, 30), path(1, 35))
-	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 3, limitKbps: 506, haveCeiling: true} })
+	w.set(0, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 3, 506 })
 	// Path 1 has no estimate at all.
 
 	w.set(1, func(p *pathMetric) { p.bound = false })
@@ -1429,72 +1431,6 @@ func TestFlowHashStableAndDistinct(t *testing.T) {
 	}
 }
 
-// flowHashTuple (used to resolve a diag.PinRequest, D-048) must produce
-// exactly what flowHash produces for a real packet carrying the same
-// 5-tuple - ompui computes the hash before sending a single byte, from
-// fields it knows ahead of time, and the daemon has to recognise the same
-// flow from the packets that actually arrive.
-func TestFlowHashTupleMatchesFlowHash(t *testing.T) {
-	pkt := func(sp, dp byte) []byte {
-		p := make([]byte, 24)
-		p[0] = 0x45
-		p[9] = 6
-		copy(p[12:16], []byte{10, 0, 0, 5})
-		copy(p[16:20], []byte{1, 1, 1, 1})
-		p[20], p[21], p[22], p[23] = 0, sp, 0, dp
-		return p
-	}
-	want := flowHash(pkt(1, 80))
-	got := flowHashTuple(net.IPv4(10, 0, 0, 5), net.IPv4(1, 1, 1, 1), 6, 1, 80)
-	if got != want {
-		t.Fatalf("flowHashTuple = %d, want %d (flowHash on the equivalent packet)", got, want)
-	}
-	// A different port must diverge here exactly as it does for flowHash -
-	// otherwise a pin could silently match the wrong flow.
-	if other := flowHashTuple(net.IPv4(10, 0, 0, 5), net.IPv4(1, 1, 1, 1), 6, 1, 81); other == want {
-		t.Fatal("flowHashTuple did not vary with destination port")
-	}
-}
-
-// A pin (D-048) forces its named flow onto its named path, bypassing the
-// spread set entirely - the point is to reach a path the gates would
-// otherwise exclude. A flow that does not match the pin, and a flow that
-// does but whose pin has expired, both fall through to ordinary txFor.
-func TestTxForHonoursDiagPin(t *testing.T) {
-	fixedNow := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
-	s := &scheduler{nowFn: func() time.Time { return fixedNow }}
-	s.cur.Store(&decision{
-		tx: []uint8{0, 1}, txBulk: []uint8{1}, txTrans: []uint8{0},
-		txBulkSpread: []uint8{0, 1},
-	})
-
-	const pinnedFlow = uint32(4242)
-	s.pin.Store(&diagPin{flow: pinnedFlow, path: 7, expires: fixedNow.Add(time.Minute)})
-
-	if got := s.txFor(protocol.ClassBulk, pinnedFlow); !sameSet(got, []uint8{7}) {
-		t.Fatalf("pinned flow = %v, want forced onto [7]", got)
-	}
-	if got := s.txFor(protocol.ClassTransactional, pinnedFlow); !sameSet(got, []uint8{7}) {
-		t.Fatalf("pinned flow (transactional) = %v, want forced onto [7]", got)
-	}
-	// Real-time must never be steered by the pin, even if its hash happened
-	// to match - redundancy across the whole set is the one thing that must
-	// never be overridden for a call.
-	if got := s.txFor(protocol.ClassRealtime, pinnedFlow); !sameSet(got, []uint8{0, 1}) {
-		t.Fatalf("real-time with a matching pin = %v, want the full duplication set unaffected", got)
-	}
-	// A different flow is untouched by the pin and follows the ordinary hash.
-	if got := s.txFor(protocol.ClassBulk, pinnedFlow+1); sameSet(got, []uint8{7}) {
-		t.Fatalf("unrelated flow %v was routed to the pinned path", got)
-	}
-
-	// An expired pin stops applying, even though the flow still matches.
-	s.pin.Store(&diagPin{flow: pinnedFlow, path: 7, expires: fixedNow.Add(-time.Second)})
-	if got := s.txFor(protocol.ClassBulk, pinnedFlow); sameSet(got, []uint8{7}) {
-		t.Fatalf("expired pin still forced flow onto [7]: %v", got)
-	}
-}
-
 // txFor is what the data path actually calls: real-time duplicates across its
 // whole set, while bulk and transactional each land on exactly one of the
 // load-balancing paths chosen by the flow hash, and different flows use
@@ -1542,15 +1478,15 @@ func spreadSet(d *decision) map[uint8]bool {
 // machine calls it stable, correctly, and D-044's filter let it into the
 // spread as a full peer. The hash then handed it half of every download.
 //
-// The observed symptom was an iperf3 run that came back either 121 Mbit/s or
-// 0.35 Mbit/s depending on nothing but the source port, 50/50 across eight
-// flows. Stability was never the missing test; size was.
+// The observed symptom was a multi-flow transfer that came back either
+// 121 Mbit/s or 0.35 Mbit/s depending on nothing but the source port, 50/50
+// across eight flows. Stability was never the missing test; size was.
 func TestSpreadExcludesAStableButTinyPath(t *testing.T) {
 	w := newWorld(t, path(0, 30), path(1, 40))
 	w.s.setClassifying(true)
 
-	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 800, limitKbps: 30000, haveCeiling: true} })
-	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 600, limitKbps: 636, haveCeiling: true} })
+	w.set(0, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 800, 30000 })
+	w.set(1, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 600, 636 })
 	d := w.tick(w.c.PromoteIntervals + 5)
 
 	// The premise: both links are healthy. If the state machine had called
@@ -1576,8 +1512,8 @@ func TestSpreadKeepsAPathWorthAggregating(t *testing.T) {
 	w := newWorld(t, path(0, 30), path(1, 40))
 	w.s.setClassifying(true)
 
-	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 800, limitKbps: 30000, haveCeiling: true} })
-	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 600, limitKbps: 5000, haveCeiling: true} })
+	w.set(0, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 800, 30000 })
+	w.set(1, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 600, 5000 })
 	d := w.tick(w.c.PromoteIntervals + 5)
 
 	if !spreadSet(d)[0] || !spreadSet(d)[1] {
@@ -1594,8 +1530,8 @@ func TestSpreadAdmitsAPathWithNoMeasuredCeiling(t *testing.T) {
 	w := newWorld(t, path(0, 30), path(1, 40))
 	w.s.setClassifying(true)
 
-	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 800, limitKbps: 30000, haveCeiling: true} })
-	w.set(1, func(p *pathMetric) { p.bw = bwView{} }) // never loaded, no opinion
+	w.set(0, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 800, 30000 })
+	w.set(1, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 0, 0 }) // never measured, no opinion
 	d := w.tick(w.c.PromoteIntervals + 5)
 
 	if !spreadSet(d)[1] {
@@ -1613,8 +1549,8 @@ func TestSpreadIsNeverEmptiedByTheGate(t *testing.T) {
 	w.s.cfg = config.NewHolder(w.c)
 	w.s.setClassifying(true)
 
-	w.set(0, func(p *pathMetric) { p.bw = bwView{sendKbps: 800, limitKbps: 30000, haveCeiling: true} })
-	w.set(1, func(p *pathMetric) { p.bw = bwView{sendKbps: 600, limitKbps: 29999, haveCeiling: true} })
+	w.set(0, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 800, 30000 })
+	w.set(1, func(p *pathMetric) { p.sendKbps, p.shapedKbps = 600, 29999 })
 	d := w.tick(w.c.PromoteIntervals + 5)
 
 	if len(d.txBulkSpread) == 0 {

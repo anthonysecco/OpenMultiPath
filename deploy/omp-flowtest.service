@@ -1,0 +1,26 @@
+# Home end of the ompd-native UDP flow test (D-053), backing the UI's
+# "Measure Link Speed" button. No external dependency - the test is entirely
+# this project's own code.
+#
+# Bound to the transport hub address 10.20.1.1, reachable only through the
+# WireGuard tunnels - never the public interface. If wgm is not up yet at
+# boot the bind fails and systemd retries until it is; that is the whole
+# reason for Restart=always here rather than a hard ordering dependency on
+# an interface systemd does not manage.
+[Unit]
+Description=OpenMultiPath uplink diagnostic server (flow test)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/omp-flowtest -listen 10.20.1.1:5202
+Restart=always
+RestartSec=2
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

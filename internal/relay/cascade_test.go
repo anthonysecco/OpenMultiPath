@@ -3,7 +3,6 @@ package relay
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
@@ -14,20 +13,18 @@ func cascadeWorld(t *testing.T, paths ...pathMetric) *world {
 	t.Helper()
 	w := newWorld(t, paths...)
 	w.s.peerResequences = func() bool { return true }
-	w.s.clockFn = func() time.Duration { return w.now }
+	w.full = map[uint8]bool{}
+	w.s.hasRoom = func(id uint8) bool { return !w.full[id] }
 	return w
 }
 
-// reported is a path whose send direction the peer is reporting on, which is
-// what the cascade's controller acts on.
+// reported is a path whose send direction the peer is reporting on.
 func reported(id uint8, rttMs float64) pathMetric {
 	p := path(id, rttMs)
 	p.haveTx = true
 	p.rttFloorMs = rttMs
 	p.txBurstRatio = 1
-	// Busy enough that its reports are measurements rather than noise; see
-	// the thin-load guard in capCtl.update.
-	p.bw.sendKbps = 50_000
+	p.sendKbps = 50_000
 	return p
 }
 
@@ -49,27 +46,6 @@ func (w *world) sendBulk(n, size int) (placed map[uint8]int, dropped int) {
 		}
 	}
 	return placed, dropped
-}
-
-// pumpTick offers demandKbps of bulk spread evenly across one evaluation
-// interval, the way a download actually arrives, and then evaluates. Sending
-// a burst at one instant would never let a token bucket refill.
-func (w *world) pumpTick(demandKbps float64) (*decision, map[uint8]int, int) {
-	const steps = 20
-	slice := w.c.EvalInterval() / steps
-	perSlice := int(demandKbps*125*slice.Seconds()/1250) + 1
-	placed, dropped := map[uint8]int{}, 0
-	start := w.now
-	for i := 0; i < steps; i++ {
-		w.now += slice
-		p, d := w.sendBulk(perSlice, 1250)
-		for id, n := range p {
-			placed[id] += n
-		}
-		dropped += d
-	}
-	w.now = start // tick advances the clock itself
-	return w.tick(1), placed, dropped
 }
 
 func ids(d *decision) []uint8 {
@@ -221,9 +197,9 @@ func TestCascadeOrderHasHysteresis(t *testing.T) {
 	}
 }
 
-// Uncapped, the first path takes everything - which is S3's "bulk always on
-// the higher-latency link until congestion is detected".
-func TestCascadeFirstPathTakesAllBulkUntilItCongests(t *testing.T) {
+// Unshaped, or shaped with room, the first path takes everything - S3's "bulk
+// always on the higher-latency link until it is full".
+func TestCascadeFirstPathTakesAllBulkUntilItIsFull(t *testing.T) {
 	w := cascadeWorld(t, reported(0, 40), reported(1, 90))
 	w.settle()
 	placed, dropped := w.sendBulk(500, 1200)
@@ -232,157 +208,52 @@ func TestCascadeFirstPathTakesAllBulkUntilItCongests(t *testing.T) {
 	}
 }
 
-// Congestion on the first path caps it, and the overflow spills onto the next.
-// Nothing is ever dropped: past every allowance bulk goes to the least-queued
-// path.
-func TestCascadeSpillsOnlyOnceTheFirstPathCongests(t *testing.T) {
+// A path whose shaper is backed up spills onto the next in the order (D-055),
+// and one that drains takes bulk again.
+func TestCascadeSpillsWhenTheFirstPathsShaperIsFull(t *testing.T) {
 	w := cascadeWorld(t, reported(0, 40), reported(1, 90))
 	w.settle()
 
-	w.sendBulk(2000, 1250) // ~50 Mbps over one evaluation, all onto path 1
-	w.set(1, func(p *pathMetric) { p.txStandingMs = float64(w.c.CascadeQueueTargetMs) * 3 })
-	w.tick(cascadeConfirmIntervals - 1)
-	w.sendBulk(2000, 1250)
-	d := w.tick(1)
-	m, ok := memberOf(d, 1)
-	if !ok || m.capKbps == 0 {
-		t.Fatalf("path 1 not capped after congesting: %+v", d.cascade)
-	}
-	if m.capKbps > m.sentKbps {
-		t.Errorf("cap %.0f kbps above the %.0f kbps that congested it", m.capKbps, m.sentKbps)
+	w.full[1] = true
+	placed, dropped := w.sendBulk(300, 1250)
+	if placed[0] != 300 || dropped != 0 {
+		t.Errorf("placed %v dropped %d with path 1 full, want all 300 spilled onto path 0", placed, dropped)
 	}
 
-	// The queue drains; the cut stands for now, and bulk past it spills.
-	w.set(1, func(p *pathMetric) { p.txStandingMs = 0 })
-	w.tick(1)
-	w.now += 10 * time.Millisecond // a little refill
-	placed, dropped := w.sendBulk(2000, 1250)
-	if placed[1] == 0 || placed[0] == 0 {
-		t.Errorf("placed %v: want path 1 up to its cap and the rest spilling onto path 0", placed)
-	}
-	if dropped != 0 {
-		t.Errorf("dropped %d; the cascade never drops bulk", dropped)
+	w.full[1] = false
+	if placed, _ = w.sendBulk(300, 1250); placed[1] != 300 {
+		t.Errorf("placed %v once path 1 drained, want it taking bulk again", placed)
 	}
 }
 
-// D-046's link lost two thirds of its traffic and never queued. Loss alone
-// must cap a path.
-func TestCascadeLossAloneCapsAPath(t *testing.T) {
+// With every path backed up, bulk goes to the first path in the order and is
+// never dropped here: the shaper's own queue is where a sender finds the
+// aggregate's limit.
+func TestCascadeOverflowsToTheFirstPathAndNeverDrops(t *testing.T) {
 	w := cascadeWorld(t, reported(0, 40), reported(1, 90))
 	w.settle()
-	w.sendBulk(1000, 1250)
-	w.set(1, func(p *pathMetric) { p.txShortLoss = float64(w.c.CascadeLossPercent) * 2 })
-	w.tick(cascadeConfirmIntervals - 1)
-	w.sendBulk(1000, 1250)
-	d := w.tick(1)
-	if m, _ := memberOf(d, 1); m.capKbps == 0 {
-		t.Error("a path losing twice the threshold with no queue was not capped")
+	w.full[0], w.full[1] = true, true
+	before := w.s.overflowed.Load()
+	placed, dropped := w.sendBulk(200, 1250)
+	if dropped != 0 || placed[1] != 200 {
+		t.Errorf("placed %v dropped %d with every path full, want all 200 on the first path 1", placed, dropped)
+	}
+	if got := w.s.overflowed.Load() - before; got != 200 {
+		t.Errorf("overflowed counted %d, want 200", got)
 	}
 }
 
-// Random radio loss below the threshold must not ratchet a healthy link down,
-// which is how cubic collapsed the uplink (D-041).
-func TestCascadeOrdinaryLossDoesNotCap(t *testing.T) {
+// Each member carries the speed its shaper holds it to, for the log and the
+// interface. Unmeasured is unshaped.
+func TestCascadeMembersCarryTheirShapedSpeed(t *testing.T) {
 	w := cascadeWorld(t, reported(0, 40), reported(1, 90))
-	w.settle()
-	w.sendBulk(1000, 1250)
-	w.set(1, func(p *pathMetric) { p.txShortLoss = float64(w.c.CascadeLossPercent) / 2 })
-	d := w.tick(10)
-	if m, _ := memberOf(d, 1); m.capKbps != 0 {
-		t.Errorf("path capped at %.0f kbps for loss below the threshold", m.capKbps)
+	w.set(1, func(p *pathMetric) { p.shapedKbps = 9_500 })
+	d := w.settle()
+	if m, _ := memberOf(d, 1); m.shapedKbps != 9_500 {
+		t.Errorf("path 1 member shaped %.0f kbps, want 9500", m.shapedKbps)
 	}
-}
-
-// Nothing reported, nothing throttled - admission control's answer, for the
-// same reason.
-func TestCascadeDoesNotThrottleWithoutEvidence(t *testing.T) {
-	w := cascadeWorld(t, path(0, 40))
-	w.settle()
-	w.set(0, func(p *pathMetric) { p.txStandingMs = 500; p.txShortLoss = 50 })
-	d := w.tick(5)
-	if m, _ := memberOf(d, 0); m.capKbps != 0 {
-		t.Errorf("capped at %.0f kbps on figures nobody reported", m.capKbps)
-	}
-	if _, dropped := w.sendBulk(100, 1250); dropped != 0 {
-		t.Errorf("dropped %d with no send-direction evidence", dropped)
-	}
-}
-
-// The call's path is cut by its own congestion exactly like any other path,
-// against the same target - and real-time is never paced.
-func TestCascadeCallsPathIsCutLikeAnyOtherPath(t *testing.T) {
-	w := cascadeWorld(t, reported(0, 40))
-	w.settle()
-
-	w.set(0, func(p *pathMetric) { p.txStandingMs = float64(w.c.CascadeQueueTargetMs) * 4 })
-	var last float64
-	for i := 0; i < 40; i++ {
-		w.sendBulk(1000, 1250)
-		d := w.tick(1)
-		m, ok := memberOf(d, 0)
-		if !ok || !m.protected {
-			t.Fatalf("the call's path is not in the cascade: %+v", d.cascade)
-		}
-		if i >= cascadeConfirmIntervals && m.capKbps == 0 {
-			t.Fatalf("evaluation %d: uncapped with its queue at four times the target", i)
-		}
-		if i >= cascadeConfirmIntervals && last != 0 && m.capKbps > last {
-			t.Fatalf("allowance rose from %.0f to %.0f kbps while the queue stood", last, m.capKbps)
-		}
-		last = m.capKbps
-	}
-	if !w.s.admitAndPlace(protocol.ClassRealtime) {
-		t.Error("real-time withheld; it is never paced")
-	}
-}
-
-// Cut at once, grown back only after a clean run: the same asymmetry on the
-// call's path as anywhere else, and no slower.
-func TestCascadeCallsPathRecoversAfterStayingClear(t *testing.T) {
-	w := cascadeWorld(t, reported(0, 40))
-	w.settle()
-	w.sendBulk(1000, 1250)
-	w.set(0, func(p *pathMetric) { p.txStandingMs = float64(w.c.CascadeQueueTargetMs) * 2 })
-	w.tick(cascadeConfirmIntervals - 1)
-	w.sendBulk(1000, 1250)
-	d := w.tick(1)
-	capAfterCut := func(d *decision) float64 { m, _ := memberOf(d, 0); return m.capKbps }
-	cut := capAfterCut(d)
-	if cut == 0 {
-		t.Fatal("no cut to recover from")
-	}
-
-	w.set(0, func(p *pathMetric) { p.txStandingMs = 0 })
-	need := w.c.CascadeRecoverIntervals
-	for i := 0; i < need-1; i++ {
-		if d, _, _ = w.pumpTick(1_000_000); capAfterCut(d) != cut && capAfterCut(d) > cut {
-			t.Fatalf("allowance grew from %.0f to %.0f after %d clean evaluations, want none before %d",
-				cut, capAfterCut(d), i+1, need)
-		}
-	}
-	for i := 0; i < 3; i++ {
-		d, _, _ = w.pumpTick(1_000_000)
-	}
-	if got := capAfterCut(d); got != 0 && got <= cut {
-		t.Errorf("allowance never grew after staying clear and in use (still %.0f kbps)", got)
-	}
-}
-
-// A cap nobody is pushing against is not evidence of headroom.
-func TestCascadeCapGrowsOnlyWhileInUse(t *testing.T) {
-	w := cascadeWorld(t, reported(0, 40), reported(1, 90))
-	w.settle()
-	w.sendBulk(1000, 1250)
-	w.set(1, func(p *pathMetric) { p.txStandingMs = float64(w.c.CascadeQueueTargetMs) * 2 })
-	w.tick(cascadeConfirmIntervals - 1)
-	w.sendBulk(1000, 1250)
-	d := w.tick(1)
-	m, _ := memberOf(d, 1)
-	cut := m.capKbps
-	w.set(1, func(p *pathMetric) { p.txStandingMs = 0 })
-	d = w.tick(w.c.CascadeRecoverIntervals * 4) // clean, but no bulk sent
-	if m, _ = memberOf(d, 1); m.capKbps != cut {
-		t.Errorf("idle cap grew from %.0f to %.0f kbps", cut, m.capKbps)
+	if m, _ := memberOf(d, 0); m.shapedKbps != 0 {
+		t.Errorf("unmeasured path 0 member shaped %.0f kbps, want 0", m.shapedKbps)
 	}
 }
 
@@ -442,19 +313,19 @@ func TestCascadeKeepsTransactionalOnTheCallsPath(t *testing.T) {
 	}
 }
 
-// Real-time is untouched by the cascade: duplicated as ever, never dropped.
-func TestCascadeNeverPacesRealtime(t *testing.T) {
+// Real-time is untouched by the cascade: duplicated as ever, never dropped,
+// even with every path's shaper backed up.
+func TestCascadeNeverPlacesRealtime(t *testing.T) {
 	w := cascadeWorld(t, reported(0, 40))
 	w.settle()
-	w.set(0, func(p *pathMetric) { p.txStandingMs = 1000 })
-	for i := 0; i < 20; i++ {
-		w.sendBulk(1000, 1250)
-		w.tick(1)
-	}
+	w.full[0] = true
 	for i := 0; i < 200; i++ {
 		if tx, ok := w.s.txForPacket(protocol.ClassRealtime, uint32(i), 200); !ok || len(tx) == 0 {
 			t.Fatal("real-time packet withheld by the cascade")
 		}
+	}
+	if !w.s.admitAndPlace(protocol.ClassRealtime) {
+		t.Error("real-time withheld")
 	}
 }
 
@@ -466,97 +337,6 @@ func (s *scheduler) admitAndPlace(class uint8) bool {
 	}
 	_, ok := s.txForPacket(class, 1, 200)
 	return ok
-}
-
-// A cut made while almost no bulk was on the path - the queue was a page load
-// or a download still classed transactional - is not evidence against bulk.
-// Once the path is clean it goes back to uncapped instead of crawling up from
-// the floor.
-func TestCascadeBlamelessCutIsForgotten(t *testing.T) {
-	w := cascadeWorld(t, reported(0, 40), reported(1, 90))
-	w.settle()
-	w.set(1, func(p *pathMetric) { p.txStandingMs = float64(w.c.CascadeQueueTargetMs) * 3 })
-	d := w.tick(cascadeConfirmIntervals) // no bulk sent at all
-	if m, _ := memberOf(d, 1); m.capKbps == 0 {
-		t.Fatal("no cut to forget")
-	}
-	w.set(1, func(p *pathMetric) { p.txStandingMs = 0 })
-	d = w.tick(w.c.CascadeRecoverIntervals + 1)
-	if m, _ := memberOf(d, 1); m.capKbps != 0 {
-		t.Errorf("blameless cut still in force at %.0f kbps after the path stayed clean", m.capKbps)
-	}
-}
-
-// Once a path has congested, its allowance is held near what actually arrived,
-// so a sender's excursions above it spill rather than queue - the difference
-// between BBR aggregating and not.
-func TestCascadeAllowanceTracksWhatArrivedAfterCongestion(t *testing.T) {
-	w := cascadeWorld(t, reported(0, 40), reported(1, 90))
-	w.settle()
-	w.pumpTick(50_000)
-	w.set(1, func(p *pathMetric) { p.txStandingMs = float64(w.c.CascadeQueueTargetMs) * 3 })
-	w.pumpTick(50_000)
-	w.pumpTick(50_000)
-	// The link now carries 20 Mbit whatever it is offered, and says so.
-	w.set(1, func(p *pathMetric) { p.txStandingMs = 0; p.txRxKbps = 20_000 })
-	var d *decision
-	for i := 0; i < 30; i++ {
-		d, _, _ = w.pumpTick(50_000)
-	}
-	m, _ := memberOf(d, 1)
-	if m.capKbps == 0 || m.capKbps > 20_000*cascadePeakHeadroom*1.01 {
-		t.Errorf("allowance %.0f kbps on a path delivering 20000; want at most %.0f", m.capKbps, 20_000*cascadePeakHeadroom)
-	}
-}
-
-// The receive rate the peer reports wins when it is lower: that is the link
-// being full while its buffer hides it.
-func TestBulkDeliveredPrefersWhatArrived(t *testing.T) {
-	m := reported(0, 40)
-	m.bw.sendKbps = 30_000
-	m.txRxKbps = 21_000
-	if got := bulkDeliveredKbps(m, 29_000); got < 19_900 || got > 20_100 {
-		t.Errorf("delivered %.0f kbps, want the 21000 received less the 1000 of other traffic", got)
-	}
-	m.txRxKbps = 0
-	if got := bulkDeliveredKbps(m, 29_000); got != 29_000 {
-		t.Errorf("delivered %.0f kbps with no receive rate, want the sent figure", got)
-	}
-}
-
-// A path carrying next to nothing reports single samples. Read as congestion
-// they cut idle links to the floor on the vehicle, where they never then
-// carried enough to be measured properly.
-func TestCascadeIgnoresQueueReadingsOnAnIdlePath(t *testing.T) {
-	w := cascadeWorld(t, reported(0, 40), reported(1, 90))
-	w.set(1, func(p *pathMetric) { p.bw.sendKbps = 20 })
-	w.settle()
-	w.set(1, func(p *pathMetric) { p.txStandingMs = 65; p.txShortLoss = 30 })
-	d := w.tick(10)
-	if m, _ := memberOf(d, 1); m.capKbps != 0 {
-		t.Errorf("idle path capped at %.0f kbps on single-sample readings", m.capKbps)
-	}
-}
-
-// One reading over the line is not congestion; two running are.
-func TestCascadeNeedsTheQueueToHoldBeforeCutting(t *testing.T) {
-	w := cascadeWorld(t, reported(0, 40), reported(1, 90))
-	w.settle()
-	w.set(1, func(p *pathMetric) { p.txStandingMs = 200 })
-	w.sendBulk(1000, 1250)
-	d := w.tick(1)
-	if m, _ := memberOf(d, 1); m.capKbps != 0 {
-		t.Errorf("cut to %.0f kbps on a single spike", m.capKbps)
-	}
-	w.set(1, func(p *pathMetric) { p.txStandingMs = 0 })
-	w.sendBulk(1000, 1250)
-	d = w.tick(1)
-	w.set(1, func(p *pathMetric) { p.txStandingMs = 200 })
-	w.sendBulk(1000, 1250)
-	d = w.tick(1)
-	if m, _ := memberOf(d, 1); m.capKbps != 0 {
-		t.Errorf("cut to %.0f kbps on two spikes that did not run together", m.capKbps)
-	}
 }
 
 // The canopy fallback is for a link that comes and goes, not one losing half
@@ -576,8 +356,8 @@ func TestCascadeCanopyFallbackRefusesALinkThatIsNotDelivering(t *testing.T) {
 // includes the call's path.
 func TestCascadeSkipsALinkTooSmallBesideTheCallsPath(t *testing.T) {
 	w := cascadeWorld(t, reported(0, 40), reported(1, 90))
-	w.set(0, func(p *pathMetric) { p.bw.limitKbps = 55_000 })
-	w.set(1, func(p *pathMetric) { p.bw.limitKbps = 3_000 })
+	w.set(0, func(p *pathMetric) { p.shapedKbps = 55_000 })
+	w.set(1, func(p *pathMetric) { p.shapedKbps = 3_000 })
 	d := w.settle()
 	if _, ok := memberOf(d, 1); ok {
 		t.Errorf("a 3 Mbit link is in the cascade ahead of a 55 Mbit call's path: %v", ids(d))
@@ -590,19 +370,17 @@ func TestCascadeSkipsALinkTooSmallBesideTheCallsPath(t *testing.T) {
 func TestRealtimeOnAPathNeverThrottlesBulk(t *testing.T) {
 	w := cascadeWorld(t, reported(0, 40))
 	w.settle()
-	w.set(0, func(p *pathMetric) { p.txStandingMs = 2 }) // a healthy path
-	var d *decision
 	var dropped int
 	for i := 0; i < 10; i++ {
 		for j := 0; j < 50; j++ { // a call at 50 packets a second
 			w.s.txForPacket(protocol.ClassRealtime, 99, 200)
 		}
-		var dr int
-		d, _, dr = w.pumpTick(50_000)
+		placed, dr := w.sendBulk(500, 1250)
 		dropped += dr
-	}
-	if m, _ := memberOf(d, 0); m.capKbps != 0 {
-		t.Errorf("bulk capped at %.0f kbps on a healthy path because a call shares it", m.capKbps)
+		if placed[0] != 500 {
+			t.Fatalf("placed %v beside a call, want all 500 bulk packets on the only path", placed)
+		}
+		w.tick(1)
 	}
 	if dropped != 0 {
 		t.Errorf("dropped %d bulk packets beside a call", dropped)

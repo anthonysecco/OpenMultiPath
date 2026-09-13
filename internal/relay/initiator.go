@@ -6,7 +6,6 @@ import (
 	"net"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
-	"github.com/anthonysecco/OpenMultiPath/internal/diag"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 	"github.com/anthonysecco/OpenMultiPath/internal/record"
 	"github.com/anthonysecco/OpenMultiPath/internal/usage"
@@ -45,6 +44,11 @@ type InitiatorConfig struct {
 	// inner packets - when its Name is set. Empty keeps the loopback
 	// relay, which is the default and the way back.
 	Tun TunConfig
+
+	// LinkSpeedPath is the measurement file ompui writes after a flow test
+	// (D-055). Each link is shaped to 95% of its measured upload, and the
+	// set is passed to home. A missing file leaves every link unshaped.
+	LinkSpeedPath string
 }
 
 // RunInitiator relays between a local WireGuard interface and the home
@@ -137,6 +141,11 @@ func RunInitiator(cfg InitiatorConfig) error {
 		sess.notePeerVersion(ver)
 		sess.observe(&h, len(buf))
 
+		if h.Type == protocol.TypeLinkSpeedAck {
+			sess.noteLinkSpeedAck(payload)
+			return
+		}
+
 		// Reports and probes carry no tunnel traffic; they exist only to
 		// keep measurement flowing when data is not.
 		if h.Type != protocol.TypeData {
@@ -152,16 +161,23 @@ func RunInitiator(cfg InitiatorConfig) error {
 	})
 	go paths.run()
 
+	// Above WireGuard the paths are WireGuard interfaces, so every packet
+	// picks up WireGuard's framing on its way to the link, and the shapers
+	// have to count it (D-055).
+	sess.setPathWriter(paths.send, cfg.Tun.Enabled())
+	if cfg.LinkSpeedPath != "" {
+		go sess.watchLinkSpeeds(cfg.LinkSpeedPath)
+	}
+
 	// Probes and reports go out every bound path, not just the chosen
 	// one. That is the whole point of them: passive measurement is
 	// structurally blind on an idle path, and an idle path is exactly the
 	// one that has to be understood before a call is ever steered onto it.
-	go sess.runProbes(paths.active, paths.send)
+	go sess.runProbes(paths.active, sess.sendControl)
 
 	sched := newScheduler(sess, cfg.Settings, paths.active)
 	sess.sched = sched
 	go sched.run()
-	go sched.watchDiagPin(diag.PinPath)
 
 	// Local endpoint -> whichever paths the scheduler has chosen. The global
 	// sequence is allocated once here, before any copies are made, so
@@ -179,7 +195,6 @@ func RunInitiator(cfg InitiatorConfig) error {
 		log.Printf("%s: not classifying - payloads are ciphertext below WireGuard", "initiator")
 	}
 
-	scratch := make([]byte, 0, bufSize+maxHeaderLen)
 	go local.readPayloads("initiator-local", func(payload []byte) {
 		class := clf.classify(payload)
 		sess.noteClass(class)
@@ -214,7 +229,7 @@ func RunInitiator(cfg InitiatorConfig) error {
 			tag = sess.nextFlowTag(flow)
 		}
 		for _, id := range tx {
-			paths.send(id, sess.stampFlow(id, globalSeq, class, tag, payload, scratch))
+			sess.transmit(id, globalSeq, class, tag, payload)
 		}
 	})
 

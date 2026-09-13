@@ -44,6 +44,12 @@ type Snapshot struct {
 	// path if the interface did not know to leave them out.
 	ManagesPaths bool `json:"manages_paths"`
 
+	// LinkSpeedsHeld says this end holds at least one measured link speed
+	// (D-055). LinkSpeedsAcknowledged, on the vehicle only, says home has
+	// confirmed it holds the same set.
+	LinkSpeedsHeld         bool `json:"link_speeds_held"`
+	LinkSpeedsAcknowledged bool `json:"link_speeds_acknowledged"`
+
 	Paths     []Path        `json:"paths"`
 	Aggregate Aggregate     `json:"aggregate"`
 	Scheduler Scheduler     `json:"scheduler"`
@@ -219,27 +225,26 @@ type Path struct {
 	// RTTFloorMs is the round trip with nothing queued on it.
 	RTTFloorMs float64 `json:"rtt_floor_ms"`
 
-	// The reactive bandwidth ceiling of D-023, all in kbps in the send
-	// direction.
+	// Measured link speed and shaping (D-055), all in kbps at the IP layer.
 	//
-	// SendKbps is what is going onto the path right now. CeilingKbps is
-	// where queueing was actually observed to set in, and CeilingKnown
-	// distinguishes that from never having seen it. LimitKbps is what the
-	// scheduler is currently willing to assume, which is the ceiling
-	// discounted for how long ago it was confirmed; zero there means no
-	// opinion, and no gate - it is the only one of the two the scheduler
-	// itself ever acts on, and the one worth trusting in the interface too
-	// (D-049).
+	// SendKbps is what this end is putting onto the path right now, in wire
+	// bytes. LinkUpKbps (vehicle to home) and LinkDownKbps (home to vehicle)
+	// are the flow test's last measurement of the link, 0 in a direction
+	// never measured; LinkMeasuredUnix is when. The vehicle reads them from
+	// its measurement file and home is told them by the vehicle.
 	//
-	// CeilingAgeSeconds is what ages. The estimate itself does not decay:
-	// an hour of idleness is not evidence that a link shrank, so the number
-	// stands and only the confidence in it slides. -1 means nothing has
-	// ever loaded the path.
-	SendKbps          float64 `json:"send_kbps"`
-	CeilingKbps       float64 `json:"ceiling_kbps"`
-	CeilingKnown      bool    `json:"ceiling_known"`
-	LimitKbps         float64 `json:"limit_kbps"`
-	CeilingAgeSeconds float64 `json:"ceiling_age_seconds"`
+	// ShapedKbps is the most this end sends on the path - 95% of the
+	// measurement in its own send direction - or 0 for unshaped, which is
+	// what an unmeasured link always is. ShaperBacklogBytes is what is
+	// queued behind the shaper now, and ShaperDropped how many packets have
+	// found its queue full.
+	SendKbps           float64 `json:"send_kbps"`
+	LinkUpKbps         float64 `json:"link_up_kbps"`
+	LinkDownKbps       float64 `json:"link_down_kbps"`
+	LinkMeasuredUnix   int64   `json:"link_measured_unix,omitempty"`
+	ShapedKbps         float64 `json:"shaped_kbps"`
+	ShaperBacklogBytes int     `json:"shaper_backlog_bytes"`
+	ShaperDropped      uint64  `json:"shaper_dropped"`
 
 	// Cost tracking, step 10. Budget is green, yellow or red;
 	// BudgetMetered says whether a cap is configured at all, which is
@@ -290,12 +295,11 @@ type Path struct {
 	// fill order, first filled first, or -1 when bulk is not placed on it
 	// by the cascade. CascadeProtected marks the path carrying real-time and
 	// transactional traffic, which is always last and otherwise treated like
-	// any other path. BulkCapKbps is how much
-	// bulk it may currently take, 0 meaning uncapped, and BulkKbps how much
-	// it carried over the last evaluation.
+	// any other path. BulkKbps is how much bulk it carried over the last
+	// evaluation. How much it may take is ShapedKbps: the cascade spills
+	// onto the next path once this one's shaper backs up.
 	CascadePosition  int     `json:"cascade_position"`
 	CascadeProtected bool    `json:"cascade_protected,omitempty"`
-	BulkCapKbps      float64 `json:"bulk_cap_kbps"`
 	BulkKbps         float64 `json:"bulk_kbps"`
 
 	LastSeenSeconds float64 `json:"last_seen_seconds"`

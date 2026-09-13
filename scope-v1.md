@@ -6,9 +6,10 @@
 - Userspace multipath daemon with the header from `protocol.md`
 - Passive measurement from data packets; active probes scaled inversely to path traffic
 - Queue delay inferred from delay above rolling minimum (no clock sync required)
-- Reactive per-path bandwidth ceiling from queueing onset during real traffic, taken from
-  the peer's reported queue delay in our send direction. No active bandwidth probes; gates
-  duplication targets and primary handovers, never a hard veto (see D-023, D-024)
+- Per-path link speed measured on demand by the flow test, never estimated; each end shapes
+  its sends to 95% of it, and an unmeasured link is unlimited. Gates duplication targets
+  and primary handovers, never a hard veto (see D-055, which replaced D-023's reactive
+  ceiling)
 - Per-path reports in both directions, so each end scores its own *send* direction from
   what the peer measured rather than from half a round trip (see D-024)
 - Authenticated wire header, keyed from a file, once a shared secret is provisioned (D-025)
@@ -74,7 +75,8 @@ of reasoning up front.
 6b. **Bandwidth ceiling.** Reactive, from queueing onset under real traffic; no active
     probes. Feeds duplication-target and handover eligibility ahead of classification, and
     ahead of it being usable to split bulk's path choice from real-time's once step 7
-    lands. **Built** (2026-09-01). See D-023.
+    lands. **Built** (2026-09-01). See D-023. **Replaced** (2026-09-13) by measured link
+    speed and shaping to 95% of it; see D-055.
 6c. **Outbound measurement.** Path reports each way, so a send decision stops being made
     from inbound evidence. Wire version 2, rolling upgrade, header authentication
     alongside it. **Built** (2026-09-02). See D-024 and D-025.

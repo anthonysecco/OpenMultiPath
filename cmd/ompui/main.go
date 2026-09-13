@@ -29,6 +29,7 @@ import (
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/diag"
+	"github.com/anthonysecco/OpenMultiPath/internal/linkspeed"
 	"github.com/anthonysecco/OpenMultiPath/internal/state"
 )
 
@@ -40,18 +41,16 @@ type server struct {
 	configPath string
 	unit       string
 
-	// iperfServer is the home end's iperf3 address (host:port) for the
-	// on-demand uplink diagnostic. diagMu makes the test single-flight: the
-	// iperf server serves one client at a time, and two saturating uploads
-	// at once would measure neither path honestly.
-	iperfServer string
+	// flowtestServer is the home end's omp-flowtest address (host:port) for
+	// the on-demand raw-link uplink diagnostic (D-053). diagMu makes the
+	// test single-flight: the server handles one run at a time, and two
+	// saturating floods at once would measure neither path honestly.
+	flowtestServer string
 
-	// overlayIperfServer is the same iperf3 server, reached over the
-	// tunnel's overlay network instead of the transport hub (D-048). Traffic
-	// sent here is an ordinary classified, scheduled flow rather than a
-	// direct link measurement, which is what lets a diag.PinRequest force
-	// ompd's own scheduler to place it on a chosen path.
-	overlayIperfServer string
+	// linkSpeedPath is where a successful flow test's result is saved as the
+	// link's measured speed (D-055). ompui is its only writer; ompd on the
+	// vehicle watches it, shapes to it, and passes it to home.
+	linkSpeedPath string
 
 	diagMu sync.Mutex
 }
@@ -62,16 +61,16 @@ func main() {
 	statePath := flag.String("state", "/var/lib/openmultipath/state.json", "state file written by the daemon")
 	configPath := flag.String("config", "/etc/openmultipath/config.json", "settings file shared with the daemon")
 	unit := flag.String("unit", "ompd", "systemd unit for the daemon, for log access and restarts")
-	iperfServer := flag.String("iperf-server", "10.20.1.1:5201", "initiator only: home's iperf3 address for the on-demand per-path uplink test")
-	overlayIperfServer := flag.String("overlay-iperf-server", "10.30.0.1:5201", "initiator only: home's iperf3 address reached over the tunnel overlay, for the scheduler-pinned uplink test (D-048)")
+	flowtestServer := flag.String("flowtest-server", "10.20.1.1:5202", "initiator only: home's omp-flowtest address for the on-demand per-path uplink test (D-053)")
+	linkSpeedPath := flag.String("linkspeed", linkspeed.DefaultPath, "initiator only: where a flow test's result is saved as the link's measured speed, which ompd shapes to (D-055)")
 	flag.Parse()
 
 	s := &server{
-		statePath:          *statePath,
-		configPath:         *configPath,
-		unit:               *unit,
-		iperfServer:        *iperfServer,
-		overlayIperfServer: *overlayIperfServer,
+		statePath:      *statePath,
+		configPath:     *configPath,
+		unit:           *unit,
+		flowtestServer: *flowtestServer,
+		linkSpeedPath:  *linkSpeedPath,
 	}
 
 	mux := http.NewServeMux()
@@ -81,8 +80,8 @@ func main() {
 	mux.HandleFunc("/api/logs", s.handleLogs)
 	mux.HandleFunc("/api/restart", s.handleRestart)
 	mux.HandleFunc("/api/diag/bandwidth", s.handleDiagBandwidth)
-	mux.HandleFunc("/api/diag/bandwidth-pinned", s.handleDiagBandwidthPinned)
 	mux.HandleFunc("/api/diag/speedtest", s.handleDiagSpeedtest)
+	mux.HandleFunc("/api/linkspeed/clear", s.handleLinkSpeedClear)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	log.Printf("ompui: serving on http://%s (state %s)", *listen, *statePath)
@@ -187,11 +186,11 @@ func (s *server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"restarted": s.unit})
 }
 
-// handleDiagBandwidth runs an on-demand iperf3 uplink test pinned to one
-// path, for checking the passive estimate against a real saturating
-// transfer. It is deliberately not part of scheduling: it costs uplink data,
-// which on a metered link is the whole reason the estimator avoids active
-// probing, so it happens only when a person asks for it.
+// handleDiagBandwidth runs an on-demand ompd-native UDP flow test (D-053)
+// pinned to one path, and saves the result as that link's measured speed
+// (D-055): ompd shapes each direction to 95% of it. It costs real, possibly
+// metered, data in both directions, so it happens only when a person asks
+// for it.
 func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -199,12 +198,8 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		PathID     *uint8 `json:"path_id"`
-		Seconds    int    `json:"seconds"`
-		Streams    int    `json:"streams"`
-		UDP        bool   `json:"udp"`
-		TargetMbps int    `json:"target_mbps"`
-		MBytes     int    `json:"mbytes"` // fixed-data mode: transfer this many MB instead of running for Seconds
+		PathID  *uint8 `json:"path_id"`
+		Seconds int    `json:"seconds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PathID == nil {
 		http.Error(w, "expected a JSON body with a path_id", http.StatusBadRequest)
@@ -212,35 +207,9 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 	}
 	// A short test is enough to load the link; a long one just spends more
 	// data. Clamp both ends so a bad value cannot flood the uplink for
-	// minutes.
+	// minutes - each direction runs for this long, one after the other.
 	if req.Seconds < 1 || req.Seconds > 30 {
-		req.Seconds = 10
-	}
-	// Parallel streams by default for TCP: a single stream over the tunnel
-	// is window-limited and reads far below the real capacity. Clamp so a
-	// bad value cannot open hundreds of connections. A UDP flood is a single
-	// stream by default - the -b rate, not stream count, is what floods.
-	if req.Streams < 1 || req.Streams > 32 {
-		if req.UDP {
-			req.Streams = 1
-		} else {
-			req.Streams = 8
-		}
-	}
-	// TargetMbps caps a UDP flood; 0 means unlimited. Clamp the ceiling so a
-	// typo cannot ask for an absurd rate.
-	if req.TargetMbps < 0 || req.TargetMbps > 10000 {
-		req.TargetMbps = 0
-	}
-	// Fixed-data mode: transfer a set number of MB instead of running for a
-	// set time, for an equal-payload comparison against another tool. Clamped
-	// so a typo cannot ask to move gigabytes over a metered link.
-	var fixedBytes int64
-	if req.MBytes > 0 {
-		if req.MBytes > 2000 {
-			req.MBytes = 2000
-		}
-		fixedBytes = int64(req.MBytes) * 1_000_000
+		req.Seconds = 5
 	}
 
 	snap, err := state.Read(s.statePath)
@@ -272,247 +241,141 @@ func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	host, portStr, err := net.SplitHostPort(s.iperfServer)
+	host, portStr, err := net.SplitHostPort(s.flowtestServer)
 	if err != nil {
-		http.Error(w, "iperf server address is misconfigured: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "flowtest server address is misconfigured: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	port, _ := strconv.Atoi(portStr)
 
-	// Single-flight: the server takes one client at a time, and two uploads
-	// at once would measure neither honestly.
+	// Single-flight: the server handles one run at a time, and two floods at
+	// once would measure neither honestly.
 	if !s.diagMu.TryLock() {
 		http.Error(w, "a bandwidth test is already running", http.StatusConflict)
 		return
 	}
 	defer s.diagMu.Unlock()
 
-	// Fixed-data transfers can take much longer than the nominal seconds on a
-	// slow path, so give them a generous ceiling; the run ends when the bytes
-	// are sent.
-	timeout := time.Duration(req.Seconds+15) * time.Second
-	if fixedBytes > 0 {
-		timeout = 180 * time.Second
-	}
+	// Both directions run sequentially, each with its own retry budget for
+	// the control round trips (see internal/diag/flowtest.go), so the whole
+	// run takes noticeably longer than either direction alone.
+	timeout := time.Duration(req.Seconds*2+20) * time.Second
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	res, runErr := diag.Run(ctx, diag.Options{
-		Iface:      path.Name,
-		Server:     host,
-		Port:       port,
-		Seconds:    req.Seconds,
-		Streams:    req.Streams,
-		UDP:        req.UDP,
-		TargetMbps: req.TargetMbps,
-		Bytes:      fixedBytes,
+	res, runErr := diag.RunFlowTest(ctx, diag.FlowOptions{
+		Iface:   path.Name,
+		Server:  host,
+		Port:    port,
+		Seconds: req.Seconds,
 	})
 
 	out := map[string]any{
 		"path_id": *req.PathID,
 		"iface":   path.Name,
-		// The estimator's current opinion, so the two sit side by side.
-		"estimate": map[string]any{
-			"ceiling_kbps":        path.CeilingKbps,
-			"ceiling_known":       path.CeilingKnown,
-			"limit_kbps":          path.LimitKbps,
-			"ceiling_age_seconds": path.CeilingAgeSeconds,
-		},
 	}
 	if runErr != nil {
+		// A failed run saves nothing. The last good measurement stands: a test
+		// that could not finish, in a dead zone say, is not evidence the link
+		// got slower.
 		out["error"] = runErr.Error()
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
 	out["result"] = res
+
+	saved, err := s.saveMeasurement(path.Name, res)
+	if err != nil {
+		out["save_error"] = err.Error()
+	} else {
+		out["saved"] = map[string]any{
+			"up_kbps":          saved.UpKbps,
+			"down_kbps":        saved.DownKbps,
+			"measured_unix":    saved.MeasuredUnix,
+			"shaped_up_kbps":   linkspeed.ShapedKbps(saved.UpKbps),
+			"shaped_down_kbps": linkspeed.ShapedKbps(saved.DownKbps),
+		}
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
-// diagPinSrcPort is the fixed local source port the pinned test's iperf3
-// client always uses (via --cport), so the exact 5-tuple can be computed and
-// registered before the run starts. Single-flight with diagMu means nothing
-// else ever contends for it.
-const diagPinSrcPort = 55201
+// saveMeasurement records a flow test's result as a link's measured speed.
+//
+// A direction that measured nothing keeps its previous figure rather than
+// being set to zero - zero means "never measured", which is unlimited, and a
+// direction that delivered nothing during one test has not been shown to be
+// unlimited. Only called under diagMu, which is what keeps this file to one
+// writer at a time.
+func (s *server) saveMeasurement(iface string, res diag.FlowResult) (linkspeed.Measurement, error) {
+	f, err := linkspeed.Load(s.linkSpeedPath)
+	if err != nil {
+		// A corrupt file is replaced rather than left to block every future
+		// measurement; what it held could not be read by ompd either.
+		log.Printf("ompui: %v; replacing it", err)
+	}
+	m := f.Links[iface]
+	if up := res.UploadMbps * 1000; up > 0 {
+		m.UpKbps = up
+	}
+	if down := res.DownloadMbps * 1000; down > 0 {
+		m.DownKbps = down
+	}
+	m.MeasuredUnix = time.Now().Unix()
+	f.Links[iface] = m
+	return m, linkspeed.Save(s.linkSpeedPath, f)
+}
 
-// handleDiagBandwidthPinned runs the UDP flood as an ordinary classified,
-// scheduled flow over the tunnel's overlay network, with a diag.PinRequest
-// (D-048) forcing ompd's own scheduler to place it on the chosen path.
-//
-// handleDiagBandwidth measures the raw link, entirely outside the daemon -
-// what the carrier will give any traffic. This measures something different:
-// what ompd's own load balancer actually does with the link under load,
-// which is the thing an operator staring at a low estimate is usually
-// actually trying to diagnose, and which raw-link numbers cannot show at
-// all - D-045 and D-046 can exclude a path from the spread set no matter how
-// fast the raw link tests.
-//
-// UDP flood only, one stream. A parallel TCP transfer opens one connection
-// per stream, each with its own source port and therefore its own flow hash,
-// and the pin would have to cover every one of them for the whole offered
-// load to actually land on the chosen path. A single UDP flow has exactly
-// one 5-tuple, so one pin covers it completely - see flowHashTuple.
-func (s *server) handleDiagBandwidthPinned(w http.ResponseWriter, r *http.Request) {
+// handleLinkSpeedClear forgets a link's measured speed, which leaves it
+// unshaped at both ends - the way back from a measurement taken at a bad
+// moment, short of measuring again.
+func (s *server) handleLinkSpeedClear(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
 	var req struct {
-		PathID     *uint8 `json:"path_id"`
-		Seconds    int    `json:"seconds"`
-		TargetMbps int    `json:"target_mbps"`
-		MBytes     int    `json:"mbytes"`
+		PathID *uint8 `json:"path_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PathID == nil {
 		http.Error(w, "expected a JSON body with a path_id", http.StatusBadRequest)
 		return
 	}
-	if req.Seconds < 1 || req.Seconds > 30 {
-		req.Seconds = 10
-	}
-	if req.TargetMbps < 0 || req.TargetMbps > 10000 {
-		req.TargetMbps = 0
-	}
-	var fixedBytes int64
-	if req.MBytes > 0 {
-		if req.MBytes > 2000 {
-			req.MBytes = 2000
-		}
-		fixedBytes = int64(req.MBytes) * 1_000_000
-	}
-
 	snap, err := state.Read(s.statePath)
 	if err != nil {
 		http.Error(w, "cannot read state to resolve the path: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	if !snap.ManagesPaths {
-		http.Error(w, "this end does not own its paths; run the test from the vehicle", http.StatusBadRequest)
+		http.Error(w, "link speeds are measured and kept on the vehicle; clear it there", http.StatusBadRequest)
 		return
 	}
-	var path *state.Path
-	for i := range snap.Paths {
-		if snap.Paths[i].ID == *req.PathID {
-			path = &snap.Paths[i]
-			break
+	var name string
+	for _, p := range snap.Paths {
+		if p.ID == *req.PathID {
+			name = p.Name
 		}
 	}
-	if path == nil {
+	if name == "" {
 		http.Error(w, "no such path", http.StatusNotFound)
 		return
 	}
-	if !path.Bound {
-		http.Error(w, "that link is down; nothing to test over - a pin cannot force traffic onto a socket that is not up", http.StatusConflict)
-		return
-	}
-
-	srcIP, err := overlaySourceIP()
-	if err != nil {
-		http.Error(w, "resolving the tunnel's own overlay address: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	host, portStr, err := net.SplitHostPort(s.overlayIperfServer)
-	if err != nil {
-		http.Error(w, "overlay iperf server address is misconfigured: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	port, _ := strconv.Atoi(portStr)
-
-	// Single-flight, shared with the raw-link tests: two saturating runs at
-	// once would measure neither path honestly, pinned or not.
-	if !s.diagMu.TryLock() {
-		http.Error(w, "a bandwidth test is already running", http.StatusConflict)
-		return
-	}
+	// Shares the flow test's lock, so a clear cannot interleave with a save.
+	s.diagMu.Lock()
 	defer s.diagMu.Unlock()
-
-	timeout := time.Duration(req.Seconds+15) * time.Second
-	if fixedBytes > 0 {
-		timeout = 180 * time.Second
+	f, err := linkspeed.Load(s.linkSpeedPath)
+	if err != nil {
+		log.Printf("ompui: %v; replacing it", err)
 	}
-
-	// The pin's own deadline outlives the run by a wide margin - it is the
-	// backstop for ompui being killed before the deferred ClearPin below
-	// runs, not the normal way this ends.
-	pin := diag.PinRequest{
-		PathID:      *req.PathID,
-		SrcIP:       srcIP.String(),
-		DstIP:       host,
-		Protocol:    17, // UDP
-		SrcPort:     diagPinSrcPort,
-		DstPort:     uint16(port),
-		ExpiresUnix: time.Now().Add(timeout + time.Minute).Unix(),
-	}
-	if err := diag.WritePin(pin); err != nil {
-		http.Error(w, "recording the diagnostic pin: "+err.Error(), http.StatusInternalServerError)
+	delete(f.Links, name)
+	if err := linkspeed.Save(s.linkSpeedPath, f); err != nil {
+		http.Error(w, "saving link speeds failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer diag.ClearPin()
-	// The daemon polls for a new pin at most twice a second (watchDiagPin);
-	// give it a moment to pick this one up before any traffic is sent, or
-	// the flood's first packets would ride ordinary routing and be missed
-	// for what they were meant to prove.
-	time.Sleep(750 * time.Millisecond)
-
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-
-	res, runErr := diag.Run(ctx, diag.Options{
-		Server:     host,
-		Port:       port,
-		LocalIP:    srcIP.String(),
-		Seconds:    req.Seconds,
-		UDP:        true,
-		TargetMbps: req.TargetMbps,
-		Bytes:      fixedBytes,
-		CPort:      diagPinSrcPort,
-	})
-
-	out := map[string]any{
-		"path_id": *req.PathID,
-		"estimate": map[string]any{
-			"ceiling_kbps":        path.CeilingKbps,
-			"ceiling_known":       path.CeilingKnown,
-			"limit_kbps":          path.LimitKbps,
-			"ceiling_age_seconds": path.CeilingAgeSeconds,
-		},
-	}
-	if runErr != nil {
-		out["error"] = runErr.Error()
-		writeJSON(w, http.StatusOK, out)
-		return
-	}
-	out["result"] = res
-	writeJSON(w, http.StatusOK, out)
-}
-
-// overlaySourceIP is the tunnel's own address on the overlay network - the
-// source address the pinned test's traffic actually carries, since it is
-// reached through the TUN device rather than a bound physical interface.
-// omp0 is not a flag: every deploy on this project already hardcodes that
-// name (see the ompd.service.d/d020.conf drop-ins), so this matches an
-// existing convention rather than adding a new one.
-func overlaySourceIP() (net.IP, error) {
-	ifi, err := net.InterfaceByName("omp0")
-	if err != nil {
-		return nil, fmt.Errorf("reading the omp0 tunnel interface: %w", err)
-	}
-	addrs, err := ifi.Addrs()
-	if err != nil {
-		return nil, fmt.Errorf("reading omp0's address: %w", err)
-	}
-	for _, a := range addrs {
-		if ipn, ok := a.(*net.IPNet); ok {
-			if ip4 := ipn.IP.To4(); ip4 != nil {
-				return ip4, nil
-			}
-		}
-	}
-	return nil, fmt.Errorf("omp0 has no IPv4 address")
+	writeJSON(w, http.StatusOK, map[string]any{"cleared": name})
 }
 
 // handleDiagSpeedtest runs a public-internet speed test pinned to one path's
-// physical WAN link, via the omp-speedtest helper. Unlike the iperf test,
+// physical WAN link, via the omp-speedtest helper. Unlike the flow test,
 // which measures the tunnel to home, this measures the carrier's own
 // capacity - a different and heavier thing: a full run spends tens of
 // megabytes of real, possibly metered, data in each direction, which is why
@@ -564,7 +427,7 @@ func (s *server) handleDiagSpeedtest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// One link test at a time, shared with the iperf test: both saturate a
+	// One link test at a time, shared with the flow test: both saturate a
 	// physical link, and two at once would measure neither.
 	if !s.diagMu.TryLock() {
 		http.Error(w, "a link test is already running", http.StatusConflict)
@@ -618,7 +481,7 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP omp_bulk_cascade_active Whether bulk is being placed per packet by the cascade (1) or per flow (0).\n")
 	fmt.Fprintf(w, "# TYPE omp_bulk_cascade_active gauge\n")
 	fmt.Fprintf(w, "omp_bulk_cascade_active{node=%q} %g\n", escape(snap.Node), b2f(snap.Scheduler.BulkScheduler == "cascade"))
-	fmt.Fprintf(w, "# HELP omp_bulk_overflowed_total Bulk sent past every cascade path's allowance onto the least-queued path.\n")
+	fmt.Fprintf(w, "# HELP omp_bulk_overflowed_total Bulk sent with every cascade path's shaper backed up, onto the first path in the fill order.\n")
 	fmt.Fprintf(w, "# TYPE omp_bulk_overflowed_total counter\n")
 	fmt.Fprintf(w, "omp_bulk_overflowed_total{node=%q} %d\n", escape(snap.Node), snap.Scheduler.BulkOverflowed)
 	fmt.Fprintf(w, "# HELP omp_wire_version Wire version spoken to the peer.\n# TYPE omp_wire_version gauge\n")
@@ -685,8 +548,15 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 		// The bulk cascade, v0.2.
 		{"omp_path_cascade_position", "Place in the bulk fill order, 0 filled first; -1 when not in the cascade.", "gauge", func(p state.Path) float64 { return float64(p.CascadePosition) }},
-		{"omp_path_bulk_cap_kbps", "Bulk this path may currently take; 0 is uncapped.", "gauge", func(p state.Path) float64 { return p.BulkCapKbps }},
 		{"omp_path_bulk_kbps", "Bulk carried over the last evaluation.", "gauge", func(p state.Path) float64 { return p.BulkKbps }},
+
+		// Measured link speed and shaping, D-055.
+		{"omp_path_send_kbps", "What this end is sending on the path, in wire bytes.", "gauge", func(p state.Path) float64 { return p.SendKbps }},
+		{"omp_path_link_up_kbps", "Measured link speed, vehicle to home; 0 is never measured.", "gauge", func(p state.Path) float64 { return p.LinkUpKbps }},
+		{"omp_path_link_down_kbps", "Measured link speed, home to vehicle; 0 is never measured.", "gauge", func(p state.Path) float64 { return p.LinkDownKbps }},
+		{"omp_path_shaped_kbps", "The most this end sends on the path; 0 is unshaped.", "gauge", func(p state.Path) float64 { return p.ShapedKbps }},
+		{"omp_path_shaper_backlog_bytes", "Bytes queued behind the path's shaper.", "gauge", func(p state.Path) float64 { return float64(p.ShaperBacklogBytes) }},
+		{"omp_path_shaper_dropped_total", "Packets dropped at the shaper's queue limit.", "counter", func(p state.Path) float64 { return float64(p.ShaperDropped) }},
 		{"omp_path_tx_standing_queue_ms", "Standing queue in the send direction, as the peer reports it.", "gauge", func(p state.Path) float64 { return p.TxStandingQueueMs }},
 		{"omp_path_tx_short_loss_percent", "Send-direction loss over the last second, as the peer reports it.", "gauge", func(p state.Path) float64 { return p.TxShortLossPercent }},
 

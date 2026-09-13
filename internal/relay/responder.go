@@ -99,18 +99,21 @@ func RunResponder(cfg ResponderConfig) error {
 		return ids
 	}
 
-	go sess.runProbes(
-		known,
-		func(id uint8, pkt []byte) {
-			addr := sess.remoteFor(id)
-			if addr == nil {
-				return
-			}
-			if _, err := pubConn.WriteToUDP(pkt, addr); err != nil {
-				log.Printf("responder: probe on path %d failed: %v", id, err)
-			}
-		},
-	)
+	// Every packet leaves by the public socket, addressed to wherever the
+	// path was last heard from. Above WireGuard that socket is on home's
+	// WireGuard interface, so each packet picks up WireGuard's framing on its
+	// way to the link and the shapers count it (D-055).
+	sess.setPathWriter(func(id uint8, pkt []byte) {
+		addr := sess.remoteFor(id)
+		if addr == nil {
+			return // never heard from, so nowhere to send
+		}
+		if _, err := pubConn.WriteToUDP(pkt, addr); err != nil {
+			log.Printf("responder: write to path %d at %s failed: %v", id, addr, err)
+		}
+	}, cfg.Tun.Enabled())
+
+	go sess.runProbes(known, sess.sendControl)
 
 	// Any RV path -> the local endpoint. Which path a packet came in on is
 	// taken from the header rather than inferred from its source address,
@@ -126,6 +129,15 @@ func RunResponder(cfg ResponderConfig) error {
 		sess.notePeerVersion(ver)
 		sess.observe(&h, len(buf))
 		sess.setRemote(h.PathID, from)
+
+		// The vehicle's measured link speeds (D-055). Answered on the path
+		// they arrived on, which is the one known to be working.
+		if h.Type == protocol.TypeLinkSpeed {
+			if ack := sess.receiveLinkSpeeds(payload); ack != nil {
+				sess.sendControl(h.PathID, sess.build(protocol.TypeLinkSpeedAck, h.PathID, sess.nextGlobalSeq(), ack, make([]byte, 0, maxHeaderLen+len(ack))))
+			}
+			return
+		}
 
 		// Reports and probes carry no tunnel traffic; they exist only to
 		// keep measurement flowing when data is not.
@@ -161,7 +173,6 @@ func RunResponder(cfg ResponderConfig) error {
 		log.Printf("%s: not classifying - payloads are ciphertext below WireGuard", "responder")
 	}
 
-	scratch := make([]byte, 0, bufSize+maxHeaderLen)
 	go local.readPayloads("responder-local", func(payload []byte) {
 		class := clf.classify(payload)
 		sess.noteClass(class)
@@ -190,14 +201,10 @@ func RunResponder(cfg ResponderConfig) error {
 			tag = sess.nextFlowTag(flow)
 		}
 		for _, id := range tx {
-			addr := sess.remoteFor(id)
-			if addr == nil {
+			if sess.remoteFor(id) == nil {
 				continue // never heard from, so nowhere to send
 			}
-			out := sess.stampFlow(id, globalSeq, class, tag, payload, scratch)
-			if _, err := pubConn.WriteToUDP(out, addr); err != nil {
-				log.Printf("responder: write to path %d at %s failed: %v", id, addr, err)
-			}
+			sess.transmit(id, globalSeq, class, tag, payload)
 		}
 	})
 

@@ -183,7 +183,7 @@ type pathState struct {
 	rtt   uint32 // most recent round trip, microseconds
 	stats pathStats
 	mtu   mtuProbe
-	bw    bwEstimate
+	meter sendMeter
 
 	// rttFloor is the smallest round trip seen on this path, re-armed on a
 	// long window. It is the part of the delay that belongs to the path
@@ -247,9 +247,8 @@ type rttFloor struct {
 	started   time.Duration
 }
 
-// rttFloorWindow matches the bandwidth estimator's: long enough that a
-// standing queue is not absorbed into the baseline, which is the whole
-// reason the floor is being kept.
+// rttFloorWindow is long enough that a standing queue is not absorbed into
+// the baseline, which is the whole reason the floor is being kept.
 const rttFloorWindow = 5 * time.Minute
 
 func (f *rttFloor) observe(now time.Duration, rtt uint32) {
@@ -352,6 +351,28 @@ type session struct {
 	// the one goroutine reading the local endpoint, so it needs no lock:
 	// allocation happens once per packet there, before any copies are made.
 	flowSeqs [protocol.FlowBuckets]uint32
+
+	// writePath puts a finished packet on a path, and throughWireGuard says
+	// whether that path is a WireGuard interface, which decides what the
+	// packet costs the link. Both set once before anything is sent; see
+	// setPathWriter.
+	writePath        func(id uint8, pkt []byte)
+	throughWireGuard bool
+
+	// shapers hold each path to its measured speed (D-055). Created on first
+	// use and never removed, so the data path reads them without a lock.
+	shapers [256]atomic.Pointer[pathShaper]
+
+	// The measured link speeds, under mu (D-055, linkspeed.go). The vehicle
+	// takes them from its measurement file and home from the vehicle.
+	// speedsAcked and speedPayload are the vehicle's side of telling home:
+	// whether home has acknowledged the set held, and the set as sent.
+	speeds        map[uint8]protocol.LinkSpeed
+	speedDigest   uint32
+	haveSpeeds    bool
+	speedsAcked   bool
+	lastSpeedSent time.Duration
+	speedPayload  []byte
 }
 
 func newSession(cfg *config.Holder, node, role string) *session {
@@ -359,13 +380,14 @@ func newSession(cfg *config.Holder, node, role string) *session {
 		cfg = config.NewHolder(config.Defaults())
 	}
 	s := &session{
-		start: time.Now(),
-		cfg:   cfg,
-		node:  node,
-		role:  role,
-		paths: make(map[uint8]*pathState),
-		names: make(map[uint8]string),
-		dedup: newDedupWindow(),
+		start:  time.Now(),
+		cfg:    cfg,
+		node:   node,
+		role:   role,
+		paths:  make(map[uint8]*pathState),
+		names:  make(map[uint8]string),
+		dedup:  newDedupWindow(),
+		speeds: make(map[uint8]protocol.LinkSpeed),
 	}
 	s.peerVersion.Store(protocol.MinVersion)
 	return s
@@ -639,13 +661,13 @@ func (s *session) buildWith(typ, pathID uint8, globalSeq uint32, class uint8, ta
 	}
 	p.lastSentAt = now
 
-	// Built under the lock so the bandwidth estimate can count what actually
-	// went onto the wire rather than an estimate of it. The header's length
+	// Built under the lock so the send meter can count what actually went
+	// onto the wire rather than an estimate of it. The header's length
 	// varies with how many echo entries rode along, and a rate derived from
 	// a guess at that would be wrong in exactly the direction that matters:
 	// echoes are largest when the most paths need reporting on.
 	out := append(h.AppendTo(buf[:0], s.emitVersion(), s.authKey), payload...)
-	p.bw.noteSent(len(out) + ipUDPOverhead)
+	p.meter.note(s.wireBytes(len(out)))
 	s.mu.Unlock()
 
 	return out
@@ -898,7 +920,7 @@ func (s *session) buildProbe(pathID uint8, buf []byte) []byte {
 		// there, and leaving it out would understate the only load the
 		// path has.
 		s.mu.Lock()
-		p.bw.noteSent(pad)
+		p.meter.note(pad)
 		s.mu.Unlock()
 	}
 	return out
@@ -957,6 +979,15 @@ func (s *session) runProbes(pathIDs func() []uint8, send func(pathID uint8, pkt 
 			}
 		}
 
+		// A changed set of link speeds goes home on every path at once,
+		// repeated until home acknowledges it (D-055). One copy getting
+		// through is enough.
+		if payload := s.linkSpeedDue(now); payload != nil {
+			for _, id := range pathIDs() {
+				send(id, s.build(protocol.TypeLinkSpeed, id, s.nextGlobalSeq(), payload, buf))
+			}
+		}
+
 		if now-lastProbe >= s.cfg.Get().ProbeInterval() {
 			lastProbe = now
 			for _, id := range pathIDs() {
@@ -1004,6 +1035,10 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 		if s.reseq != nil {
 			s.reseq.reset()
 		}
+
+		// And it has forgotten the link speeds it was told, so they are
+		// due again (D-055).
+		s.speedsAcked = false
 	}
 	p.stats.noteBytes(wireLen)
 	if h.HasFlow {
@@ -1092,12 +1127,10 @@ func (s *session) metrics(now time.Duration) []pathMetric {
 	for id, p := range s.paths {
 		st := &p.stats
 
-		// The bandwidth estimate is advanced here rather than on a loop of
-		// its own. This is already the once-per-evaluation pass over every
-		// path under the lock, it has the round trip and the receive-side
-		// queue delay to hand, and giving the estimate its own goroutine
-		// would only add a second cadence to keep in step with this one.
-		p.bw.observe(now, ms(p.rtt), msi(st.queueDelay), p.peer, c)
+		// The send meter is advanced here rather than on a loop of its own:
+		// this is already the once-per-evaluation pass over every path under
+		// the lock, and a second cadence would only need keeping in step.
+		p.meter.observe(now)
 
 		// A path that has never delivered anything has been silent for as
 		// long as this process has been running. The initiator registers
@@ -1125,7 +1158,8 @@ func (s *session) metrics(now time.Duration) []pathMetric {
 			burstRatio:     st.recentBurstRatio(),
 			thin:           st.thin(),
 			unusable:       p.mtu.ceiling != 0 && p.mtu.confirmed < minUsablePathMTU,
-			bw:             p.bw.view(now, c),
+			sendKbps:       p.meter.kbps,
+			shapedKbps:     s.shapedKbpsLocked(id),
 			budget:         s.budgetState(s.names[id], c),
 			label:          c.LabelFor(s.names[id]),
 
@@ -1135,28 +1169,22 @@ func (s *session) metrics(now time.Duration) []pathMetric {
 			txJitterMs:   p.peer.jitterMs,
 			txLoss:       p.peer.loss,
 			txBurstRatio: p.peer.burst,
-			txStandingMs: p.peer.standingMs,
-			txShortLoss:  p.peer.shortLoss,
-			txRxKbps:     p.peer.rxKbps,
-			txAge:        txAge(now, p.peer),
 			rttFloorMs:   ms(p.rttFloor.cur),
 		})
 	}
 	return out
 }
 
-// txAge is how long ago the peer last reported on a path, or -1 if it never
-// has.
-func txAge(now time.Duration, v peerView) time.Duration {
-	if !v.valid {
-		return -1
-	}
-	return now - v.at
-}
-
 // holdLiveWindow is how recently a path must have delivered anything to
 // count toward the resequencer's hold.
 const holdLiveWindow = 2 * time.Second
+
+// holdTailCapMs caps how much of a path's measured tail the hold waits out.
+// It was the cascade's queue target, 40 ms, when the cascade paced on queue
+// (D-052); with paths shaped under their measured speed (D-055) the carrier's
+// queue should stay shorter than that, and a tail beyond it is a spike the
+// resequencer should not stall every flow for.
+const holdTailCapMs = 40
 
 // updateHold sets how long the resequencer waits for a missing packet, from
 // this end's own inbound measurements (v0.2-design.md, section 7).
@@ -1164,9 +1192,9 @@ const holdLiveWindow = 2 * time.Second
 // The receiver is measuring exactly the direction it is resequencing, so
 // nothing needs to come over the wire and no clocks need to agree. The wait
 // a gap deserves is how far behind the fastest path the slowest can deliver:
-// the difference in their base delays, plus the queue the far end's cascade
-// lets stand on a path - the smaller of the worst tail measured and the
-// cascade's own queue target - plus a margin, capped.
+// the difference in their base delays, plus the queue that stands on a path -
+// the smaller of the worst tail measured and holdTailCapMs - plus a margin,
+// capped.
 //
 // Every live path counts, not only those already carrying spread bulk. The
 // hold has to be right before the far end spills onto a second path, not an
@@ -1198,8 +1226,8 @@ func (s *session) updateHold(now time.Duration, c config.Config) {
 
 	hold := c.ResequencerHoldMargin()
 	if n > 1 {
-		if target := float64(c.CascadeQueueTargetMs); tail > target {
-			tail = target
+		if tail > holdTailCapMs {
+			tail = holdTailCapMs
 		}
 		hold += time.Duration((slowest - fastest + tail) * float64(time.Millisecond))
 	}
@@ -1302,13 +1330,13 @@ func (s *session) logStats() {
 		for id, p := range s.paths {
 			st := &p.stats
 			log.Printf("%s: %s | rtt %.1fms p95-spread %.1fms jitter %.1fms queue %.1fms | "+
-				"rx %d lost %d bursts %v | samples %d%s | mtu %d | tx %.0fkbps %s",
+				"rx %d lost %d bursts %v | samples %d%s | mtu %d | tx %.0fkbps | %s",
 				pathLabel(id, s.cfg.Get().LabelFor(s.names[id])), describe(d, id),
 				ms(p.rtt), msi(st.spread()), st.jitter/1000, msi(st.queueDelay),
 				st.received, st.lost, st.bursts,
 				st.filled, thinNote(st.thin()),
 				p.mtu.confirmed,
-				p.bw.sendKbps, describeCeiling(&p.bw, now))
+				p.meter.kbps, s.describeShapingLocked(id))
 		}
 		if d.blind {
 			log.Printf("scheduler: %s", d.reason)
@@ -1346,18 +1374,23 @@ func (s *session) logStats() {
 	}
 }
 
-// describeCeiling renders a path's capacity estimate for the log, in the
-// terms it is actually held in: a ceiling that was measured, how long ago
-// anything confirmed it, or the fact that nothing ever has.
-func describeCeiling(b *bwEstimate, now time.Duration) string {
-	switch {
-	case b.haveCeiling:
-		return fmt.Sprintf("ceiling %.0fkbps (confirmed %v ago)",
-			b.ceilingKbps, (now - b.confirmedAt).Round(time.Second))
-	case b.everLoaded:
-		return "ceiling unknown, loaded but never seen to queue"
+// describeShapingLocked renders a path's measured speed and shaping for the
+// log.
+func (s *session) describeShapingLocked(id uint8) string {
+	shaped := s.shapedKbpsLocked(id)
+	if shaped <= 0 {
+		return "link speed unmeasured, unshaped"
 	}
-	return "ceiling unknown, never loaded"
+	out := fmt.Sprintf("measured %s, shaped to %s", kbpsText(s.localKbpsLocked(id)), kbpsText(shaped))
+	if sh := s.shapers[id].Load(); sh != nil {
+		if b := sh.backlog(); b > 0 {
+			out += fmt.Sprintf(", %d bytes queued", b)
+		}
+		if d := sh.dropped.Load(); d > 0 {
+			out += fmt.Sprintf(", %d dropped at the queue limit", d)
+		}
+	}
+	return out
 }
 
 // recommendedTunnelMTULocked is recommendedTunnelMTU for callers already
@@ -1476,11 +1509,6 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 			Alive:             alive,
 		}
 
-		// Read, never advanced: the estimate is driven from the evaluation
-		// pass in metrics, and the state file is written on a cadence of its
-		// own. Sampling it here as well would fold the same bytes in twice
-		// and report a rate that moved with how often the interface was
-		// being looked at.
 		if p.peer.fresh(now) {
 			path.TxReported = true
 			path.TxSpreadMs = p.peer.spreadMs
@@ -1494,14 +1522,21 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 		}
 		path.RTTFloorMs = ms(p.rttFloor.cur)
 
-		bw := p.bw.view(now, snap.Config)
-		path.SendKbps = bw.sendKbps
-		path.CeilingKbps = bw.ceilingKbps
-		path.CeilingKnown = bw.haveCeiling
-		path.LimitKbps = bw.limitKbps
-		path.CeilingAgeSeconds = -1
-		if bw.everLoaded {
-			path.CeilingAgeSeconds = (now - bw.confirmedAt).Seconds()
+		// Read, never advanced: the meter is driven from the evaluation pass
+		// in metrics, and the state file is written on a cadence of its own.
+		// Sampling it here as well would fold the same bytes in twice and
+		// report a rate that moved with how often the interface was being
+		// looked at.
+		path.SendKbps = p.meter.kbps
+		if ls, ok := s.speeds[id]; ok {
+			path.LinkUpKbps = float64(ls.UpKbps)
+			path.LinkDownKbps = float64(ls.DownKbps)
+			path.LinkMeasuredUnix = int64(ls.MeasuredUnix)
+		}
+		path.ShapedKbps = s.shapedKbpsLocked(id)
+		if sh := s.shapers[id].Load(); sh != nil {
+			path.ShaperBacklogBytes = sh.backlog()
+			path.ShaperDropped = sh.dropped.Load()
 		}
 		if v, ok := d.views[id]; ok {
 			path.State = v.State
@@ -1519,7 +1554,6 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 			if d.cascadeOn && m.id == id {
 				path.CascadePosition = i
 				path.CascadeProtected = m.protected
-				path.BulkCapKbps = m.capKbps
 				path.BulkKbps = m.sentKbps
 			}
 		}
@@ -1598,6 +1632,8 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 		snap.Scheduler.BulkOverflowed = s.sched.overflowed.Load()
 	}
 	snap.Scheduler.WireVersion = int(s.emitVersion())
+	snap.LinkSpeedsHeld = s.haveSpeeds && len(s.speeds) > 0
+	snap.LinkSpeedsAcknowledged = s.role == roleInitiator && s.speedsAcked
 	if s.reseq != nil {
 		snap.Scheduler.Resequencer = s.reseq.stats()
 	}
