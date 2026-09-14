@@ -3098,3 +3098,83 @@ a restricted C subset, which is the real cost, not the toolchain.
 
 **Revisit trigger.** Field data showing host CPU or syscall overhead - not link
 bandwidth - as the limiting factor on either box. No such evidence exists today.
+
+## D-064 · Move a transactional flow whole off a full path
+
+**Decision.** In cascade mode, each transactional flow is remembered on the one path it
+rides. When that path's transactional shaper band backs up past `shaperRoom`, the flow
+moves whole to the best path that still has room, and it stays there until that path
+fills too. New flows start on the primary whenever the primary has room. Code:
+`internal/relay/transactional.go`, `pathShaper.hasTransactionalRoom`, and the
+transactional branch of `txForPacket`. This builds the "relief valve" future enhancement
+recorded in `scope-v1.md` (2026-09-14), using the design it chose there. It was the
+owner's request: "transactional flows don't get stuck on a small bandwidth link with low
+latency."
+
+**Why.** D-052's cascade is bulk-only. In cascade mode `buildTx` pins transactional to the
+primary with no spread. A speed test's parallel connections mostly classify as
+transactional. With Starlink's ~560 kbps standby tier as primary, all of that load piled
+onto Starlink while the 85 Mbps AT&T link had room to spare, and a concurrent VoWiFi call sharing
+Starlink suffered.
+
+**The rules, each with a test that fails when the rule is removed.**
+- **The trigger is transactional's own band.** That band drains ahead of bulk (D-060), so
+  it backs up only once real-time plus transactional want more than the path is shaped
+  to. That is exactly "transactional exceeds the link". A bulk backlog does not move
+  anything.
+- **Per flow, never per packet.** A flow lives on one path at a time, so nothing needs the
+  resequencer. A move costs one reordering event, like an ordinary route change. D-044's
+  collapse came from sustained interleaving, which this never does.
+- **Sticky (D-033's reasoning).** A flow leaves a path only when that path is full, never
+  for a better one. With every path full, it stays put. A move would buy a reordering and
+  no room.
+- **Held for 2 s after a move** (`transMoveHold`). Without the hold, a flow too big for
+  either of two links bounces between them as each one drains behind it. The one
+  exception: a path that leaves the order (down, red, unhealthy) gives its flows back
+  right away.
+- **Where to move: the primary first, then the scheduler's own ranking** (score, then
+  scoring delay). Between healthy links that means lowest latency first, and it is the
+  same ranking that picks the primary. The note in `scope-v1.md` suggested scoring delay
+  over `baseDelayMs`, because the trigger is congestion and a destination's own congestion
+  should count against it. The ranking includes that.
+- **Candidates pass the cascade's gates, minus the delta gate.** Health comes from D-046
+  (not red, not down, delivering, not flapping) and size from D-045 (at least 12% of the
+  best healthy link). A flow that moves has, by definition, filled a path, so a link an
+  eighth the size would be full the moment the flow arrived. The delta gate is dropped
+  because it exists for the resequencer. The primary always stays in the order, which is
+  why a small primary can hand flows to a big link.
+- **Cascade mode only.** In `bulk_scheduler: flow`, `txFor` already spreads transactional
+  per flow (D-044). That mode is v0.1 exactly, and it stays the kill switch.
+- **Unclassified traffic is not moved.** It has no flow to move (fragments, ICMP, a full
+  classifier table), and it queues in bulk's band, so transactional's room says nothing
+  about it.
+
+**Bounded state.** The table is keyed on `flowHash`. Idle entries go after
+`classify_flow_idle_seconds`, and the table is capped at `classify_max_flows`. Both limits
+are reused, not new settings. A hash collision means two flows share one entry, and so
+one path, which is harmless. The table is owned by the data-path goroutine, like the flow
+sequences, so it needs no lock.
+
+**Telemetry.** `transactional_moved` in the state file, `omp_transactional_moved_total` in
+Prometheus, a periodic log line, and a line in the UI under the bulk cascade.
+
+**Rejected: spilling transactional per packet, the cascade reversed.** It needs the
+resequencer. The resequencer's hold would add delay to exactly the latency-sensitive
+traffic this class exists to protect: a smaller version of the harm `admit()` refuses to
+do to transactional.
+
+**Verified on the real links** (2026-09-14, both nodes, Starlink primary on the vehicle).
+A real VoWiFi call (UDP/4500) ran beside a speed test:
+- **While the test's connections were still transactional,** 32 flows moved (36 → 68)
+  with no bouncing. The vehicle's transactional load, 3–9 Mbps during the download phase,
+  rode AT&T, and Starlink stayed at or below 25% of its shaped rate with no backlog.
+- **The call's downlink was clean:** 50 pps steady, and the largest gap was 86 ms during
+  the upload phase.
+
+**Starlink still saturated, but through bulk, not this.** Once the classifier
+reclassified the test as bulk, the cascade filled Starlink first on the vehicle and
+dropped 17k packets there. D-065 fixes that.
+
+**Open, for the road.** Neither the 2 s hold nor reusing `shaperRoom` as the trigger has
+been tuned. Both are reasoned from the lab constants and D-033, and the test above only
+showed they do no harm.

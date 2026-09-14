@@ -332,7 +332,8 @@ func (s *scheduler) pickCascade(d *decision, size int) ([]uint8, bool) {
 // txForPacket is what the data path calls: the paths one packet goes out of,
 // or false when it is to be dropped at the ingress. It differs from txFor only
 // while the cascade is active, where bulk is placed per packet and
-// transactional returns to the primary alone.
+// transactional returns to the primary, each flow moving off it whole once it
+// is full (D-064).
 func (s *scheduler) txForPacket(class uint8, flow uint32, size int) ([]uint8, bool) {
 	d := s.cur.Load()
 	if !d.cascadeOn || class == protocol.ClassRealtime {
@@ -341,9 +342,18 @@ func (s *scheduler) txForPacket(class uint8, flow uint32, size int) ([]uint8, bo
 	if class == protocol.ClassBulk {
 		return s.pickCascade(d, size)
 	}
-	// Transactional, and anything unplaced: the call's link, alone. S3 wants
-	// page loads responsive on the low-latency path, and a request split
-	// across links would be resequenced for nothing.
+	// Transactional: the call's link, alone, until it is full. S3 wants page
+	// loads responsive on the low-latency path, and a request split across
+	// links would be resequenced for nothing - so a flow moves whole, never
+	// per packet.
+	if class == protocol.ClassTransactional {
+		if tx := s.placeTransactional(d, flow); len(tx) > 0 {
+			return tx, true
+		}
+	}
+	// Anything unplaced - a fragment, ICMP, a full classifier table - has no
+	// flow to move and queues in bulk's band besides, so transactional's room
+	// says nothing about it. It stays on the primary.
 	if len(d.txTrans) > 0 {
 		return d.txTrans, true
 	}

@@ -3,6 +3,7 @@ package relay
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
@@ -15,6 +16,9 @@ func cascadeWorld(t *testing.T, paths ...pathMetric) *world {
 	w.s.peerResequences = func() bool { return true }
 	w.full = map[uint8]bool{}
 	w.s.hasRoom = func(id uint8) bool { return !w.full[id] }
+	w.transFull = map[uint8]bool{}
+	w.s.transRoom = func(id uint8) bool { return !w.transFull[id] }
+	w.s.now = func() time.Duration { return w.now }
 	return w
 }
 

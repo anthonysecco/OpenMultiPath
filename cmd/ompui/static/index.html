@@ -448,7 +448,10 @@ function bulkPlacement(s, named) {
       return `${named(p.id)}${p.cascade_protected ? " (call's path)" : ""} ${cap}`;
     }).join(" → ");
   const dropped = sc.bulk_overflowed ? ` · ${sc.bulk_overflowed.toLocaleString()} with every path backed up` : "";
-  return `<p class="muted" title="Bulk fills the slowest path first and spills onto faster ones only once each path's shaper backs up, the call's path last. A path is shaped to 90% of its measured link speed; an unmeasured path is unshaped, so it never spills.">Bulk: cascade ${members}${dropped}${reseq}</p>`;
+  const moved = sc.transactional_moved
+    ? `<p class="muted" title="Transactional rides the call's path until that path's transactional queue backs up; then a flow moves whole onto the best path with room, and stays there until that one fills too.">Transactional: ${sc.transactional_moved.toLocaleString()} flows moved off a full path</p>`
+    : "";
+  return `<p class="muted" title="Bulk fills the slowest path first and spills onto faster ones only once each path's shaper backs up, the call's path last. A path is shaped to 90% of its measured link speed; an unmeasured path is unshaped, so it never spills.">Bulk: cascade ${members}${dropped}${reseq}</p>${moved}`;
 }
 
 // What the classifier has decided, since the daemon started.

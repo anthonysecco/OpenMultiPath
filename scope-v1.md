@@ -45,7 +45,10 @@ traffic only when the fast one is saturated or down.
 *(The above was written before D-052 built bulk's per-packet cascade + resequencer.
 It is done for bulk. What follows is a new, still-open gap found afterward.)*
 
-## Future enhancement: give transactional traffic a relief valve (not yet designed in full)
+## Future enhancement: give transactional traffic a relief valve (built as D-064)
+
+*(Built 2026-09-14 as direction 2 below; `decisions.md` D-064 is the as-built record and
+overrides this note where they disagree.)*
 
 **The gap, found 2026-09-14 investigating a real VoWiFi call (UDP/4500) with an upload
 speed test running concurrently.** In `bulk_scheduler: cascade` mode, D-052's per-packet

@@ -68,7 +68,8 @@ type decision struct {
 	// single path, so nothing reorders.
 	txBulkSpread []uint8
 
-	// txTrans is the transactional set: the primary alone.
+	// txTrans is the transactional set: the primary alone. While the cascade
+	// runs, a transactional flow leaves it once it is full (transOrder, D-064).
 	//
 	// It follows real-time's path but never real-time's duplication.
 	// Transactional wants the same link - shortest round trip, least loss
@@ -95,6 +96,15 @@ type decision struct {
 	cascadeOn   bool
 	cascadeWhy  string
 	overflowIdx int // where bulk goes past every allowance
+
+	// transOrder is where a transactional flow may ride while the cascade
+	// runs, the primary first; a flow moves along it only when its own path
+	// is full (D-064, transactional.go). Empty when the cascade is not
+	// running. transIdle and transMaxFlows bound the data path's flow table,
+	// published here so it need not read config on every packet.
+	transOrder    []uint8
+	transIdle     time.Duration
+	transMaxFlows int
 
 	primary     uint8
 	havePrimary bool
@@ -216,6 +226,20 @@ type scheduler struct {
 	// in every real build; a field so tests can say which paths are full.
 	hasRoom func(id uint8) bool
 
+	// transRoom is hasRoom for transactional's own shaper band (D-064), and
+	// now the data path's clock for how long a moved flow is held.
+	transRoom func(id uint8) bool
+	now       func() time.Duration
+
+	// transFlows is the path each transactional flow is riding, keyed by its
+	// flow hash, and transSweepAt when idle entries are next forgotten. Owned
+	// by the data path goroutine alone, like the session's flow sequences.
+	transFlows   map[uint32]*transFlow
+	transSweepAt time.Duration
+
+	// transMoved counts transactional flows moved off a full path.
+	transMoved atomic.Uint64
+
 	// The cascade's evaluation state, owned by the evaluation goroutine:
 	// the fill order held across evaluations, the swaps waiting out their
 	// hysteresis, and the counters last read.
@@ -249,6 +273,8 @@ func newScheduler(sess *session, cfg *config.Holder, candidates func() []uint8) 
 	if sess != nil {
 		s.peerResequences = func() bool { return sess.emitVersion() >= 3 }
 		s.hasRoom = func(id uint8) bool { return sess.shaperFor(id).hasRoom() }
+		s.transRoom = func(id uint8) bool { return sess.shaperFor(id).hasTransactionalRoom() }
+		s.now = sess.elapsed
 	}
 	s.cur.Store(emptyDecision)
 	return s
@@ -825,6 +851,7 @@ func (s *scheduler) evaluate(now time.Duration, c config.Config) {
 	s.buildTx(d, c, eligible, sendable)
 	s.steerBulk(now, d, c, eligible)
 	s.buildCascade(now, d, c, eligible)
+	s.buildTransactional(now, d, c, eligible)
 	if d.cascadeOn {
 		// The cascade's controller protects the call's path now, and D-031's
 		// gate is not kept behind it (S7). The gate still runs in flow mode,

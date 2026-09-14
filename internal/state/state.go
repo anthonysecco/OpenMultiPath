@@ -158,6 +158,11 @@ type Scheduler struct {
 	// figure means the allowances are set lower than the links can carry.
 	BulkOverflowed uint64 `json:"bulk_overflowed"`
 
+	// TransactionalMoved counts transactional flows moved whole off a path
+	// whose transactional band had backed up, onto one with room (D-064).
+	// Zero outside cascade mode, where transactional is spread per flow.
+	TransactionalMoved uint64 `json:"transactional_moved"`
+
 	// WireVersion is the version this end is speaking to its peer.
 	WireVersion int `json:"wire_version"`
 

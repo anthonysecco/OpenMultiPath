@@ -484,6 +484,9 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP omp_bulk_overflowed_total Bulk sent with every cascade path's shaper backed up, onto the first path in the fill order.\n")
 	fmt.Fprintf(w, "# TYPE omp_bulk_overflowed_total counter\n")
 	fmt.Fprintf(w, "omp_bulk_overflowed_total{node=%q} %d\n", escape(snap.Node), snap.Scheduler.BulkOverflowed)
+	fmt.Fprintf(w, "# HELP omp_transactional_moved_total Transactional flows moved whole off a path whose transactional band had backed up.\n")
+	fmt.Fprintf(w, "# TYPE omp_transactional_moved_total counter\n")
+	fmt.Fprintf(w, "omp_transactional_moved_total{node=%q} %d\n", escape(snap.Node), snap.Scheduler.TransactionalMoved)
 	fmt.Fprintf(w, "# HELP omp_wire_version Wire version spoken to the peer.\n# TYPE omp_wire_version gauge\n")
 	fmt.Fprintf(w, "omp_wire_version{node=%q} %d\n", escape(snap.Node), snap.Scheduler.WireVersion)
 	rs := snap.Scheduler.Resequencer

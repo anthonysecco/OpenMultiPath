@@ -190,6 +190,22 @@ func (s *pathShaper) hasRoom() bool {
 	return float64(s.queued[bandBulk]) < s.bytesFor(shaperRoom, shaperMinBurstBytes)
 }
 
+// hasTransactionalRoom is hasRoom for the transactional band: whether a
+// transactional flow may stay on or move onto this path (D-064). Bulk's
+// backlog does not count against it, for the mirror of hasRoom's reason -
+// transactional drains ahead of bulk, so a download queuing here takes nothing
+// from a request. Its own band backs up only once real-time and transactional
+// together want more than the path is shaped to, which is exactly the
+// condition that should move a flow.
+func (s *pathShaper) hasTransactionalRoom() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rateBps == 0 {
+		return true
+	}
+	return float64(s.queued[bandTransactional]) < s.bytesFor(shaperRoom, shaperMinBurstBytes)
+}
+
 // send transmits one data packet, now if the bucket allows and nothing is
 // waiting ahead of it, otherwise queued in its class's band.
 func (s *pathShaper) send(class uint8, globalSeq uint32, tag flowTag, payload []byte) {

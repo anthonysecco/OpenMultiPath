@@ -188,6 +188,34 @@ func TestHasRoomIgnoresTransactionalBacklog(t *testing.T) {
 	}
 }
 
+// hasTransactionalRoom is the mirror (D-064): transactional's own backlog
+// fills it, and bulk's does not, since transactional drains ahead of bulk.
+func TestHasTransactionalRoomReadsOnlyItsOwnBand(t *testing.T) {
+	r := newShaperRig()
+	r.sh.setRate(8) // 1 kB a second, so a small backlog fills shaperRoom
+	if !r.sh.hasTransactionalRoom() {
+		t.Fatal("an empty shaped path reads as having no room for transactional")
+	}
+	for i := 0; i < 50; i++ {
+		r.sh.send(protocol.ClassBulk, uint32(i), flowTag{}, pkt('b', 1000))
+	}
+	time.Sleep(20 * time.Millisecond)
+	if !r.sh.hasTransactionalRoom() {
+		t.Error("a path with only bulk queued reads as having no room for transactional")
+	}
+	for i := 0; i < 10; i++ {
+		r.sh.send(protocol.ClassTransactional, uint32(100+i), flowTag{}, pkt('t', 1000))
+	}
+	if r.sh.hasTransactionalRoom() {
+		t.Error("a path with seconds of transactional queued reads as having room for more")
+	}
+
+	r.sh.setRate(0)
+	if !r.sh.hasTransactionalRoom() {
+		t.Error("an unshaped path reads as full")
+	}
+}
+
 // Past the queue limit a packet is dropped rather than queued, which is how a
 // sender learns the link is full.
 func TestShaperDropsPastItsQueueLimit(t *testing.T) {

@@ -1338,6 +1338,9 @@ func (s *session) logStats() {
 			// which belongs to the evaluation goroutine.
 			name := func(id uint8) string { return pathLabel(id, s.cfg.Get().LabelFor(s.names[id])) }
 			log.Printf("bulk: %s; %d sent past every allowance", describeCascade(d, name), s.sched.overflowed.Load())
+			if n := s.sched.transMoved.Load(); n > 0 {
+				log.Printf("transactional: %d flows moved off a full path", n)
+			}
 		}
 		if s.reseq != nil {
 			if st := s.reseq.stats(); st.Reordered > 0 || st.Late > 0 {
@@ -1611,6 +1614,7 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 	}
 	if s.sched != nil {
 		snap.Scheduler.BulkOverflowed = s.sched.overflowed.Load()
+		snap.Scheduler.TransactionalMoved = s.sched.transMoved.Load()
 	}
 	snap.Scheduler.WireVersion = int(s.emitVersion())
 	snap.LinkSpeedsHeld = s.haveSpeeds && len(s.speeds) > 0

@@ -25,8 +25,10 @@ type world struct {
 	// expressible - it is what a handover to a one-way path looks like.
 	mute map[uint8]bool
 
-	// full names paths whose shaper is backed up, for the cascade's spill.
-	full map[uint8]bool
+	// full names paths whose shaper is backed up, for the cascade's spill,
+	// and transFull paths whose transactional band is (D-064).
+	full      map[uint8]bool
+	transFull map[uint8]bool
 }
 
 func newWorld(t *testing.T, paths ...pathMetric) *world {
