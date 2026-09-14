@@ -1020,6 +1020,14 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 			s.reseq.reset()
 		}
 
+		// And so did its global sequence, which the dedup window is keyed
+		// on. Left holding the old counter the window failed open on every
+		// packet and delivered each duplicate twice, or, against a peer up
+		// only briefly, would drop its first packets as copies of old ones.
+		if s.dedup != nil {
+			s.dedup.reset()
+		}
+
 		// And it has forgotten the link speeds it was told, so they are
 		// due again (D-055).
 		s.speedsAcked = false

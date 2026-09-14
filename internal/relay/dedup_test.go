@@ -174,3 +174,41 @@ func TestLateArrivalInASkippedRangeIsNotMistakenForADuplicate(t *testing.T) {
 		t.Error("the second copy of that late packet was delivered")
 	}
 }
+
+// A peer that restarts counts from zero again. Against a window whose top is
+// that peer's old counter, every new packet reads as older than the window.
+// Delivering it is right; staying stuck there is not. The field case: home
+// delivered every duplicated call packet twice after a deploy restarted it
+// ahead of the vehicle.
+func TestFarBehindReseedsTheWindowSoDedupRecovers(t *testing.T) {
+	w := newDedupWindow()
+	w.accept(50_000_000)
+
+	for seq := uint32(1); seq <= 100; seq++ {
+		if !w.accept(seq) {
+			t.Fatalf("sequence %d from the restarted peer was dropped", seq)
+		}
+		if w.accept(seq) {
+			t.Fatalf("the second copy of sequence %d was delivered: dedup stayed open after the restart", seq)
+		}
+	}
+}
+
+// reset forgets the old counter entirely, so a peer that restarts after only a
+// short run - its old sequences still inside the window - does not have its new
+// packets thrown away as copies of old ones.
+func TestResetForgetsTheOldCounter(t *testing.T) {
+	w := newDedupWindow()
+	for seq := uint32(1); seq <= 1000; seq++ {
+		w.accept(seq)
+	}
+	w.reset()
+	for seq := uint32(1); seq <= 10; seq++ {
+		if !w.accept(seq) {
+			t.Fatalf("sequence %d after a reset was dropped as a copy of the old run", seq)
+		}
+	}
+	if w.accept(5) {
+		t.Error("a duplicate after the reset was delivered")
+	}
+}

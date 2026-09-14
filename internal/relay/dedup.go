@@ -62,6 +62,29 @@ func (w *dedupWindow) isSet(seq uint32) bool {
 	return w.bits[(seq/64)%uint32(len(w.bits))]&(1<<(seq%64)) != 0
 }
 
+// reset forgets everything, so the next packet starts the window afresh.
+// The session calls it when the peer restarts: the peer's global sequence
+// has started again from zero, and a window still holding the old counter
+// would either fail open on every packet (old top far ahead) or drop the
+// new packets as copies of old ones (old top close behind).
+func (w *dedupWindow) reset() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i := range w.bits {
+		w.bits[i] = 0
+	}
+	w.seen = false
+}
+
+// reseedLocked starts the window again at seq.
+func (w *dedupWindow) reseedLocked(seq uint32) {
+	for i := range w.bits {
+		w.bits[i] = 0
+	}
+	w.top = seq
+	w.mark(seq)
+}
+
 // accept reports whether this packet should be delivered. A false means it
 // is a copy of one already delivered.
 func (w *dedupWindow) accept(seq uint32) bool {
@@ -98,7 +121,22 @@ func (w *dedupWindow) accept(seq uint32) bool {
 
 	case int(-d) >= dedupBits:
 		// Older than the window can speak to. Deliver it - see the
-		// fail-open note above.
+		// fail-open note above - and start the window again from here.
+		//
+		// Delivering alone was not enough. A peer that restarts counts
+		// from zero again, and every packet it sends reads as older than
+		// the old top: with nothing to move the top back, the window
+		// failed open for good and every duplicated packet was delivered
+		// twice until the new counter caught the old one up. On the real
+		// pair that was home delivering each of a call's uplink packets
+		// twice after a deploy restarted it two seconds ahead of the
+		// vehicle. The session resets the window when it sees a restart
+		// (reset); this is what keeps a restart the detector misses from
+		// costing the same. A genuinely ancient straggler re-seeds it too,
+		// which costs at most a few copies delivered twice while the
+		// window re-learns - the direction this mechanism is allowed to
+		// err in.
+		w.reseedLocked(seq)
 		return true
 
 	default:

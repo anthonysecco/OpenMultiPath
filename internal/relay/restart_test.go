@@ -88,3 +88,30 @@ func TestPeerRestartRecoversSequenceTracking(t *testing.T) {
 			s.paths[0].wantSeq, want)
 	}
 }
+
+// The dedup window is keyed on the peer's global sequence, which a restart
+// takes back to zero like everything else. A peer up only briefly left its old
+// sequences inside the window, so its first packets after restarting would be
+// dropped as copies of them - the session must reset the window when it sees
+// the restart.
+func TestPeerRestartResetsTheDedupWindow(t *testing.T) {
+	s := newTestSession()
+
+	uptime := uint32(200 * time.Second / time.Microsecond)
+	for i := uint32(0); i < 1000; i++ {
+		s.observe(&protocol.Header{PathID: 0, PathSeq: 4000 + i, SendTS: uptime + i}, 100)
+		s.deliver(i + 1)
+	}
+
+	// The peer restarts: clock, path sequence and global sequence all start
+	// over.
+	s.observe(&protocol.Header{PathID: 0, PathSeq: 0, SendTS: 1000}, 100)
+	for seq := uint32(1); seq <= 10; seq++ {
+		if !s.deliver(seq) {
+			t.Fatalf("global sequence %d after the peer restarted was dropped as a duplicate", seq)
+		}
+	}
+	if s.deliver(3) {
+		t.Error("a duplicate after the restart was delivered")
+	}
+}

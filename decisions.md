@@ -3269,3 +3269,61 @@ twice, both times with transactional traffic, not bulk:
   `shaperRoom`'s 3,000-byte floor, so the move trigger never fired.
 
 Neither touched the call, which is sent first on Starlink.
+
+## D-066 · Reset the dedup window when the peer restarts
+
+**Decision.** The receive-side dedup window (`internal/relay/dedup.go`, D-038) now starts
+over when the peer restarts, in two ways:
+- **In the session's peer-restart block** (`session.observe`), beside the resequencer
+  reset and the link-speed re-send it already does.
+- **Inside the window itself.** A packet so far behind the top that the window can say
+  nothing about it is still delivered, as before, but the window now re-seeds from it.
+
+**Found on the real links** (2026-09-14), capturing a real VoWiFi call at both ends during
+D-065's test. Home delivered 822 of the call's 824 uplink packets twice, about 5 ms apart:
+the second link's copy. Home had discarded 0 duplicates since the day's first deploy, and
+65,065 before it. The vehicle deduplicated normally.
+
+**Cause.** Both deploys restarted home about 2 s before the vehicle. In that gap home's new
+window took its top from the vehicle's old process, whose global sequence was high. The
+restarted vehicle counts from zero again, so every packet it sent read as more than a
+window behind the top. The window delivers those by design (fail open), but nothing ever
+moved the top back. It stayed open for every packet until the new counter caught up with
+the old one, which on a busy link is days. The session's peer-restart handling already
+reset the per-path sequence, the resequencer and the link speeds, because each is keyed on
+a counter the restart zeroes. The dedup window is keyed on one too and had been missed.
+
+**Two mechanisms, because they cover different cases.**
+- **The reset is the only thing that handles a peer that was up briefly.** Its old
+  sequences are still inside the window, so its first packets after restarting are not far
+  behind. They land on set bits and would be dropped as copies of old packets, failing
+  closed. A re-seed never sees them.
+- **The re-seed is the only thing that handles a restart the detector misses.** Detection
+  is a transit swing larger than any plausible queue (in
+  `pathStats.observeTransit`), so a peer restarted after a very short run might not produce
+  one.
+
+Each has a test that fails without it.
+
+**Accepted, knowingly.** A genuinely ancient straggler, more than 65,536 sequences late,
+also re-seeds the window. A few duplicates still in flight may then be delivered twice
+while it re-learns. That is the direction D-038 chose to err in, and a packet that late
+is rare.
+
+**Impact while it was broken.** Real-time only, since nothing else is duplicated, and in
+the direction toward whichever end restarted first. The call was unharmed because the
+carrier's IPsec replay window discards the second copy. A real-time application without
+one, such as plain RTP, would have received every packet twice. The bug is as old as D-038
+and fired on any deploy that restarted the ends in that order.
+
+**Verified on the real links** (2026-09-14). The fix was deployed in the order that had
+broken it, home 2 s ahead of the vehicle. A real VoWiFi call was then captured at both ends
+for 66 s:
+
+| Direction | Sent | Delivered at the far end | Delivered twice |
+|---|---|---|---|
+| Vehicle → home | 3,536 | 3,535 | 0 (was 822 of 824) |
+| Home → vehicle | 5,087 | 5,086 | 0 |
+
+The one-packet difference in each direction was still in flight when the capture
+stopped. Over the call, home discarded 2,746 duplicate copies and the vehicle 3,499.
