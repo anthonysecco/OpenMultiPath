@@ -422,7 +422,17 @@ func TestTiedScoresBreakTowardsTheLowerDelay(t *testing.T) {
 // beautifully - no queue, no loss, nothing to go wrong yet. Sending it a
 // mirror of a multi-megabit transfer is how a 10 MB copy produced eight
 // thousand lost packets.
-func TestDuplicationSkipsAPathTooSmallForTheLoad(t *testing.T) {
+// Capacity is deliberately not checked before duplicating. offeredKbps is
+// the primary's whole send rate - real-time plus whatever bulk and
+// transactional are riding the same path - not what the duplicate itself
+// costs, since only real-time is ever mirrored. Gating on it made a
+// saturating download look like it would cost 6 Mbps to duplicate and
+// silently stopped the real-time copy going out at exactly the moment it
+// mattered most. The shaper on the receiving path enforces the real
+// constraint itself: real-time drained ahead of everything else in its own
+// band, dropped there rather than corrupted if the path genuinely cannot
+// carry it (principle 5).
+func TestDuplicationIgnoresLoadAndTrustsTheShaper(t *testing.T) {
 	w := newWorld(t, path(0, 40), path(1, 30))
 	w.c.DuplicateMode = config.DuplicateUnstable
 	w.s.cfg = config.NewHolder(w.c)
@@ -441,11 +451,8 @@ func TestDuplicationSkipsAPathTooSmallForTheLoad(t *testing.T) {
 	if d.primary != 1 {
 		t.Fatalf("primary is path %d, want the transfer to still be on path 1", d.primary)
 	}
-	if txSet(d)[0] {
-		t.Errorf("duplicated a 6 Mbps stream onto a 512 kbps path: tx %v (%s)", d.tx, d.reason)
-	}
-	if len(d.tx) != 1 {
-		t.Errorf("tx = %v, want the primary alone when nothing can take a copy", d.tx)
+	if !txSet(d)[0] {
+		t.Errorf("did not duplicate onto path 0 despite it looking too small for the primary's load: tx %v (%s)", d.tx, d.reason)
 	}
 }
 

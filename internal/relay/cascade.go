@@ -23,7 +23,7 @@ import (
 //     nothing, and spills onto the next faster path only once that one is
 //     full, and so on down to the path carrying the call, which is always
 //     last;
-//   - a path is full when its shaper is backed up (D-055): it is held to 95%
+//   - a path is full when its shaper is backed up (D-055): it is held to 90%
 //     of its measured speed, and bulk queued behind that past shaperRoom goes
 //     on to the next path. A path never measured is unshaped, so it never
 //     reads full and never spills - an unmeasured link is taken as unlimited;

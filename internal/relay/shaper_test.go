@@ -134,6 +134,60 @@ func TestRealtimeDrainsAheadOfQueuedBulk(t *testing.T) {
 	t.Fatalf("real-time never went out: %q", r.order())
 }
 
+// Transactional jumps a bulk backlog the same way real-time does, but does
+// not jump real-time: three strict-priority bands, not two.
+func TestTransactionalDrainsAheadOfBulkButBehindRealtime(t *testing.T) {
+	r := newShaperRig()
+	r.sh.setRate(80) // 10 kB a second
+	for i := 0; i < 30; i++ {
+		r.sh.send(protocol.ClassBulk, uint32(i), flowTag{}, pkt('b', 1000))
+	}
+	r.sh.send(protocol.ClassRealtime, 98, flowTag{}, pkt('r', 200))
+	r.sh.send(protocol.ClassTransactional, 99, flowTag{}, pkt('t', 200))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		order := r.order()
+		var seenR, seenT bool
+		for i, b := range order {
+			switch b {
+			case 'r':
+				seenR = true
+			case 't':
+				seenT = true
+				if !seenR {
+					t.Fatalf("transactional went out before real-time: %q", order)
+				}
+				// Same slack as the real-time test: whatever was already on
+				// its way when these arrived may go first, but no more.
+				if i > 4 {
+					t.Fatalf("transactional went out after %d bulk packets: %q", i, order)
+				}
+			}
+		}
+		if seenT {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("transactional never went out: %q", r.order())
+}
+
+// hasRoom is bulk's own backlog only: a transactional flow queued up must
+// not read as bulk being full, or the cascade would spill bulk off a
+// perfectly good path for the wrong reason.
+func TestHasRoomIgnoresTransactionalBacklog(t *testing.T) {
+	r := newShaperRig()
+	r.sh.setRate(8) // 1 kB a second, so a small backlog fills shaperRoom
+	for i := 0; i < 50; i++ {
+		r.sh.send(protocol.ClassTransactional, uint32(i), flowTag{}, pkt('t', 1000))
+	}
+	time.Sleep(20 * time.Millisecond) // let the drain goroutine start pulling
+	if !r.sh.hasRoom() {
+		t.Error("a path with only transactional queued reads as having no room for bulk")
+	}
+}
+
 // Past the queue limit a packet is dropped rather than queued, which is how a
 // sender learns the link is full.
 func TestShaperDropsPastItsQueueLimit(t *testing.T) {

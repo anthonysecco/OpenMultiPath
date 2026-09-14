@@ -50,8 +50,8 @@ func TestCorruptFileLoadsEmptyWithAnError(t *testing.T) {
 }
 
 func TestShapedKbps(t *testing.T) {
-	if got := ShapedKbps(10_000); got != 9_500 {
-		t.Errorf("ShapedKbps(10000) = %v, want 9500", got)
+	if got := ShapedKbps(10_000); got != 9_000 {
+		t.Errorf("ShapedKbps(10000) = %v, want 9000", got)
 	}
 	if got := ShapedKbps(0); got != 0 {
 		t.Errorf("unmeasured shaped to %v, want 0 (unlimited)", got)

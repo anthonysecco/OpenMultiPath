@@ -36,8 +36,8 @@ func TestLinkSpeedsReachHomeAndAreAcknowledged(t *testing.T) {
 	vehicle.mu.Lock()
 	up0, up1 := vehicle.shapedKbpsLocked(0), vehicle.shapedKbpsLocked(1)
 	vehicle.mu.Unlock()
-	if up0 != 9_500 || up1 != 0 {
-		t.Errorf("vehicle shaped path 0 to %.0f and path 1 to %.0f, want 9500 and unshaped", up0, up1)
+	if up0 != 9_000 || up1 != 0 {
+		t.Errorf("vehicle shaped path 0 to %.0f and path 1 to %.0f, want 9000 and unshaped", up0, up1)
 	}
 
 	now := vehicle.elapsed()
@@ -62,8 +62,8 @@ func TestLinkSpeedsReachHomeAndAreAcknowledged(t *testing.T) {
 	home.mu.Lock()
 	down0 := home.shapedKbpsLocked(0)
 	home.mu.Unlock()
-	if down0 != 47_500 {
-		t.Errorf("home shaped path 0 to %.0f, want 47500 (95%% of the download)", down0)
+	if down0 != 45_000 {
+		t.Errorf("home shaped path 0 to %.0f, want 45000 (90%% of the download)", down0)
 	}
 
 	// Unacknowledged, it is repeated.
@@ -145,8 +145,8 @@ func TestLinkSpeedsNotSentToAnOlderPeer(t *testing.T) {
 	// It still shapes its own sends; that needs nothing from home.
 	vehicle.mu.Lock()
 	defer vehicle.mu.Unlock()
-	if got := vehicle.shapedKbpsLocked(0); got != 9_500 {
-		t.Errorf("shaped to %.0f, want 9500", got)
+	if got := vehicle.shapedKbpsLocked(0); got != 9_000 {
+		t.Errorf("shaped to %.0f, want 9000", got)
 	}
 }
 
@@ -177,10 +177,10 @@ func TestShapersFollowTheSet(t *testing.T) {
 		"wg1": {UpKbps: 20_000, MeasuredUnix: 1},
 		"wg2": {UpKbps: 4_000, MeasuredUnix: 1},
 	})))
-	if got := sh.kbps(); got < 18_999 || got > 19_001 {
-		t.Errorf("existing shaper at %.0f kbps, want 19000", got)
+	if got := sh.kbps(); got < 17_999 || got > 18_001 {
+		t.Errorf("existing shaper at %.0f kbps, want 18000", got)
 	}
-	if got := vehicle.shaperFor(1).kbps(); got < 3_799 || got > 3_801 {
-		t.Errorf("new shaper at %.0f kbps, want 3800", got)
+	if got := vehicle.shaperFor(1).kbps(); got < 3_599 || got > 3_601 {
+		t.Errorf("new shaper at %.0f kbps, want 3600", got)
 	}
 }

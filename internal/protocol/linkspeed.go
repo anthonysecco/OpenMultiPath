@@ -10,8 +10,8 @@ import (
 // Link speeds, version 4 (D-055).
 //
 // The vehicle measures each link's speed in both directions with the flow
-// test and shapes its own sends to 95% of the upload figure. Home has to
-// shape its sends on the same link to 95% of the download figure, and has no
+// test and shapes its own sends to 90% of the upload figure. Home has to
+// shape its sends on the same link to 90% of the download figure, and has no
 // way to measure it itself - the test is run from the vehicle, which owns the
 // links. So the vehicle tells it.
 //

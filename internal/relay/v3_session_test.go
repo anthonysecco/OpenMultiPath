@@ -170,52 +170,25 @@ func TestNoFastReportsTowardAVersionTwoPeer(t *testing.T) {
 	}
 }
 
-// The standing queue ignores a lone spike that the instantaneous figure
-// reports, and follows a queue that really stands.
-func TestStandingQueueIgnoresASpikeAndFollowsAStandingQueue(t *testing.T) {
-	var st pathStats
-	now := time.Duration(0)
-	transit := uint32(1_000_000)
-	for i := 0; i < 100; i++ { // settle a floor
-		now += 5 * time.Millisecond
-		st.observeTransit(transit, now)
-	}
-	now += 5 * time.Millisecond
-	st.observeTransit(transit+80_000, now) // one 80 ms spike
-	if q := st.standingQueue(now); q != 0 {
-		t.Errorf("standing queue %d us after one spike, want 0", q)
-	}
-	if st.queueDelay < 70_000 {
-		t.Fatalf("instantaneous queue %d us, the spike should show there", st.queueDelay)
-	}
-	for i := 0; i < 40; i++ { // 200 ms of every packet 30 ms late
-		now += 5 * time.Millisecond
-		st.observeTransit(transit+30_000, now)
-	}
-	if q := st.standingQueue(now); q < 29_000 || q > 31_000 {
-		t.Errorf("standing queue %d us under a 30 ms standing queue, want ~30000", q)
-	}
-}
-
-func TestShortLossFollowsTheLastSecond(t *testing.T) {
+// shortRxKbps still follows the last second even though its byte-rate
+// bucket now also stands in for what standing-queue/short-loss used to
+// track before D-055 removed the controller that paced on them.
+func TestShortRxKbpsFollowsTheLastSecond(t *testing.T) {
 	var st pathStats
 	now := time.Duration(0)
 	for i := 0; i < 90; i++ {
 		now += 10 * time.Millisecond
 		st.observeTransit(1000, now)
+		st.noteBytes(1250) // 1000 bytes/10ms -> 1 Mbps -ish, in wire bytes
 	}
-	st.observeLoss(10)
-	if l := st.shortLossPercent(now); l < 5 {
-		t.Errorf("short loss %.1f%% right after losing 10 packets, want it visible", l)
+	if kbps := st.shortRxKbps(now); kbps < 500 {
+		t.Errorf("short rx %.0f kbps while receiving steadily, want it visible", kbps)
 	}
 	for i := 0; i < 150; i++ {
 		now += 10 * time.Millisecond
 		st.observeTransit(1000, now)
 	}
-	if l := st.shortLossPercent(now); l != 0 {
-		t.Errorf("short loss %.1f%% 1.5 s later, want 0", l)
-	}
-	if st.recentLossPercent() == 0 {
-		t.Error("the thirty-second figure forgot the loss too; only the short one should")
+	if kbps := st.shortRxKbps(now); kbps != 0 {
+		t.Errorf("short rx %.0f kbps 1.5 s after the last byte, want 0", kbps)
 	}
 }

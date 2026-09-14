@@ -239,12 +239,6 @@ type Path struct {
 	TxJitterMs     float64 `json:"tx_jitter_ms"`
 	TxLossPercent  float64 `json:"tx_loss_percent"`
 
-	// Version 3 figures: the standing queue - the least transit above the
-	// floor over the last ~100 ms - and loss over the last second. What the
-	// cascade paces on.
-	TxStandingQueueMs  float64 `json:"tx_standing_queue_ms"`
-	TxShortLossPercent float64 `json:"tx_short_loss_percent"`
-
 	// TxDelayMs is the one-way delay estimate the scheduler actually ranks
 	// on: half the round-trip floor, plus what the peer says it is queueing.
 	// The first half is a symmetry assumption and the second is measured;
@@ -262,7 +256,7 @@ type Path struct {
 	// never measured; LinkMeasuredUnix is when. The vehicle reads them from
 	// its measurement file and home is told them by the vehicle.
 	//
-	// ShapedKbps is the most this end sends on the path - 95% of the
+	// ShapedKbps is the most this end sends on the path - 90% of the
 	// measurement in its own send direction - or 0 for unshaped, which is
 	// what an unmeasured link always is. ShaperBacklogBytes is what is
 	// queued behind the shaper now, and ShaperDropped how many packets have

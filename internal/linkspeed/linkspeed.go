@@ -42,9 +42,9 @@ const DefaultPath = "/var/lib/openmultipath/linkspeed.json"
 // keeps the daemon's own queue - where the call can be put first - ahead of
 // the carrier's, where it cannot.
 //
-// A constant, not a setting: the owner set 95%, and every tunable needs a
+// A constant, not a setting: the owner set 90%, and every tunable needs a
 // working default the user never has to touch.
-const ShapePercent = 95
+const ShapePercent = 90
 
 // ShapedKbps is the most ompd sends on a link measured at kbps, or 0 -
 // unlimited - for a link never measured.

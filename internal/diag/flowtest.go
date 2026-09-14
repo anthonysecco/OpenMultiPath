@@ -150,7 +150,7 @@ type tally struct {
 // All of it applies because this test binds straight to the wg interface
 // (D-040's own choice), so every data packet really is WireGuard-encapsulated
 // on its way out. protocol.IPWireBytes is shared with ompd's shaper (D-055),
-// which limits each link to 95% of this figure and has to count bytes exactly
+// which limits each link to 90% of this figure and has to count bytes exactly
 // the way it was measured.
 func mbps(t tally, seconds int) float64 {
 	if seconds <= 0 || t.packets == 0 {

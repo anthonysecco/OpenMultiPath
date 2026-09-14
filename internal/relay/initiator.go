@@ -46,7 +46,7 @@ type InitiatorConfig struct {
 	Tun TunConfig
 
 	// LinkSpeedPath is the measurement file ompui writes after a flow test
-	// (D-055). Each link is shaped to 95% of its measured upload, and the
+	// (D-055). Each link is shaped to 90% of its measured upload, and the
 	// set is passed to home. A missing file leaves every link unshaped.
 	LinkSpeedPath string
 }

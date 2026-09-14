@@ -18,10 +18,11 @@ import (
 // The point is where the queue forms. Sent flat out, a link queues in the
 // carrier's modem, where a download sits in front of the call and nothing on
 // this box can reorder it. Held just under the link's speed, the queue forms
-// here instead, and here the call goes first: real-time has a band of its own
-// that always drains ahead of everything else. Bulk still takes every byte the
-// call does not use - ordering, not a throttle, which keeps the owner's rule
-// that real-time never holds bulk back (D-052).
+// here instead, and here the call goes first: three strict-priority bands,
+// real-time drained ahead of transactional, transactional ahead of bulk.
+// Each class still takes every byte the one above it does not use -
+// ordering, not a throttle, which keeps the owner's rule that real-time
+// never holds bulk back (D-052).
 //
 // Packets are queued unbuilt and stamped only as they leave. Two reasons,
 // either sufficient: the per-path sequence must be in wire order or the far
@@ -70,11 +71,15 @@ const (
 	shaperRoom = 10 * time.Millisecond
 )
 
-// Bands, drained strictly in order.
+// Bands, drained strictly in order: real-time first, then transactional,
+// then bulk. Traffic the classifier could not place (protocol.ClassUnknown)
+// shares bulk's band rather than transactional's - an honest "don't know"
+// gets no more benefit of the doubt than confirmed bulk.
 const (
-	bandRealtime = 0
-	bandOther    = 1
-	shaperBands  = 2
+	bandRealtime      = 0
+	bandTransactional = 1
+	bandBulk          = 2
+	shaperBands       = 3
 )
 
 // shapedPacket is one queued, unbuilt data packet.
@@ -164,22 +169,25 @@ func (s *pathShaper) kbps() float64 {
 	return s.rateBps * 8 / 1000
 }
 
-// backlog is the payload bytes waiting in both bands.
+// backlog is the payload bytes waiting across all bands.
 func (s *pathShaper) backlog() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.queued[bandRealtime] + s.queued[bandOther]
+	return s.queued[bandRealtime] + s.queued[bandTransactional] + s.queued[bandBulk]
 }
 
 // hasRoom reports whether the cascade may place more bulk here: always on an
-// unshaped path, and on a shaped one while its backlog is under shaperRoom.
+// unshaped path, and on a shaped one while bulk's own backlog is under
+// shaperRoom. Transactional's backlog does not count against it - a
+// transactional flow queuing up is not evidence that bulk is full, and
+// letting it count would spill bulk off a path for the wrong reason.
 func (s *pathShaper) hasRoom() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.rateBps == 0 {
 		return true
 	}
-	return float64(s.queued[bandOther]) < s.bytesFor(shaperRoom, shaperMinBurstBytes)
+	return float64(s.queued[bandBulk]) < s.bytesFor(shaperRoom, shaperMinBurstBytes)
 }
 
 // send transmits one data packet, now if the bucket allows and nothing is
@@ -207,9 +215,12 @@ func (s *pathShaper) send(class uint8, globalSeq uint32, tag flowTag, payload []
 		}
 	}
 
-	band := bandOther
-	if class == protocol.ClassRealtime {
+	band := bandBulk
+	switch class {
+	case protocol.ClassRealtime:
 		band = bandRealtime
+	case protocol.ClassTransactional:
+		band = bandTransactional
 	}
 	if float64(s.queued[band]+len(payload)) > s.limitLocked() {
 		s.mu.Unlock()
@@ -258,7 +269,7 @@ func (s *pathShaper) transmit(p *shapedPacket) int {
 func (s *pathShaper) drain() {
 	for {
 		s.mu.Lock()
-		for s.bands[bandRealtime] == nil && s.bands[bandOther] == nil {
+		for s.bands[bandRealtime] == nil && s.bands[bandTransactional] == nil && s.bands[bandBulk] == nil {
 			s.mu.Unlock()
 			<-s.wake
 			s.mu.Lock()
@@ -281,7 +292,10 @@ func (s *pathShaper) drain() {
 		}
 		band := bandRealtime
 		if s.bands[band] == nil {
-			band = bandOther
+			band = bandTransactional
+			if s.bands[band] == nil {
+				band = bandBulk
+			}
 		}
 		p := s.bands[band][0]
 		s.bands[band][0] = nil
@@ -307,7 +321,7 @@ func (s *pathShaper) drain() {
 // idleLocked reports whether nothing is queued or on its way out, so a new
 // packet sent directly cannot overtake one sent before it.
 func (s *pathShaper) idleLocked() bool {
-	return s.inflight == 0 && s.bands[bandRealtime] == nil && s.bands[bandOther] == nil
+	return s.inflight == 0 && s.bands[bandRealtime] == nil && s.bands[bandTransactional] == nil && s.bands[bandBulk] == nil
 }
 
 func (s *pathShaper) refillLocked() {

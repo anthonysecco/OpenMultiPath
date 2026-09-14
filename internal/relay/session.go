@@ -220,10 +220,7 @@ type peerView struct {
 	loss     float64
 	burst    float64
 
-	// Version 3: the standing queue and loss over the last second.
-	standingMs float64
-	shortLoss  float64
-	rxKbps     float64 // what the peer received on this path over the last second
+	rxKbps float64 // what the peer received on this path over the last second, version 3
 
 	at    time.Duration
 	valid bool
@@ -781,9 +778,13 @@ func (s *session) collectReportsLocked(now time.Duration) []protocol.ReportEntry
 			LossPerMille:  perMille(st.recentLossPercent()),
 			BurstTenths:   tenths(st.recentBurstRatio()),
 
-			StandingQueueTenthMs: tenthMs(msi(st.standingQueue(now))),
-			ShortLossPerMille:    perMille(st.shortLossPercent(now)),
-			RxKbpsBy16:           by16(st.shortRxKbps(now)),
+			// StandingQueueTenthMs and ShortLossPerMille are no longer
+			// computed (the per-path bulk controller that paced on them was
+			// removed by D-055; both are dead telemetry since). Left at
+			// zero rather than removed from the wire: the fixed v3/v4 byte
+			// layout still needs both slots present for a peer on either
+			// version to stay framed correctly.
+			RxKbpsBy16: by16(st.shortRxKbps(now)),
 		})
 	}
 	return out
@@ -1088,10 +1089,8 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 			burst:    float64(r.BurstTenths) / 10,
 			at:       now,
 
-			standingMs: float64(r.StandingQueueTenthMs) / 10,
-			shortLoss:  float64(r.ShortLossPerMille) / 10,
-			rxKbps:     float64(r.RxKbpsBy16) * 16,
-			valid:      true,
+			rxKbps: float64(r.RxKbpsBy16) * 16,
+			valid:  true,
 		}
 	}
 }
@@ -1498,8 +1497,6 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 			path.TxQueueDelayMs = p.peer.queueMs
 			path.TxJitterMs = p.peer.jitterMs
 			path.TxLossPercent = p.peer.loss
-			path.TxStandingQueueMs = p.peer.standingMs
-			path.TxShortLossPercent = p.peer.shortLoss
 			path.TxDelayMs = outboundDelayMs(ms(p.rttFloor.cur), p.peer.spreadMs,
 				float64(snap.Config.BaseDelayMs))
 		}

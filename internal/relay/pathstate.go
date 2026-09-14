@@ -100,7 +100,7 @@ type pathMetric struct {
 	budget usage.State
 
 	// sendKbps is what this end is putting onto the path now, in wire
-	// bytes, and shapedKbps the most it will: 95% of the link's measured
+	// bytes, and shapedKbps the most it will: 90% of the link's measured
 	// speed in this direction, or 0 for a link never measured, which is
 	// unlimited (D-055). Deliberately not part of the state machine: a
 	// small link is not a degraded link, and a path that can only do 512k

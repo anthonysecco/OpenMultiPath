@@ -88,15 +88,26 @@
   .sched-block { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
   .sched-block.bad .path-name { color: var(--bad); }
 
-  /* One column per path, side by side so the same metric can be read
-     straight across. Wraps to fewer columns, then one, as the viewport
-     narrows - never a sideways scroll. */
-  #paths { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); align-items: start; }
+  /* Cards are wide horizontal strips, one per row, so a direction's metrics
+     read straight across rather than requiring a scroll down the card. */
+  #paths { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(560px, 1fr)); align-items: start; }
   .path {
     background: var(--panel); border: 1px solid var(--line);
     border-left: 4px solid var(--line); border-radius: 8px;
     padding: 14px 16px;
   }
+  /* Down/up side by side as table rows so the same metric lines
+     up in a column - the point of turning the card sideways. Down is
+     always the top row, up the bottom, regardless of which end of the
+     tunnel this is: only the physical meaning (upload vs download) flips
+     with role, never the row order. */
+  .dir-table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  .dir-table th, .dir-table td { padding: 6px 10px 6px 0; text-align: left; vertical-align: top; }
+  .dir-table th { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; font-weight: 600; cursor: help; }
+  .dir-table td { font-variant-numeric: tabular-nums; font-size: 14px; }
+  .dir-table .dirlabel { white-space: nowrap; font-weight: 650; }
+  .dir-table .extra { font-size: 12px; color: var(--dim); white-space: normal; }
+  .dir-table tr + tr td, .dir-table tr + tr th { border-top: 1px solid var(--line); }
   .path.alive { border-left-color: var(--good); }
   .path.dead  { border-left-color: var(--bad); }
   .path-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
@@ -288,6 +299,17 @@ function duration(sec) {
   return h + "h " + Math.floor((sec % 3600) / 60) + "m";
 }
 
+// Every latency figure on this page goes through here, so a jitter reading
+// and an RTT reading are never formatted two different ways, and everything
+// stays in milliseconds - no unit switching to read across. Below 10ms the
+// extra decimal is the difference a switching decision cares about; above
+// it, that decimal is noise nobody reads.
+function latency(ms) {
+  if (ms === undefined || ms === null) return "—";
+  if (Math.abs(ms) < 10) return ms.toFixed(1) + " ms";
+  return Math.round(ms) + " ms";
+}
+
 // Bitrates span four orders of magnitude here - a 512k standby tier and a
 // 200 Mbps dish are both normal - so they are scaled rather than printed as
 // a wall of digits nobody can compare at a glance.
@@ -331,7 +353,7 @@ function renderAggregate(s) {
     card("Loss (lifetime)", fmt(a.loss_percent, 2) + "%",
          `${a.lost.toLocaleString()} of ${(a.received + a.lost).toLocaleString()}`,
       "Loss across every path combined, since the daemon started. Unlike the recent figure, an old incident never ages out of this one - read it as history, not current health.") +
-    card("Best RTT", a.best_rtt_ms ? fmt(a.best_rtt_ms) + " ms" : "—",
+    card("Best RTT", a.best_rtt_ms ? latency(a.best_rtt_ms) : "—",
          "lowest across live paths",
       "The lowest round trip currently measured across live paths - what the tunnel could do right now if it were steering perfectly onto the fastest one.") +
     card("Received", a.received.toLocaleString(), "",
@@ -413,7 +435,7 @@ function bulkPlacement(s, named) {
   if (!sc.bulk_scheduler) return "";
   const rs = sc.resequencer || {};
   const reseq = rs.reordered || rs.late
-    ? ` · resequencer holding ${fmt(rs.hold_ms, 0)} ms, ${(rs.reordered || 0).toLocaleString()} reordered, ${(rs.late || 0).toLocaleString()} late`
+    ? ` · resequencer holding ${latency(rs.hold_ms)}, ${(rs.reordered || 0).toLocaleString()} reordered, ${(rs.late || 0).toLocaleString()} late`
     : "";
   if (sc.bulk_scheduler !== "cascade") {
     return `<p class="muted" title="Bulk is placed one flow to one path, v0.1's scheduler.">Bulk: per flow${sc.bulk_scheduler_reason ? ` (${sc.bulk_scheduler_reason})` : ""}${reseq}</p>`;
@@ -426,7 +448,7 @@ function bulkPlacement(s, named) {
       return `${named(p.id)}${p.cascade_protected ? " (call's path)" : ""} ${cap}`;
     }).join(" → ");
   const dropped = sc.bulk_overflowed ? ` · ${sc.bulk_overflowed.toLocaleString()} with every path backed up` : "";
-  return `<p class="muted" title="Bulk fills the slowest path first and spills onto faster ones only once each path's shaper backs up, the call's path last. A path is shaped to 95% of its measured link speed; an unmeasured path is unshaped, so it never spills.">Bulk: cascade ${members}${dropped}${reseq}</p>`;
+  return `<p class="muted" title="Bulk fills the slowest path first and spills onto faster ones only once each path's shaper backs up, the call's path last. A path is shaped to 90% of its measured link speed; an unmeasured path is unshaped, so it never spills.">Bulk: cascade ${members}${dropped}${reseq}</p>`;
 }
 
 // What the classifier has decided, since the daemon started.
@@ -454,34 +476,38 @@ function classSplit(sc) {
   return `<p class="muted" title="${total.toLocaleString()} packets since start">Classified: ${shown}</p>`;
 }
 
-// Which traffic classes are placed on this path right now. Real-time and
-// transactional both ride a single chosen path at a time (never split), so
-// each is a plain on/off: real-time follows p.sending, which is true for
-// every path currently in the real-time send set - the primary, plus a
-// make-before-break handover target or duplicate copies when the
-// duplication mode calls for it; transactional follows p.primary alone,
-// since it never duplicates even during a handover. Bulk gets a third,
-// yellow state: cascade_position >= 0 means this path has a place in the
-// fill order, but bulk_kbps of 0 means nothing has spilled onto it yet
-// because the paths ahead of it in the cascade have not backed up - queued,
-// not idle.
-function badgesHTML(p) {
-  const badge = (label, cls, title) => `<span class="tag ${cls}" title="${title}">${label}</span>`;
-  const rt = p.sending
-    ? badge("Real-time", "good", "This path is currently carrying real-time traffic.")
-    : badge("Real-time", "", "This path is not currently carrying real-time traffic.");
-  const trans = p.primary
-    ? badge("Trans", "good", "This path is the primary, so it is carrying transactional traffic.")
-    : badge("Trans", "", "This path is not the primary, so it is not carrying transactional traffic - transactional never spreads or duplicates.");
-  let bulk;
-  if (p.cascade_position < 0) {
-    bulk = badge("Bulk", "", "This path has no place in the bulk cascade right now - either bulk placement is not running the cascade, or this path is not eligible.");
-  } else if (p.bulk_kbps > 0) {
-    bulk = badge("Bulk", "good", "This path is actively carrying bulk traffic right now.");
-  } else {
-    bulk = badge("Bulk", "warn", "This path has a place in the bulk cascade but nothing has spilled onto it yet - the paths ahead of it in the fill order have not backed up.");
+// Which single traffic class a direction is carrying right now, as one
+// badge per direction rather than three on/off toggles - a direction is
+// doing exactly one of these at a time. Priority order for display when more
+// than one is technically true (a primary path also carries real-time)
+// matches the project's own priority order: real-time first, since that is
+// what the project exists to protect.
+//
+// This can only be computed for this end's own send direction - p.sending,
+// p.primary, and p.cascade_position all come from this node's own
+// scheduler. The direction this end *receives* on is the peer's send
+// direction, decided by the peer's own independent scheduler (each end
+// schedules only its own sends - see D-055, D-056), and that decision is not
+// currently exchanged over the protocol. directionClassPlaceholder covers
+// that gap until it is.
+function directionClass(p) {
+  if (p.sending) return `<span class="tag good" title="This direction is currently carrying real-time traffic.">RT</span>`;
+  if (p.primary) return `<span class="tag good" title="This path is the primary, so this direction is carrying transactional traffic.">Trans</span>`;
+  if (p.cascade_position >= 0) {
+    const n = p.cascade_position + 1;
+    return p.bulk_kbps > 0
+      ? `<span class="tag good" title="Actively carrying bulk traffic, position ${n} in the cascade.">Bulk ${n}</span>`
+      : `<span class="tag warn" title="Has a place in the bulk cascade at position ${n}, but nothing has spilled onto it yet - the paths ahead of it have not backed up.">Bulk ${n}</span>`;
   }
-  return rt + trans + bulk;
+  return `<span class="tag" title="Not currently carrying real-time, transactional, or bulk traffic.">idle</span>`;
+}
+
+// TODO(data gap): the peer's class decision for its own send direction -
+// which is this end's receive direction - is not yet part of the protocol.
+// Once each end reports it (alongside the existing tx_* measurements),
+// replace this placeholder with directionClass() fed from that field.
+function directionClassPlaceholder() {
+  return `<span class="tag" title="Not yet available: this direction is the far end's send, scheduled by the far end's own independent scheduler. The protocol does not currently exchange that decision - this is a placeholder for future work.">not yet reported</span>`;
 }
 
 function renderPaths(s) {
@@ -531,7 +557,7 @@ function renderPaths(s) {
     // estimated: a link nobody has measured is shown as exactly that, and is
     // unshaped. Home shows the figures the vehicle sent it. This end sends in
     // one direction - up from the vehicle, down from home - and "Shaped to"
-    // is 95% of that direction's measurement, counted in full wire bytes.
+    // is 90% of that direction's measurement, counted in full wire bytes.
     const measuredAgo = p.link_measured_unix ? duration(Date.now() / 1000 - p.link_measured_unix) + " ago" : "";
     const downMeasured = p.link_down_kbps > 0;
     const upMeasured = p.link_up_kbps > 0;
@@ -539,68 +565,121 @@ function renderPaths(s) {
       ? `measured ${measuredAgo}${owns ? "" : ", as reported by the vehicle"}; stands until the link is measured again or cleared`
       : (owns ? "never measured" : "the vehicle has not measured this link");
     const upLinkNote = upMeasured
-      ? `measured ${measuredAgo}${owns ? "" : ", as reported by the vehicle"}; stands until the link is measured again or cleared - see Shaped to below for what this end actually sends`
+      ? `measured ${measuredAgo}${owns ? "" : ", as reported by the vehicle"}; stands until the link is measured again or cleared`
       : (owns ? "never measured, so assumed unlimited and not shaped - press Measure Link Speed below"
               : "the vehicle has not measured this link, so it is assumed unlimited and not shaped");
     const sendDir = owns ? "upload" : "download";
     const shaped = p.shaped_kbps > 0 ? rate(p.shaped_kbps) : "unshaped";
     const shapedNote = p.shaped_kbps > 0
-      ? `95% of the measured ${sendDir}, counting every header and tunnel byte; ${(p.shaper_backlog_bytes || 0).toLocaleString()} bytes queued now, ${(p.shaper_dropped || 0).toLocaleString()} packets dropped at the queue limit since the daemon started`
+      ? `90% of the measured ${sendDir}, counting every header and tunnel byte; ${(p.shaper_backlog_bytes || 0).toLocaleString()} bytes queued now, ${(p.shaper_dropped || 0).toLocaleString()} packets dropped at the queue limit since the daemon started`
       : `no ${sendDir} measurement, so nothing is held back`;
 
-    // Inbound and outbound are measured in different places and routinely
-    // disagree, so each gets its own metric-group rather than being
-    // interleaved: everything in "Inbound" is measured here, on packets
-    // arriving; everything in "Outbound" is what the far end reports about
-    // our transmissions, and is what the scheduler ranks on. A path can be
-    // fine one way and unusable the other, and grouping is what makes that
-    // visible at a glance instead of requiring a label on every row.
+    // Down is always this end's own receive direction, and up is always
+    // this end's own send direction - that identity never swaps with role
+    // (it is what "inbound stays on top, outbound stays on bottom"
+    // actually means). Down: measured locally, on packets arriving here.
+    // Up: what the far end reports about our own transmissions, which is
+    // what the scheduler ranks on. A path can be fine one way and unusable
+    // the other, and the row split is what makes that visible at a glance.
     //
-    // The group always renders, with every row in the same place, whether
-    // or not there is anything to report (D-052 review: a group that
-    // appears on some path columns and not others is the thing that breaks
-    // side-by-side comparison). When the far end is not reporting, a row
-    // shows a dash rather than the raw field - the underlying number is
-    // still whatever it last was and would read as a real, if oddly good
-    // or zero, measurement.
+    // What DOES change with role is which absolute link measurement each
+    // row's Speed cell reads: link_up_kbps/link_down_kbps are a single
+    // absolute measurement of the vehicle's own link (up = vehicle's
+    // upload, toward home; down = vehicle's download, from home), always
+    // measured by the vehicle and reported to home unchanged (D-055). So
+    // "this end's own send speed" is link_up_kbps for the initiator but
+    // link_down_kbps for the responder - exactly mirroring localKbpsLocked
+    // in internal/relay/linkspeed.go, which picks the same field for
+    // shaping. Getting this backwards once put the wrong absolute figure,
+    // and once the wrong row's content entirely, on the responder's card.
+    //
+    // Only the send row (up) carries a real class/priority badge: that
+    // comes from this node's own scheduler. The receive row (down)
+    // reflects the peer's send, decided by the peer's own scheduler, which
+    // this node does not currently learn (see directionClassPlaceholder).
+    //
+    // Every row always renders, with every column in the same place,
+    // whether or not there is anything to report (D-052 review: a group
+    // that appears on some path cards and not others is the thing that
+    // breaks side-by-side comparison). When the far end is not reporting,
+    // a cell shows a dash rather than the raw field - the underlying number
+    // is still whatever it last was and would read as a real, if oddly
+    // good or zero, measurement.
     const noOut = `<span class="muted" title="Not shown: the far end is not currently reporting on this path (see the “no outbound report” tag above), so there is nothing honest to put here.">—</span>`;
-    const outboundGroup = `
-      <div class="metric-group">
-        <h3>Outbound</h3>
-        <div class="metrics">
-        <div class="metric"><div class="k" title="The link's speed in the send direction (${sendDir}), as last measured by Measure Link Speed. Never estimated from traffic: an unmeasured link is assumed unlimited. See Shaped to below for what this end actually sends.">Link speed</div>
-          <div class="v" title="${upLinkNote}">${upMeasured ? rate(p.link_up_kbps) : "unmeasured"}</div></div>
-        <div class="metric"><div class="k" title="Loss rate the peer reports on this end's transmissions, over roughly the last minute. This is the figure a send decision actually needs - a round trip alone can't say which direction loss happened in.">Loss</div>
-          <div class="v" style="${p.tx_reported ? `color:var(--${lossClass(p.tx_loss_percent)})` : ""}">${p.tx_reported ? fmt(p.tx_loss_percent, 2) + "%" : noOut}</div></div>
-        <div class="metric"><div class="k" title="The peer's measured RFC 3550 interarrival jitter on this end's transmissions.">Jitter</div><div class="v">${p.tx_reported ? fmt(p.tx_jitter_ms) + " ms" : noOut}</div></div>
-        <div class="metric"><div class="k" title="The peer's measured queue buildup on this end's send direction - the only direct evidence of congestion on the path this end transmits on.">Queue delay</div><div class="v">${p.tx_reported ? fmt(p.tx_queue_delay_ms) + " ms" : noOut}</div></div>
-        <div class="metric"><div class="k" title="One-way network delay in the send direction: half this path's RTT floor plus the peer's reported p95 tail. Measured by the peer, not by this end - send and receive are independent paths and routinely disagree.">Network</div>
-          <div class="v" title="one-way network delay in the send direction: half the ${fmt(p.rtt_floor_ms)} ms round-trip floor, plus the ${fmt(p.tx_spread_ms)} ms p95 tail the peer measured. The two directions' figures sum to about the round-trip floor, which is the symmetry assumption checking out.">${p.tx_reported ? fmt(p.tx_delay_ms - (cfg.base_delay_ms || 0)) + " ms" : noOut}</div></div>
-        <div class="metric"><div class="k" title="What the E-model scorer is actually fed for outbound delay: the network figure above, plus a fixed non-network allowance (codec framing, jitter buffer, the hairpin through home) set by Base delay. Not comparable to a raw round trip.">Score delay</div>
-          <div class="v" title="what the E-model is actually fed: the ${fmt(p.tx_delay_ms - (cfg.base_delay_ms || 0))} ms above plus a fixed ${cfg.base_delay_ms || 0} ms of non-network budget - codec framing, the far end's jitter buffer, and the hairpin through home. Both ends add that constant independently, so this figure is NOT comparable with the round trip.">${p.tx_reported ? fmt(p.tx_delay_ms) + " ms" : noOut}</div></div>
-        <div class="metric"><div class="k" title="The peer's measured 95th-percentile tail latency on packets this end sent it - the send direction, which cannot be observed locally.">p95 spread</div><div class="v">${p.tx_reported ? fmt(p.tx_spread_ms) + " ms" : noOut}</div></div>
-        <div class="metric"><div class="k" title="The least transit above this path's floor over the last ~100 ms, as the peer measured it on this end's transmissions. A lone jitter spike does not move it; a queue that is really building does - with the path shaped under its measured speed, a queue here means the link has slowed since it was measured.">Standing queue</div><div class="v">${p.tx_reported ? fmt(p.tx_standing_queue_ms) + " ms" : noOut}</div></div>
-        <div class="metric"><div class="k" title="Loss over the last second on this end's transmissions, as the peer measured it. The fast figure; the one-minute figure beside it is for judging the path.">Loss 1 s</div>
-          <div class="v" style="${p.tx_reported ? `color:var(--${lossClass(p.tx_short_loss_percent)})` : ""}">${p.tx_reported ? fmt(p.tx_short_loss_percent, 1) + "%" : noOut}</div></div>
-        <div class="metric"><div class="k" title="Current outbound bit rate on this path: data, any duplicated copies, and protocol overhead (echoes, reports, MTU probes) combined.">Sending</div>
-          <div class="v" title="what is going onto this path right now">${rate(p.send_kbps)}</div></div>
-        <div class="metric"><div class="k" title="The most this end sends on the path: 95% of the measured link speed in its send direction, counting every header and tunnel overhead byte, so the queue forms here - where the call goes first - rather than in the carrier's modem. Unshaped when that direction was never measured.">Shaped to</div>
-          <div class="v" title="${shapedNote}">${shaped}</div></div>
-        </div>
-      </div>`;
-
+    const noThroughput = `<span class="muted" title="Not tracked: there is no receive-side throughput counter for this direction, only the loss/jitter/latency figures measured on arrival.">—</span>`;
     const inCascade = p.cascade_position >= 0;
-    const noBulk = `<span class="muted" title="Not placed: bulk is not being spread onto this path right now - either it is not eligible, or the scheduler is not running the cascade (see Bulk placement in the overlay card above).">—</span>`;
-    const bulkGroup = `
-      <div class="metric-group">
-        <h3>Bulk</h3>
-        <div class="metrics">
-        <div class="metric"><div class="k" title="This path's place in the bulk cascade: bulk fills place 1 first and spills to the next place only once that path's shaper backs up. The call's path is always last, and otherwise treated like any path - a call never holds bulk back.">Position</div>
-          <div class="v" title="${inCascade ? (p.cascade_protected ? "carries real-time and transactional traffic too, so it is always filled last" : "filled " + (p.cascade_position + 1) + (p.cascade_position === 0 ? "st" : p.cascade_position === 1 ? "nd" : p.cascade_position === 2 ? "rd" : "th") + " in the fill order") : ""}">${inCascade ? (p.cascade_position + 1) + (p.cascade_protected ? " · call's path" : "") : noBulk}</div></div>
-        <div class="metric"><div class="k" title="How much bulk this path is carrying right now, and what its shaper holds the whole path to - bulk spills onto the next path once that is backed up. An unmeasured path is unshaped and never spills.">Carried / shaped</div>
-          <div class="v" title="${inCascade ? (p.shaped_kbps > 0 ? "shaped to " + rate(p.shaped_kbps) + " for everything on the path, the call included" : "unshaped: link speed never measured") : ""}">${inCascade ? rate(p.bulk_kbps) + (p.shaped_kbps > 0 ? " / " + rate(p.shaped_kbps) : " / unshaped") : noBulk}</div></div>
-        </div>
-      </div>`;
+
+    // This end's own send speed is link_up_kbps for the initiator,
+    // link_down_kbps for the responder (see the note above); receive is
+    // whichever of the two that isn't. Speed's hover carries the shaped
+    // figure on the send row, since shaping is this end's own doing - the
+    // receive row only gets the measured-time note, since this end does
+    // not know how the peer shapes its own send.
+    const ownSendMeasured = owns ? upMeasured : downMeasured;
+    const ownSendKbps = owns ? p.link_up_kbps : p.link_down_kbps;
+    const ownSendNote = owns ? upLinkNote : downLinkNote;
+    const ownRecvMeasured = owns ? downMeasured : upMeasured;
+    const ownRecvKbps = owns ? p.link_down_kbps : p.link_up_kbps;
+    const ownRecvNote = owns ? downLinkNote : upLinkNote;
+    const upSpeedTitle = ownSendNote + (ownSendMeasured ? ` · shaped to ${shaped} (${shapedNote})` : "");
+    const upSpeedCell = `<td title="${upSpeedTitle}">${ownSendMeasured ? rate(ownSendKbps) : "unmeasured"}</td>`;
+    const downSpeedCell = `<td title="${ownRecvNote}">${ownRecvMeasured ? rate(ownRecvKbps) : "unmeasured"}</td>`;
+
+    // Network latency (one-way, send direction) is peer-reported: the far
+    // end tells us how our own transmissions arrived, so it only exists for
+    // the send row. Nothing analogous is computed for the receive
+    // direction - that would need the far end to run the same computation
+    // on our behalf, which the protocol does not currently do - so the
+    // receive row shows a dash rather than a fabricated figure.
+    const netLatency = p.tx_reported ? latency(p.tx_delay_ms - (cfg.base_delay_ms || 0)) : noOut;
+    const noNetLatency = `<span class="muted" title="Not computed: one-way network delay is derived by the far end about our own transmissions, and nothing analogous exists for the receive direction.">—</span>`;
+
+    const sendExtra = [
+      p.tx_reported ? `queue ${latency(p.tx_queue_delay_ms)}` : "",
+      p.tx_reported ? `p95 spread ${latency(p.tx_spread_ms)}` : "",
+      inCascade ? `bulk carried ${rate(p.bulk_kbps)}` : "",
+      `backlog ${bytes(p.shaper_backlog_bytes || 0)}`,
+    ].filter(Boolean).join(" · ");
+    const recvExtra = `queue ${latency(p.queue_delay_ms)} · p95 spread ${latency(p.p95_spread_ms)}`;
+
+    // Column order: Throughput, Loss, Latency, Jitter, Class, Extra (Speed
+    // is spliced in ahead of these, from the up/down-specific cells above).
+    // Class sits just before Extra rather than up front, since it is a
+    // one-word badge, not a number somebody is scanning down a column of.
+    const upCells = upSpeedCell + `
+        <td>${rate(p.send_kbps)}</td>
+        <td title="Loss over the last 1 minute, as the peer reports it on this end's transmissions." style="${p.tx_reported ? `color:var(--${lossClass(p.tx_loss_percent)})` : ""}">${p.tx_reported ? fmt(p.tx_loss_percent, 2) + "%" : noOut}</td>
+        <td>${netLatency}</td>
+        <td>${p.tx_reported ? latency(p.tx_jitter_ms) : noOut}</td>
+        <td>${directionClass(p)}</td>
+        <td class="extra">${sendExtra}</td>`;
+    const downCells = downSpeedCell + `
+        <td>${noThroughput}</td>
+        <td title="Loss over the last 1 minute, measured locally on arrival." style="color:var(--${lossClass(p.recent_loss_percent)})">${fmt(p.recent_loss_percent, 2)}%</td>
+        <td>${noNetLatency}</td>
+        <td>${latency(p.jitter_ms)}</td>
+        <td>${directionClassPlaceholder()}</td>
+        <td class="extra">${recvExtra}</td>`;
+
+    const downTitle = "This end's receive direction.";
+    const upTitle = "This end's send direction.";
+    const dirTable = `
+      <table class="dir-table">
+        <thead><tr>
+          <th></th>
+          <th title="Link speed in this direction - the vehicle's own measurement, reported to home unchanged. Never estimated from traffic: an unmeasured link is assumed unlimited. Hover for the shaped figure and when it was last measured.">Speed</th>
+          <th title="Current bit rate actually moving in this direction right now.">Throughput</th>
+          <th title="Loss rate over the last 1 minute in this direction.">Loss</th>
+          <th title="One-way network delay in the send direction: half this path's RTT floor plus the peer's reported p95 tail. Only available for the send row - nothing analogous is computed for receive.">Latency</th>
+          <th title="RFC 3550 interarrival jitter in this direction.">Jitter</th>
+          <th title="Which traffic class this direction is carrying right now, and the bulk cascade's fill position when it applies.">Class</th>
+          <th title="Everything else for this direction: queueing delay, tail latency (p95 spread), and, on the send row, the shaper's queued backlog and bulk currently carried.">Extra</th>
+        </tr></thead>
+        <tbody>
+          <tr><td class="dirlabel" title="${downTitle}">▼ Down</td>${downCells}</tr>
+          <tr><td class="dirlabel" title="${upTitle}">▲ Up</td>${upCells}</tr>
+        </tbody>
+      </table>`;
 
     const bindRow = owns
       ? `<div class="metric"><div class="k" title="Times this path's socket has gone down and come back since the daemon started - an interface bounce, DHCP renewal, or address change on this physical link specifically.">Link drops</div>
@@ -616,14 +695,12 @@ function renderPaths(s) {
       <div class="metric-group">
         <h3>Quality</h3>
         <div class="metrics">
-          <div class="metric"><div class="k" title="Which traffic classes are currently placed on this path. Green means active now, grey means not currently placed here.">Badges</div>
-            <div class="v" style="display:flex;gap:6px;flex-wrap:wrap">${badgesHTML(p)}</div></div>
           <div class="metric"><div class="k" title="Mean Opinion Score (1-5), the R-factor at right converted to the scale a person reads at a glance. This is what a call would sound like if steered onto this path alone, right now.">Quality</div>
             <div class="v" style="color:var(--${mosClass(p.mos)})" title="${penalty}">${fmt(p.mos, 2)} MOS</div></div>
           <div class="metric"><div class="k" title="ITU-T G.107 R-factor (0-100): one-way delay and loss combined into the single number the scheduler actually ranks paths on, after penalties for burst loss, flapping, and budget.">Score</div>
             <div class="v" title="E-model R factor after penalties; the scheduler ranks on this">${fmt(p.score, 0)} R</div></div>
           <div class="metric"><div class="k" title="Most recent round-trip time, measured by echoing a timestamp back. The two ends' clocks never need to be synchronized for this to be valid.">RTT</div>
-            <div class="v" title="round trip; floor ${fmt(p.rtt_floor_ms)} ms with nothing queued on it">${fmt(p.rtt_ms)} ms</div></div>
+            <div class="v" title="round trip; floor ${latency(p.rtt_floor_ms)} with nothing queued on it">${latency(p.rtt_ms)}</div></div>
           <div class="metric"><div class="k" title="Largest physical packet size confirmed to cross this path by active probing. The tunnel's own MTU is the smallest of these across every path, so one small path caps everyone.">Path MTU</div><div class="v">${p.path_mtu || "—"}</div></div>
           <div class="metric"><div class="k" title="How many of the last 200 packets back the delay and jitter figures above. Below 20, treat this path's statistics as too thin to trust - especially before promoting it.">Samples</div><div class="v">${p.samples}</div></div>
           <div class="metric"><div class="k" title="Time since anything last arrived on this path. A live call needs this in the low single digits of seconds; a value that keeps climbing is a path going quiet.">Last seen</div>
@@ -632,20 +709,9 @@ function renderPaths(s) {
       </div>
 
       <div class="metric-group">
-        <h3>Inbound</h3>
-        <div class="metrics">
-          <div class="metric"><div class="k" title="The link's speed in the receive direction (${owns ? "download" : "upload"}), as last measured by Measure Link Speed. Never estimated from traffic: an unmeasured link is assumed unlimited.">Link speed</div>
-            <div class="v" title="${downLinkNote}">${downMeasured ? rate(p.link_down_kbps) : "unmeasured"}</div></div>
-          <div class="metric"><div class="k" title="Loss rate over roughly the last minute, measured directly on packets arriving here.">Loss</div>
-            <div class="v" style="color:var(--${lossClass(p.recent_loss_percent)})">${fmt(p.recent_loss_percent, 2)}%</div></div>
-          <div class="metric"><div class="k" title="RFC 3550 interarrival jitter: smoothed packet-to-packet variation in arrival timing, measured on packets received here.">Jitter</div><div class="v">${fmt(p.jitter_ms)} ms</div></div>
-          <div class="metric"><div class="k" title="How far the most recent packet's transit exceeds this path's own rolling-minimum delay - i.e. how full the buffer ahead of it is right now, inbound.">Queue delay</div><div class="v">${fmt(p.queue_delay_ms)} ms</div></div>
-          <div class="metric"><div class="k" title="95th-percentile transit time above this path's own floor, over roughly the last 200 packets received here. Tail latency - what a call actually feels, not the average.">p95 spread</div><div class="v">${fmt(p.p95_spread_ms)} ms</div></div>
-        </div>
+        <h3>Down / Up</h3>
+        ${dirTable}
       </div>
-
-      ${outboundGroup}
-      ${bulkGroup}
 
       <div class="metric-group">
         <h3>Cumulative</h3>
@@ -682,7 +748,7 @@ function diagBlock(owns, p) {
     </div>
     <div class="diag-row">
       <button class="diag-btn" ${d.udp && d.udp.running ? "disabled" : ""} onclick="runUdpFlood(${p.id})"
-        title="Floods the link in each direction for 5 seconds and saves the result as its link speed. ompd then shapes this link to 95% of it, at both ends.">
+        title="Floods the link in each direction for 5 seconds and saves the result as its link speed. ompd then shapes this link to 90% of it, at both ends.">
         ${d.udp && d.udp.running ? "Measuring…" : "Measure Link Speed"}</button>
       ${(p.link_up_kbps > 0 || p.link_down_kbps > 0) ? `<button class="diag-btn" ${d.udp && d.udp.running ? "disabled" : ""} onclick="clearLinkSpeed(${p.id})"
         title="Forget this link's measured speed. It is then assumed unlimited and not shaped at either end until measured again.">Clear Link Speed</button>` : ""}
@@ -698,7 +764,7 @@ function speedResultHTML(d) {
   if (d.down == null) return "";
   const mb = d.bytes ? ` · spent ${(d.bytes / 1e6).toFixed(0)} MB` : "";
   return `<strong>↓ ${rate(d.down * 1000)}</strong> / <strong>↑ ${rate(d.up * 1000)}</strong>`
-    + ` · ${d.ping.toFixed(0)} ms`
+    + ` · ${latency(d.ping)}`
     + (d.server ? ` · ${d.server}` : "") + mb;
 }
 

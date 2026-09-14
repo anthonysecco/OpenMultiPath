@@ -188,7 +188,7 @@ func (s *server) handleRestart(w http.ResponseWriter, r *http.Request) {
 
 // handleDiagBandwidth runs an on-demand ompd-native UDP flow test (D-053)
 // pinned to one path, and saves the result as that link's measured speed
-// (D-055): ompd shapes each direction to 95% of it. It costs real, possibly
+// (D-055): ompd shapes each direction to 90% of it. It costs real, possibly
 // metered, data in both directions, so it happens only when a person asks
 // for it.
 func (s *server) handleDiagBandwidth(w http.ResponseWriter, r *http.Request) {
@@ -557,8 +557,6 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		{"omp_path_shaped_kbps", "The most this end sends on the path; 0 is unshaped.", "gauge", func(p state.Path) float64 { return p.ShapedKbps }},
 		{"omp_path_shaper_backlog_bytes", "Bytes queued behind the path's shaper.", "gauge", func(p state.Path) float64 { return float64(p.ShaperBacklogBytes) }},
 		{"omp_path_shaper_dropped_total", "Packets dropped at the shaper's queue limit.", "counter", func(p state.Path) float64 { return float64(p.ShaperDropped) }},
-		{"omp_path_tx_standing_queue_ms", "Standing queue in the send direction, as the peer reports it.", "gauge", func(p state.Path) float64 { return p.TxStandingQueueMs }},
-		{"omp_path_tx_short_loss_percent", "Send-direction loss over the last second, as the peer reports it.", "gauge", func(p state.Path) float64 { return p.TxShortLossPercent }},
 
 		// Cost tracking, step 10. Bytes rather than a band name, because
 		// the useful alert is on the number approaching the cap rather

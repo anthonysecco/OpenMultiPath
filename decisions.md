@@ -2946,3 +2946,120 @@ other non-voice IPsec use, rides the low-latency path same as a call. This trade
 precision D-057 was reaching for, for a rule simple enough to be correct. Per-flow
 throughput/size/spacing tuning, and any finer-grained treatment within these ports, is
 future work.
+
+## D-059 · Remove the standing-queue and short-window-loss report figures
+
+**Decision.** Delete the standing-queue and last-second-loss computations D-055 added
+(`internal/relay/stats.go`'s `observeStanding`/`standingQueue` and
+`shortLossPercent`/the loss half of `rollShortLoss`), the `TxStandingQueueMs` and
+`TxShortLossPercent` fields they fed (`internal/state/state.go`, `peerView` in
+`internal/relay/session.go`), their Prometheus gauges (`cmd/ompui/main.go`), and their
+display in the path UI (`cmd/ompui/static/index.html`). The wire fields themselves -
+`StandingQueueTenthMs` and `ShortLossPerMille` in `protocol.ReportEntry`, part of the
+fixed version 3/4 report-entry byte layout - are left in place and always encoded as
+zero, rather than removing them and bumping the wire version: nothing reads them
+downstream any more, so the two-value round trip of a version bump was not worth it for
+what is now a pair of dead-weight slots on the wire. `RxKbpsBy16`, the third figure D-055
+added alongside them, is unaffected and still computed - it feeds the UI's Throughput
+figure and shares its byte-bucket bookkeeping with the loss figure being removed here
+(`rollShortLoss` is kept, renamed `rollShortBytes`, with only the loss-counting half cut).
+
+**Why these were dead weight.** D-055's own comment in `internal/relay/cascade.go`
+already said so: "There used to be a controller per path here, cutting each path's
+allowance on the standing queue and loss the far end reported and growing it back after
+a clean run. D-055 removed it: a link's speed is what it measured, not what its queue
+suggests." That controller was the only consumer either figure ever had. Since then they
+have been pure telemetry - decoded off the wire, copied into path state, and shown on
+the UI's path cards - with nothing in the scheduler, classifier, shaper, or cascade
+reading either one. A grep for every call site of `standingQueue`/`shortLossPercent` and
+the state fields they fed turned up exactly one non-decorative use of each, and both were
+the same dead controller.
+
+**Why keep the wire slots rather than bump the version.** The two ends negotiate a wire
+version per peer and a build must go on correctly encoding and decoding whatever version
+the peer last spoke (see `Version`/`MinVersion` in `internal/protocol/header.go`) - that
+is what lets one end upgrade before the other with no outage, and it is not being
+touched here. Shrinking the version 3/4 report entry would need a new version number
+carrying the shorter layout while the old numbers keep encoding and decoding the old one
+exactly, forever - real complexity for two fields nobody reads. Encoding zero into slots
+nobody consumes costs four bytes per report entry and no logic; that is the "simplicity
+over cleverness" trade for a removal with this little upside. A future field that
+actually needs the room can take version 5 outright.
+
+## D-060 · Give the shaper a third band: transactional, ahead of bulk
+
+**Decision.** `pathShaper` (`internal/relay/shaper.go`) gets a third strict-priority
+band. Real-time still drains first, but transactional now has a band of its own that
+drains ahead of bulk instead of sharing bulk's queue - `bandRealtime`, `bandTransactional`,
+`bandBulk`, drained in that order, each still taking every byte the one ahead of it does
+not use. `protocol.ClassUnknown` shares bulk's band rather than transactional's: an
+honest "the classifier could not say" gets no more benefit of the doubt than confirmed
+bulk. `hasRoom()`, which the cascade reads to decide whether a path can take more bulk,
+now checks bulk's own backlog only, not the combined figure - a transactional flow
+queuing up is not evidence that bulk is full, and counting it that way would have spilled
+bulk off a path for the wrong reason.
+
+**Why this was a real gap, not a documentation mismatch.** The shaper was two bands
+before this - real-time and everything else - which matched D-056's own description at
+the time but left transactional and bulk sharing one FIFO queue. A page load or DNS
+lookup queued behind a download's worth of bulk packets waited its turn in line exactly
+like the bulk in front of it, on a path busy enough for the queue to matter at all. That
+is precisely the failure D-030's original real-time/transactional split (see the class
+definitions in `internal/protocol/header.go`) exists to prevent for the call; it was
+simply never extended to the band the packets actually queue in.
+
+**Why unknown does not get transactional's protection.** Bulk is the traffic this project
+already treats as sacrificial; giving an unclassified packet the same protection as a
+confirmed short request would be a guess dressed up as a decision, on exactly the signal
+(no real evidence either way) that should not buy anything.
+
+## D-061 · Shape to 90% of measured speed, not 95%
+
+**Decision.** `linkspeed.ShapePercent` drops from 95 to 90. Every place derived from it -
+the vehicle's own send shaping, home's send shaping (D-055), and the UI/CLI text
+describing both - follows the constant, so this is a one-line change everywhere except
+the tests that hardcoded the old percentage's arithmetic (`internal/linkspeed` and
+`internal/relay`'s linkspeed tests), which now assert 90%'s numbers instead.
+
+**Why.** A bigger margin below the measured ceiling leaves more headroom for the
+measurement itself being a little optimistic - a flow test result that was slightly
+favorable, or a link that has degraded a little since it was last measured - to still
+land inside what the daemon actually sends, rather than the shaper's own queue forming
+first for a small overrun instead of a real one. This is the owner's judgment call, not a
+finding from field data the way D-053 through D-055's own numbers were: no live-link
+regression forced the change, and 95% was itself a working default, not a bug. Every
+tunable still needs a working default nobody has to touch, and 90% is it now.
+
+## D-062 · Drop the pre-duplication capacity check; trust the shaper's own band
+
+**Decision.** `scheduler.buildTx` (`internal/relay/scheduler.go`) no longer estimates
+whether a candidate path can afford a real-time duplicate before sending one. The old
+check compared `offeredKbps` (the primary path's whole send rate - real-time plus
+whatever bulk and transactional happen to be riding it) against each candidate's
+capacity via `canTake`. It is replaced with `withinBudget`, which only gates on cost
+(`sc.m.budget.Band == usage.Green`) - a metered-link money question, not a physical-
+capacity one. Both `DuplicateAlways` and `DuplicateUnstable` now duplicate onto every
+usable, in-budget path with no capacity precheck at all.
+
+**Why the old check was wrong.** `offeredKbps` is the primary's total send rate, not
+what a real-time duplicate itself costs - only the real-time flow is ever mirrored, never
+the bulk or transactional riding alongside it. A saturating download on the primary
+inflated that figure enough to make every candidate path look unaffordable, silently
+stopping the real-time duplicate at exactly the moment - the primary under heavy load -
+duplication exists to protect against. `TestDuplicationSkipsAPathTooSmallForTheLoad`
+asserted the old (wrong) behavior; it is replaced by
+`TestDuplicationIgnoresLoadAndTrustsTheShaper`, which asserts a duplicate now goes out
+onto a path even when it looks too small for the primary's load.
+
+**Why it is safe to stop checking capacity at all.** The receiving path's own shaper
+already enforces exactly what that path can hold, per class: real-time drains ahead of
+transactional and bulk in its own strict-priority band (D-060), and is dropped there -
+not corrupted, not reordered behind bulk - if the path genuinely cannot carry it
+(principle 5, fail to a working state). A precheck here can only ever estimate that
+constraint from the wrong number; the shaper measures it exactly, packet by packet, so
+the precheck was strictly worse than the thing already downstream of it.
+
+**Accepted, knowingly.** This entry documents a change found already implemented,
+tested, and deployed in the working tree, without a decision recorded for it at the
+time - the rationale above is drawn from the code's and test's own comments rather than
+from a discussion. Flagged for the project owner to confirm the reasoning stands.

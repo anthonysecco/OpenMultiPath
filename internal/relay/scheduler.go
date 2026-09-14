@@ -1133,10 +1133,20 @@ func (s *scheduler) buildTx(d *decision, c config.Config, eligible []scored, sen
 		return
 	}
 
-	// What a second copy of the stream would cost the path that took it.
-	// The primary's own send rate is the honest figure: a duplicate is, by
-	// definition, exactly as much traffic as the original.
-	load := s.offeredKbps(eligible)
+	// Capacity is deliberately not checked here. A duplicate carries only
+	// the real-time flow, and the shaper on the receiving path already
+	// enforces exactly what that path can hold - real-time drained ahead
+	// of everything else in its own band (D-060), dropped there rather
+	// than corrupted if the path genuinely cannot carry it (principle 5).
+	// A precheck here would have to estimate what a duplicate costs
+	// instead of measuring it, and offeredKbps (the primary's whole send
+	// rate, including bulk and transactional riding the same path) is the
+	// wrong number for that: it overstates the real-time flow by whatever
+	// else the primary happens to be carrying, and a saturating download
+	// was enough to make every candidate look unaffordable and silently
+	// stop the duplicate. Cost budget is a different question and still
+	// gated below - that is money, not physical capacity.
+	withinBudget := func(sc scored) bool { return sc.m.budget.Band == usage.Green }
 
 	switch c.DuplicateMode {
 	case config.DuplicateAlways:
@@ -1145,7 +1155,7 @@ func (s *scheduler) buildTx(d *decision, c config.Config, eligible []scored, sen
 			if sc.m.id == s.primary {
 				continue
 			}
-			if !s.canTake(sc, load, c) {
+			if !withinBudget(sc) {
 				skipped++
 				continue
 			}
@@ -1153,19 +1163,16 @@ func (s *scheduler) buildTx(d *decision, c config.Config, eligible []scored, sen
 		}
 		d.reason = "duplicating real-time on every usable path"
 		if skipped > 0 {
-			d.reason = "duplicating real-time on every path with the capacity for it"
+			d.reason = "duplicating real-time on every path within budget"
 		}
 
 	case config.DuplicateUnstable:
 		if mach := s.machines[s.primary]; mach != nil && mach.state == stateUnstable {
-			// Only one spare copy, and it goes to the best path that can
-			// actually take it. Duplication is insurance, and taking out
-			// three policies on a link that has none to spare is how the
-			// insurance becomes the accident - which is precisely what a
-			// 512k standby link does when a download is mirrored onto it
-			// because it looked healthy while carrying nothing.
+			// Only one spare copy, and it goes to the best-scoring path
+			// within budget. eligible is sorted best-first, so the first
+			// match is the best one.
 			for _, sc := range eligible {
-				if sc.m.id == s.primary || !s.canTake(sc, load, c) {
+				if sc.m.id == s.primary || !withinBudget(sc) {
 					continue
 				}
 				d.tx = append(d.tx, sc.m.id)
@@ -1174,7 +1181,7 @@ func (s *scheduler) buildTx(d *decision, c config.Config, eligible []scored, sen
 			if len(d.tx) > 1 {
 				d.reason = "duplicating real-time while the chosen path is degraded"
 			} else {
-				d.reason = "chosen path degraded, no path has the capacity to duplicate onto"
+				d.reason = "chosen path degraded, no path within budget to duplicate onto"
 			}
 			return
 		}
