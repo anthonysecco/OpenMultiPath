@@ -2829,3 +2829,120 @@ far more often than before, since both rank paths by the same band-then-score or
 sharing the primary is the routine case, not the fallback. The place bulk still lands
 elsewhere is ordinary: a cheaper band, or stickiness carried from an earlier state.
 
+## D-057 · Recognize ESP/IKE, and gate the behavioural thresholds on it
+
+**Decision.** `internal/classify/esp.go` reads the SPI and sequence number that lead every
+ESP packet and the ISAKMP header that leads every IKEv2 message, both cleartext under RFC
+4303 and RFC 7296 even though the SA's own payload is not. Confirmed the same way RTP is
+(D-030) - three packets agreeing on a run, checked only on UDP/4500, where RFC 3948's NAT-T
+encapsulation puts both. Unlike STUN, RTP and vendor prefixes, a confirmed run does not by
+itself set the class: an IPsec tunnel carries whatever its owner puts in it, so it only
+selects a second, wider pair of behavioural thresholds (`classify_esp_max_bytes` /
+`classify_esp_gap_variance_ms`) in place of the cleartext pair.
+
+**Why this came up.** Calling over Wi-Fi - VoWiFi - tunnels its RTP audio inside ESP,
+NAT-T-encapsulated over UDP/4500 to the carrier's ePDG. None of the three signals above see
+it: there is no ICE exchange for STUN to catch, the RTP header is inside the ESP ciphertext
+so D-030's detector cannot read it, and no vendor publishes ePDG ranges the way Microsoft
+publishes its Optimize endpoints. A real test confirmed the gap: the flow landed
+transactional, not real-time.
+
+**Why not decrypt, and why the header is enough anyway.** ESP's payload is exactly the
+thing this project has no business reading. But the receiver has to know which key to use
+before it can decrypt, so the SPI is not inside the ciphertext at all - it, the sequence
+number, and IKE's SPIs/version/exchange-type/length are transmitted in the clear by
+necessity, the same structural reason D-030's argument for RTP over SRTP holds here too.
+
+**Why a confirmed run does not mean real-time by itself.** A phone's IPsec tunnel is not
+one thing. A VoWiFi call and a background VPN sync can both be ESP on the same 5-tuple,
+told apart in the general case only by which child SA's SPI they carry - and that pairing is
+negotiated inside IKEv2's encrypted CREATE_CHILD_SA exchange, which is genuinely unreadable
+without the keys. Splitting the flow key on SPI was considered and rejected for the same
+reason: ESP's SPI is chosen by the *receiving* end of each direction, so a call's two
+directions carry two different SPIs, and keying on SPI directly would split one
+conversation into two - the exact failure `FlowKey`'s canonicalization exists to prevent.
+So "this is IPsec" only gates which behavioural thresholds apply; whether the SA is voice
+still comes from packet size and gap variance, same as any other flow that reaches the
+catch-all.
+
+**Why the thresholds need to be wider, not just present.** `classify_rtp_max_bytes` (250)
+and `classify_gap_variance_ms` (5) were tuned against cleartext RTP arriving over a wired-ish
+path. ESP adds a fixed SPI/sequence/ICV/padding overhead on top of the codec payload it
+carries, and the jitter measured here is whatever the sender's own Wi-Fi radio already added
+before the packet reached ompd, not a LAN's - worse yet in a moving vehicle. The ESP pair
+(400 bytes, 20 ms) leaves the same order of headroom below QUIC bulk's 1200-1400 byte range
+that the cleartext pair has, and is still tight enough that a bursty flow which happened to
+land on UDP/4500 would not pass it.
+
+**Consequence for the flow dump.** `FlowSnapshot`/`state.Flow` carry a new `ESP` field so a
+VoWiFi test can be read directly off the UI - whether the evidence confirmed - rather than
+inferred from the class alone, the same reasoning as D-030's settling-packet numbers.
+
+**`ClassifyVendorPrefixes`, added alongside this.** D-019's vendor-prefix tier existed in
+code but nothing ever called `SetVendorPrefixes` in production - the list had no source.
+Given a known carrier ePDG address, the direct fix is the tier already designed for exactly
+this: a config-driven list (`classify_vendor_prefixes`), CIDR or bare address, checked
+before the behavioural catch-all the same as a compiled-in prefix, reparsed only when the
+config actually changes. Empty is a complete default; this is a shortcut for an address
+someone already knows, not a requirement.
+
+**Accepted, knowingly.** A phone's other IPsec traffic sharing the exact same 5-tuple as an
+active VoWiFi call - both on UDP/4500 to the same ePDG address, at the same time - is judged
+by the blended behavioural sample of both, not classified per-SA. This is the corollary of
+rejecting SPI-keyed flow splitting above, and is believed rare: it requires two SAs to the
+same peer address on the same port pair, which is not the common shape of "a call plus
+unrelated background traffic."
+
+## D-058 · Reopen D-057: assume UDP/500 and UDP/4500 are real-time outright
+
+**Decision.** Replace D-057's ESP/IKE header detection with a flat port rule: any flow
+on UDP/500 or UDP/4500 is real-time, full stop, no packet inspection. Placed as signal 4
+in `internal/classify/classify.go`, after vendor prefixes and ahead of the behavioural
+catch-all. `esp.go` and its tests are deleted; `classify_esp_max_bytes`,
+`classify_esp_gap_variance_ms` and `classify_esp_silence_gap_ms` are removed along with it.
+Packet-level tuning - throughput, size, spacing - is deferred to a later pass; this step
+only has to get a call onto the right path.
+
+**Why D-057's reasoning no longer holds.** It was sound in principle - SPI and ISAKMP
+header fields survive encryption for the same structural reason D-030's RTP header does -
+but real-world testing against a live VoWiFi call (2026-09-13) found it fragile in ways
+that kept surfacing new failure modes rather than converging:
+
+- IKE handshake packets (IKE_SA_INIT/IKE_AUTH, carrying certificates and DH material)
+  are far larger than any codec frame and, before being excluded, poisoned the mean size
+  of a flow's first sampling window.
+- RFC 3948 NAT-T keepalives - a lone 0xFF byte sent seconds or minutes apart while a call
+  is still ringing - are neither ESP-shaped nor IKE-shaped, so nothing caught them either;
+  a handful before the call connects poisoned the gap variance instead.
+- Once both of those were excluded, genuine DTX/comfort-noise silence between talk spurts
+  did the same thing on a smaller scale, requiring a third exclusion
+  (`classify_esp_silence_gap_ms`).
+- Even after all three fixes, a live decision measured 36-144 ms of gap jitter on packets
+  whose true wire timestamps (replayed offline through the identical code) showed 5.93 ms.
+  The daemon's own read loop classifies and transmits every packet synchronously on one
+  goroutine (`initiator.go`'s `readPayloads` callback, down through `pathShaper.send`'s
+  inline transmit) - any other device's packet on a busy LAN can delay when the next one is
+  even read, and that self-inflicted delay is indistinguishable, from inside the classifier,
+  from real jitter. Raising `classify_esp_gap_variance_ms` from 20 to 200 ms papered over
+  this, but the honest fix is decoupling transmission from the read loop, which is a
+  separate change this decision does not attempt.
+
+Each fix bought a little more real-world coverage and cost a little more surface: three new
+config fields, a second exclusion path through `observe()`, and a decision tree that needed
+a live call and a packet capture to reason about correctly even for the person who wrote it.
+That is the opposite of CLAUDE.md's "simplicity over cleverness" - the design one can reason
+about at 2am in a campground - and D-057's own core claim (structural evidence beats
+behavioural inference) was never in question; what failed was layering a delicate
+behavioural measurement *on top of* that structural evidence instead of stopping at it.
+
+**Why a flat port rule is safe enough.** UDP/500 and UDP/4500 are not general-purpose
+ports; ordinary bulk transfers do not use them. The asymmetric cost D-027 warns about -
+a false real-time verdict duplicates bulk traffic over a metered link - is bounded by how
+rarely anything else legitimately lives on these ports, not by packet-level heuristics.
+
+**Accepted, knowingly.** Any traffic on these ports gets real-time treatment regardless of
+what it actually is - a corporate VPN's bulk sync sharing a phone's IPsec tunnel, or any
+other non-voice IPsec use, rides the low-latency path same as a call. This trades the
+precision D-057 was reaching for, for a rule simple enough to be correct. Per-flow
+throughput/size/spacing tuning, and any finer-grained treatment within these ports, is
+future work.

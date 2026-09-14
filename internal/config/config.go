@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -172,6 +173,17 @@ type Config struct {
 	ClassifySamplePackets int `json:"classify_sample_packets"`
 	ClassifyRTPMaxBytes   int `json:"classify_rtp_max_bytes"`
 	ClassifyGapVarianceMs int `json:"classify_gap_variance_ms"`
+
+	// ClassifyVendorPrefixes is the vendor-hint tier (D-019), sourced from
+	// config instead of requiring a code change: a CIDR ("1.2.3.0/24") or
+	// a bare address ("1.2.3.4", read as a /32) per entry, matched before
+	// the behavioural catch-all runs. Empty is a complete default - every
+	// flow still reaches a verdict through STUN, RTP and behavioural
+	// evidence alone - this is only ever a shortcut for an address a
+	// person already knows carries real-time traffic, such as a carrier's
+	// ePDG for VoWiFi. Invalid entries are dropped rather than rejected,
+	// same as everywhere else in this file.
+	ClassifyVendorPrefixes []string `json:"classify_vendor_prefixes,omitempty"`
 
 	// The transactional/bulk split. A flow is transactional until it
 	// proves itself an elephant, and goes back when it stops.
@@ -697,6 +709,7 @@ func (c Config) Sanitised() Config {
 		ClassifySamplePackets:   clamp(c.ClassifySamplePackets, Bounds["classify_sample_packets"]),
 		ClassifyRTPMaxBytes:     clamp(c.ClassifyRTPMaxBytes, Bounds["classify_rtp_max_bytes"]),
 		ClassifyGapVarianceMs:   clamp(c.ClassifyGapVarianceMs, Bounds["classify_gap_variance_ms"]),
+		ClassifyVendorPrefixes:  sanitisedVendorPrefixes(c.ClassifyVendorPrefixes),
 		ClassifyBulkKbps:        clamp(c.ClassifyBulkKbps, Bounds["classify_bulk_kbps"]),
 		ClassifyBulkDwellMs:     clamp(c.ClassifyBulkDwellMs, Bounds["classify_bulk_dwell_ms"]),
 		ClassifyBulkClearKbps:   clamp(c.ClassifyBulkClearKbps, Bounds["classify_bulk_clear_kbps"]),
@@ -712,6 +725,30 @@ func (c Config) Sanitised() Config {
 		BudgetYellowPenaltyR:       clamp(c.BudgetYellowPenaltyR, Bounds["budget_yellow_penalty_r"]),
 		BudgetRedPenaltyR:          clamp(c.BudgetRedPenaltyR, Bounds["budget_red_penalty_r"]),
 	}
+}
+
+// sanitisedVendorPrefixes drops any entry that is not a valid CIDR or bare
+// IP address, rather than rejecting the whole list over one typo made from
+// the passenger seat. Parsing happens again in internal/classify, which
+// cannot import this package's validation without an import cycle - this
+// pass exists so a config file saved through the web interface reads back
+// clean, and a malformed entry shows up once, here, rather than silently
+// failing to match downstream.
+func sanitisedVendorPrefixes(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, err := netip.ParsePrefix(s); err == nil {
+			out = append(out, s)
+			continue
+		}
+		if _, err := netip.ParseAddr(s); err == nil {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // sanitisedLinks brings every per-link allowance inside its range.

@@ -1,7 +1,7 @@
 // Package classify decides whether an inner packet is real-time,
 // transactional or bulk.
 //
-// This is step 7, and protocol.md sets out the shape: three signals in
+// This is step 7, and protocol.md sets out the shape: four signals in
 // strict precedence, first match wins, with a per-flow cache so that the
 // decision is made once per conversation rather than once per packet.
 //
@@ -9,7 +9,9 @@
 //     the flow's first media packet (D-019)
 //  2. Vendor prefixes    - a hint for non-WebRTC clients, never a
 //     foundation, because the feeds rot (D-019)
-//  3. Behavioural        - catch-all, from packet size and the variance
+//  3. IKE/IPsec ports    - UDP/500 and UDP/4500 are assumed real-time
+//     outright, no packet inspection (D-058)
+//  4. Behavioural        - catch-all, from packet size and the variance
 //     of the inter-packet gap (D-018)
 //
 // Two structural rules come ahead of all three. All TCP is definitively
@@ -61,6 +63,17 @@ import (
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 )
 
+// ikePort and natTPort are IKE/IPsec's well-known ports - 500 unencapsulated,
+// 4500 once NAT-T detects a NAT between the peers, which is the near-universal
+// case for a phone behind carrier-grade NAT. D-058 assumes outright that
+// anything on either port is a call (VoWiFi, and any other IPsec-tunneled
+// voice), rather than inspecting ESP/IKE headers to gate a behavioural
+// sample: see D-058 for why the header-based approach was reopened.
+const (
+	ikePort  = 500
+	natTPort = 4500
+)
+
 // Classifier assigns a traffic class to inner packets and remembers what
 // it decided, per flow. It is safe for concurrent use.
 type Classifier struct {
@@ -74,6 +87,15 @@ type Classifier struct {
 	flows     map[FlowKey]*flow
 	vendors   []netip.Prefix
 	nextSweep time.Time
+
+	// cfgVendors mirrors vendors but is sourced from live config
+	// (ClassifyVendorPrefixes) rather than SetVendorPrefixes, so a known
+	// carrier ePDG address can be added from the config file the same way
+	// any other threshold is - without a restart. cfgVendorRaw is what the
+	// parse cache was built from, so a config read that has not changed
+	// does not re-parse strings on every packet.
+	cfgVendorRaw []string
+	cfgVendors   []netip.Prefix
 }
 
 // flow is what is remembered about one conversation.
@@ -169,6 +191,8 @@ func (c *Classifier) Classify(pkt []byte) uint8 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.refreshCfgVendors(cfg.ClassifyVendorPrefixes)
+
 	f := c.flows[p.flow]
 
 	// An entry can outlive its idle timeout, because the sweep that
@@ -258,7 +282,19 @@ func (c *Classifier) Classify(pkt []byte) uint8 {
 		return f.class
 	}
 
-	// 4. Behavioural catch-all. It answers "is this a call", and anything
+	// 4. IKE/IPsec ports. Assumed real-time outright - VoWiFi and any
+	// other IPsec-tunneled call ride these ports, and D-058 chose a flat
+	// port rule over inspecting ESP/IKE headers to decide packet by
+	// packet. See D-058 for what that approach ran into on a live call,
+	// and why per-flow throughput/size/spacing tuning was deferred rather
+	// than folded into classification.
+	if p.flow.APort == ikePort || p.flow.BPort == ikePort ||
+		p.flow.APort == natTPort || p.flow.BPort == natTPort {
+		f.class, f.decided = protocol.ClassRealtime, true
+		return f.class
+	}
+
+	// 5. Behavioural catch-all. It answers "is this a call", and anything
 	// it does not call real-time falls through to the volume detector
 	// rather than being carried as bulk outright.
 	c.observe(f, p, now)
@@ -331,7 +367,58 @@ func (c *Classifier) vendorMatch(k FlowKey) bool {
 			return true
 		}
 	}
+	for _, p := range c.cfgVendors {
+		if p.Contains(k.A) || p.Contains(k.B) {
+			return true
+		}
+	}
 	return false
+}
+
+// refreshCfgVendors reparses ClassifyVendorPrefixes when the config has
+// actually changed, so a person can add a known carrier ePDG address (or
+// anything else worth a direct hint) to the config file the same way any
+// other threshold is adjusted - no rebuild, no restart - while the common
+// case of an unchanged config costs one small slice comparison per packet
+// rather than a parse.
+//
+// Called with c.mu already held.
+func (c *Classifier) refreshCfgVendors(raw []string) {
+	if stringSliceEqual(c.cfgVendorRaw, raw) {
+		return
+	}
+	c.cfgVendorRaw = append([]string(nil), raw...)
+	c.cfgVendors = c.cfgVendors[:0]
+	for _, s := range raw {
+		if p, ok := parseVendorPrefix(s); ok {
+			c.cfgVendors = append(c.cfgVendors, p)
+		}
+	}
+}
+
+// parseVendorPrefix accepts either a CIDR ("141.207.227.233/32") or a bare
+// address ("141.207.227.233"), so a config file can name a single known
+// peer without anyone having to remember to append the host mask.
+func parseVendorPrefix(s string) (netip.Prefix, bool) {
+	if p, err := netip.ParsePrefix(s); err == nil {
+		return p, true
+	}
+	if a, err := netip.ParseAddr(s); err == nil {
+		return netip.PrefixFrom(a, a.BitLen()), true
+	}
+	return netip.Prefix{}, false
+}
+
+func stringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // admit makes room for a new flow and returns its entry, or nil if the

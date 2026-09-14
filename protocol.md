@@ -247,8 +247,16 @@ Needed to identify conferencing traffic. Run in precedence order, first match wi
    warning under that table. It also covers the case STUN cannot: a daemon that started
    mid-call never saw the ICE exchange. Works on SRTP, where the payload is encrypted but
    the header is not. See D-030.
-3. **Vendor prefix matching**, for non-WebRTC paths such as Zoom's native client.
-4. **Behavioral heuristic**, as catch-all.
+3. **Vendor prefix matching**, for non-WebRTC paths such as Zoom's native client. Sourced
+   from config (`classify_vendor_prefixes`) as well as compiled-in lists, so a known address
+   - a carrier's VoWiFi ePDG, say - can be added without a rebuild.
+4. **IKE/IPsec ports.** UDP/500 and UDP/4500 are assumed real-time outright, no packet
+   inspection - VoWiFi and any other IPsec-tunneled call ride these ports. See D-058, which
+   reopens D-057's header-based ESP/IKE detection: real-world testing found it fragile
+   (IKE handshake noise, NAT-T keepalives, DTX silence gaps, and the daemon's own read-loop
+   jitter all corrupted the behavioural sample it depended on) and simpler to replace with a
+   flat port rule. Per-flow throughput/size/spacing tuning is deferred to a later pass.
+5. **Behavioral heuristic**, as catch-all for everything the first four miss.
 
 Cache classification per 5-tuple in a flow cache so subsequent packets are not
 re-inspected.

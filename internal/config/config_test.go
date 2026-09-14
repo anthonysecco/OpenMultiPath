@@ -138,6 +138,31 @@ func TestUnknownDuplicateModeFallsBackToTheDefault(t *testing.T) {
 	}
 }
 
+// A malformed vendor-prefix entry - a typo made from the passenger seat
+// while adding a known carrier ePDG address - must not take out every other
+// entry, or silently pass through to a classifier that would either choke
+// on it or, worse, match nothing and look like it was never added.
+func TestVendorPrefixesDropInvalidEntriesKeepValidOnes(t *testing.T) {
+	c := Defaults()
+	c.ClassifyVendorPrefixes = []string{
+		"141.207.227.233",   // bare address, the common case for one known peer
+		"107.122.31.31/32",  // already a CIDR
+		"not-an-ip-address", // typo
+		"300.1.1.1",         // out of range
+	}
+	got := c.Sanitised().ClassifyVendorPrefixes
+	want := []string{"141.207.227.233", "107.122.31.31/32"}
+	if len(got) != len(want) {
+		t.Fatalf("vendor prefixes = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("vendor prefixes = %v, want %v", got, want)
+			break
+		}
+	}
+}
+
 func TestSaveAndLoadRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	want := Defaults()

@@ -215,6 +215,22 @@ func TestVendorPrefixClassifiesImmediately(t *testing.T) {
 	}
 }
 
+// D-058: any traffic on IKE/IPsec's well-known ports is assumed real-time
+// outright, no packet inspection - the flat rule that replaced D-057's
+// ESP/IKE header detection. A large, single, shapeless packet is exactly
+// what the old behavioural test would have called bulk; the port rule
+// must not care.
+func TestIKEAndNATTPortsClassifyImmediately(t *testing.T) {
+	c, _ := testClassifier(t)
+
+	for _, port := range []int{500, 4500} {
+		got := c.Classify(udp4("10.20.0.2", port, "141.207.227.233", port, nil, 1300))
+		if got != protocol.ClassRealtime {
+			t.Errorf("a single MTU-sized packet on port %d classified %s, want realtime", port, className(got))
+		}
+	}
+}
+
 // Port pairs get reused. A new conversation on a recycled 5-tuple must not
 // inherit the last one's class, or a download lands on the call's path.
 func TestIdleFlowExpiresSoAReusedPortStartsClean(t *testing.T) {
