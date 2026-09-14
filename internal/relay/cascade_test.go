@@ -390,3 +390,105 @@ func TestRealtimeOnAPathNeverThrottlesBulk(t *testing.T) {
 		t.Errorf("dropped %d bulk packets beside a call", dropped)
 	}
 }
+
+// dupAlways is a cascade world duplicating real-time on every path, so every
+// path carries the call - the vehicle's own setting.
+func dupAlways(t *testing.T, paths ...pathMetric) *world {
+	t.Helper()
+	w := cascadeWorld(t, paths...)
+	w.c.DuplicateMode = config.DuplicateAlways
+	w.s.cfg.Set(w.c)
+	return w
+}
+
+// The field case (D-065): with the call on both links, a 562 kbps Starlink
+// primary was let into the cascade unchecked and filled first. It is too small
+// beside AT&T whoever it carries, so bulk rides AT&T alone, overflow included.
+func TestCascadeLeavesOutACallsPathTooSmall(t *testing.T) {
+	w := dupAlways(t, reported(0, 40), reported(1, 60))
+	w.set(0, func(p *pathMetric) { p.shapedKbps = 562 })
+	w.set(1, func(p *pathMetric) { p.shapedKbps = 77_500 })
+	d := w.settle()
+	if d.primary != 0 || len(d.tx) != 2 {
+		t.Fatalf("primary %d, real-time on %v; want the small path 0 primary and duplicated", d.primary, d.tx)
+	}
+	if got := ids(d); !sameOrder(got, []uint8{1}) {
+		t.Errorf("fill order %v, want AT&T's path 1 alone", got)
+	}
+	w.full[1] = true
+	if placed, _ := w.sendBulk(200, 1250); placed[0] != 0 {
+		t.Errorf("placed %v with every member full, want nothing on the 562 kbps path", placed)
+	}
+}
+
+// The same from the other end: a small duplicate is left out too.
+func TestCascadeLeavesOutADuplicateTooSmall(t *testing.T) {
+	w := dupAlways(t, reported(0, 40), reported(1, 60))
+	w.set(0, func(p *pathMetric) { p.shapedKbps = 106_000 })
+	w.set(1, func(p *pathMetric) { p.shapedKbps = 563 })
+	d := w.settle()
+	if got := ids(d); !sameOrder(got, []uint8{0}) {
+		t.Errorf("fill order %v, want path 0 alone", got)
+	}
+}
+
+// A duplicate losing half of what it is given is not a home for spread bulk,
+// call or no call.
+func TestCascadeLeavesOutAnUnhealthyDuplicate(t *testing.T) {
+	w := dupAlways(t, reported(0, 40), reported(1, 60))
+	w.settle()
+	w.set(1, func(p *pathMetric) { p.txLoss = 50; p.recentLoss = 50 })
+	d := w.tick(w.c.DemoteIntervals + 2)
+	if _, ok := memberOf(d, 1); ok {
+		t.Errorf("a duplicate losing half its traffic is in the cascade %v", ids(d))
+	}
+}
+
+// Nor one so far behind the primary that the far end would give up on it.
+func TestCascadeDeltaGateAppliesToADuplicate(t *testing.T) {
+	w := dupAlways(t, path(0, 40), path(1, 800))
+	d := w.settle()
+	if len(d.tx) != 2 {
+		t.Fatalf("real-time on %v, want it duplicated onto both paths", d.tx)
+	}
+	if got := ids(d); !sameOrder(got, []uint8{0}) {
+		t.Errorf("fill order %v, want path 0 alone", got)
+	}
+}
+
+// With the call on every path, the primary is the one bulk reaches for last,
+// and a full cascade overflows onto the duplicate rather than onto it.
+func TestCascadeFillsADuplicateBeforeThePrimary(t *testing.T) {
+	w := dupAlways(t, reported(0, 40), reported(1, 60))
+	d := w.settle()
+	if d.primary != 0 {
+		t.Fatalf("primary = %d, want 0", d.primary)
+	}
+	if got := ids(d); !sameOrder(got, []uint8{1, 0}) {
+		t.Fatalf("fill order %v, want the duplicate 1 first and the primary 0 last", got)
+	}
+	if placed, _ := w.sendBulk(100, 1250); placed[1] != 100 {
+		t.Errorf("placed %v with room everywhere, want all of it on the duplicate", placed)
+	}
+	w.full[0], w.full[1] = true, true
+	if placed, _ := w.sendBulk(100, 1250); placed[1] != 100 {
+		t.Errorf("placed %v with every path full, want the overflow on the duplicate", placed)
+	}
+}
+
+// When no path passes, bulk rides the primary alone and the cascade stays on,
+// rather than switching off and on as a link's health crosses a line.
+func TestCascadeFallsBackToThePrimaryWhenNoPathPasses(t *testing.T) {
+	w := dupAlways(t, reported(0, 40), reported(1, 60))
+	w.settle()
+	for _, id := range []uint8{0, 1} {
+		w.set(id, func(p *pathMetric) { p.txLoss = 50; p.recentLoss = 50 })
+	}
+	d := w.tick(w.c.DemoteIntervals + 2)
+	if !d.cascadeOn {
+		t.Fatalf("cascade inactive (%s) with no path passing, want it on the primary", d.cascadeWhy)
+	}
+	if got := ids(d); !sameOrder(got, []uint8{d.primary}) {
+		t.Errorf("fill order %v, want the primary %d alone", got, d.primary)
+	}
+}

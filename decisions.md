@@ -3173,8 +3173,99 @@ A real VoWiFi call (UDP/4500) ran beside a speed test:
 
 **Starlink still saturated, but through bulk, not this.** Once the classifier
 reclassified the test as bulk, the cascade filled Starlink first on the vehicle and
-dropped 17k packets there. D-065 fixes that.
+dropped 17k packets there. See D-065.
 
 **Open, for the road.** Neither the 2 s hold nor reusing `shaperRoom` as the trigger has
 been tuned. Both are reasoned from the lab constants and D-033, and the test above only
 showed they do no harm.
+
+## D-065 · The call's paths pass the cascade's gates too, and the primary fills last
+
+**Decision.** Two changes to `buildCascade` (`internal/relay/cascade.go`):
+1. **The call's paths are gated like any other.** A path carrying real-time (`d.tx`: the
+   primary, its duplicates, a make-before-break target) joins the bulk cascade only if it
+   passes the gates the other paths already face: health (D-046), size (D-045) and the
+   delta gate.
+2. **Among the call's paths, the primary is filled last.** Duplicates come first and the
+   primary last; before this, `d.tx` put the primary first.
+
+If no path passes, bulk rides the primary alone and the cascade stays on. It does not
+switch off and on each time a link's health crosses a line.
+
+**Why: found on the real links, D-064's test** (2026-09-14). A VoWiFi call ran beside a
+speed test with `duplicate_mode: always`, so the call was on both links, and Starlink
+(562 kbps) was the primary on the vehicle. Once the test's connections were reclassified
+as bulk:
+- **Starlink was in the cascade anyway.** Carrying the call exempted it from the size gate,
+  though it is 0.7% of AT&T.
+- **Starlink was filled first.** It was the primary, so it came first in `d.tx`.
+- **Starlink took every overflow packet.** Overflow goes to the first path in the fill
+  order.
+
+Over the ~22 s upload phase this cost:
+
+| Measure | Change |
+|---|---|
+| Bulk overflowed (all onto Starlink) | +17,652 |
+| Starlink shaper drops | +17,437 |
+| Home resequencer gaps timed out | +4,552 (hold at its 200 ms cap) |
+| Home resequencer gaps given up lost | +1,923 |
+| AT&T use | 65–84% |
+
+Every dropped packet stalled its flow at the far end, and the senders read the stall as
+congestion. In the download direction home's primary was AT&T, so the order was AT&T →
+Starlink and overflow landed on AT&T. Starlink still absorbed about 420 kbps of spilled
+bulk at 100% of its shaped rate.
+
+**Reopening v0.2-design.md §5.1, and why its reasoning no longer holds.** The design adds
+protected paths "in `d.tx` order" with no membership test. That was safe because each path
+had a controller: bulk on a protected path was held to a queue target stricter than on
+the others, so a small path carrying the call had its bulk allowance cut almost at once.
+D-055 removed the controller. The shaper caps a path's total rate but does nothing to keep
+bulk off it, so the exemption lost the thing that made it safe.
+
+**The owner's rule (D-052) is kept.** Real-time on a path still changes only where that
+path sits, and never keeps bulk off a path. A path is left out for being small, unhealthy
+or too far behind, exactly as it would be if it carried no call. The real-time duplicate is
+placed by `buildTx` and is untouched.
+
+**Why the primary last.** "The call's path last" said nothing once duplication put the
+call on every path. `d.tx`'s own order then had bulk filling first, and overflowing onto,
+the one path the call cannot lose. A duplicate is a spare copy, so the primary is the one
+to reach for last. After change 1 this matters only between comparable links, such as
+AT&T beside a 20 Mbps cellular link.
+
+**The cascade can never be emptied by these gates.** The size bar is the best healthy
+path, which always passes it. The delta gate is measured from the primary, which is always
+in reach of itself. Only when every path is unhealthy, or the one healthy path is too far
+behind, does nothing pass, and then the primary carries bulk alone, as it always could.
+
+**Accepted, knowingly.** With the Starlink standby tier, the vehicle now sends no bulk on
+Starlink at all. Real-time duplicates and transactional flows that start there still ride
+it. That is the intent: 562 kbps beside 77 Mbps adds 0.7% of capacity and, per packet,
+stalls every flow it touches.
+
+**Verified on the real links** (2026-09-14, both nodes, `duplicate_mode: always`). The
+same test was repeated: a real VoWiFi call beside Ookla against server 32408, giving
+93.4 Mbps down and 67.9 Mbps up. The logged bulk order read AT&T alone on both ends.
+
+| Vehicle upload | D-064 build | D-065 build |
+|---|---|---|
+| Bulk offered to Starlink | up to 25 Mbps | 0 |
+| Starlink peak / shaper drops | 102% / +17,437 | 32% / 0 |
+| AT&T during the upload | 65–84% | 100% of its shaped rate, 26 drops |
+| Home resequencer | +4,552 gaps timed out, +1,923 lost, hold at 200 ms | 0 timed out, 131 lost, 192 late |
+
+In the download direction, Starlink carried no bulk, and the vehicle's resequencer gave up
+206 gaps as lost with none late or timed out. The call's downlink, measured on the vehicle,
+held 50 pps with a 40 ms largest gap and no gap over 60 ms.
+
+**Still open.** Starlink was home's primary on this run and still reached its shaped rate
+twice, both times with transactional traffic, not bulk:
+- **A 2 s burst with 906 drops.** New speed-test connections started on Starlink while
+  AT&T's transactional band was already full, and D-064's rule of staying put when every
+  path is full held them there.
+- **About 10 s of upload ACKs at 79–106%.** Starlink's queue stayed just under
+  `shaperRoom`'s 3,000-byte floor, so the move trigger never fired.
+
+Neither touched the call, which is sent first on Starlink.

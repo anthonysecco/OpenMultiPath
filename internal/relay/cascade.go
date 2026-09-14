@@ -21,8 +21,8 @@ import (
 //
 //   - it fills the slowest usable path first, where latency costs a download
 //     nothing, and spills onto the next faster path only once that one is
-//     full, and so on down to the path carrying the call, which is always
-//     last;
+//     full, and so on down to the paths carrying the call, which are always
+//     last, the primary last of all (D-065);
 //   - a path is full when its shaper is backed up (D-055): it is held to 90%
 //     of its measured speed, and bulk queued behind that past shaperRoom goes
 //     on to the next path. A path never measured is unshaped, so it never
@@ -152,10 +152,22 @@ func (s *scheduler) buildCascade(now time.Duration, d *decision, c config.Config
 			bestKbps = sc.m.shapedKbps
 		}
 	}
+	// Every gate applies to the call's paths as well (D-065). v0.2 let them in
+	// unconditionally because each path's controller held a small one's bulk
+	// down; D-055 removed the controller, and the shaper alone caps a path's
+	// rate without keeping bulk off it. On the vehicle, with duplication on
+	// both links, a 562 kbps Starlink primary took first pick of the upload and
+	// dropped seventeen thousand packets the far end then stalled waiting for,
+	// while AT&T idled at two thirds. Carrying the call still decides only
+	// where a path sits; being too small, unhealthy or too far behind decides
+	// whether it is in, whoever it carries.
+	passes := func(sc scored) bool {
+		return healthyForCascade(now, sc, c) &&
+			!undersizedForSpread(sc.m.shapedKbps, bestKbps, c) && inReach(sc)
+	}
 	var members []scored
 	for _, sc := range eligible {
-		if protected[sc.m.id] || !healthyForCascade(now, sc, c) ||
-			undersizedForSpread(sc.m.shapedKbps, bestKbps, c) || !inReach(sc) {
+		if protected[sc.m.id] || !passes(sc) {
 			continue
 		}
 		members = append(members, sc)
@@ -180,9 +192,26 @@ func (s *scheduler) buildCascade(now time.Duration, d *decision, c config.Config
 	for _, id := range order {
 		add(id, false)
 	}
-	for _, id := range d.tx {
-		if _, ok := byID[id]; ok {
+	// The call's paths last, and among them the primary last of all (D-065):
+	// d.tx is the primary first and then its duplicates, so it is walked
+	// backwards. "The call's path last" could not say anything once
+	// duplication put the call on every path, and d.tx's own order had bulk
+	// filling the one path the call cannot lose first - and overflowing onto
+	// it once every path was full. A duplicate is a spare copy; the primary
+	// is the one to reach for last.
+	for i := len(d.tx) - 1; i >= 0; i-- {
+		id := d.tx[i]
+		if sc, ok := byID[id]; ok && passes(sc) {
 			add(id, true)
+		}
+	}
+	// No path passed - every one unhealthy, or the only healthy big one too far
+	// behind. Bulk rides the primary alone, as it did before any gate applied
+	// here, rather than the cascade switching off and on each time a link's
+	// health crosses a line.
+	if len(d.cascade) == 0 {
+		if _, ok := byID[d.primary]; ok {
+			add(d.primary, true)
 		}
 	}
 
