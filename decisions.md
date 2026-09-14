@@ -3063,3 +3063,38 @@ the precheck was strictly worse than the thing already downstream of it.
 tested, and deployed in the working tree, without a decision recorded for it at the
 time - the rationale above is drawn from the code's and test's own comments rather than
 from a discussion. Flagged for the project owner to confirm the reasoning stands.
+
+## D-063 · eBPF/XDP for the data path: recorded, not planned
+
+**Decision.** Raised as external feedback (a reviewer asked why classification,
+scheduling, and resequencing aren't done in-kernel via eBPF/XDP instead of a userspace
+daemon). Not adopted. Kept as a low-priority future enhancement, revisitable if its
+premise changes.
+
+**Why not now.** The case for XDP is skipping the kernel/userspace copy and context
+switch to save CPU and latency on the hot path. That only pays off when host packet
+processing is the bottleneck. Here it never is - the bottleneck is WAN link bandwidth
+(tens of Mbps over Starlink/LTE), which the N100 and home server have orders of
+magnitude of headroom against. What it costs is real: the resequencer and scheduler
+are the hardest, highest-risk part of this project, and reimplementing them under the
+eBPF verifier's constraints (bounded loops, bounded stack, map-based state instead of
+normal control flow) works against principle 2 - simplicity, and the ability to debug
+live in a vehicle nobody can send support to.
+
+**Why XDP specifically buys less here than usual.** Its performance case depends on
+*native* driver support at the NIC. This project's uplinks are cellular modems and
+Starlink, typically USB-attached, terminating in WireGuard/tun virtual interfaces -
+none of which get native XDP. Generic (SKB-mode) XDP is the fallback, and it
+reintroduces most of the copy/context-switch cost XDP exists to avoid. This holds on
+both x86 (home, RV) and ARM alike; the constraint is USB-attached links, not
+architecture.
+
+**Go stays viable if this is ever revisited.** `cilium/ebpf` loads and manages eBPF
+programs and maps from Go without needing libbpf's C bindings, and the BPF C itself
+can be cross-compiled to bytecode in CI (via `bpf2go`) rather than on-device - so it
+would not violate "no dependency that requires a build toolchain the RV cannot run".
+The daemon would still be Go for the control plane; the hot-path logic would move to
+a restricted C subset, which is the real cost, not the toolchain.
+
+**Revisit trigger.** Field data showing host CPU or syscall overhead - not link
+bandwidth - as the limiting factor on either box. No such evidence exists today.
