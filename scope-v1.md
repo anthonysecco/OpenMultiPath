@@ -42,6 +42,83 @@ reorder buffer makes the fast path as slow as the slow one — 40 ms Starlink bo
 120 ms LTE needs an 80 ms hold, so everything becomes 120 ms. The slow path should carry
 traffic only when the fast one is saturated or down.
 
+*(The above was written before D-052 built bulk's per-packet cascade + resequencer.
+It is done for bulk. What follows is a new, still-open gap found afterward.)*
+
+## Future enhancement: give transactional traffic a relief valve (not yet designed in full)
+
+**The gap, found 2026-09-14 investigating a real VoWiFi call (UDP/4500) with an upload
+speed test running concurrently.** In `bulk_scheduler: cascade` mode, D-052's per-packet
+cascade (`internal/relay/cascade.go`) is bulk-only — D-052 says explicitly it "supersedes
+D-031's gate and D-044's per-flow spread **in cascade mode**." Transactional gets neither:
+`scheduler.buildTx` pins it rigidly to the primary (`d.txTrans = []uint8{s.primary}`), with
+no spread and no cascade. A speed test's many parallel TCP connections mostly classify as
+*transactional*, not bulk (most individual connections don't sustain
+`classify_bulk_kbps` for the full `classify_bulk_dwell_ms` dwell even though their
+aggregate is large) — so that whole aggregate has nowhere to go but the primary.
+
+That became a real problem because Starlink was primary at the time (slightly lower
+latency than the AT&T LTE link at that moment — an ordinary, expected tie-break, not a
+bug). With transactional pinned to primary and no relief valve, the speed test's
+transactional load piled entirely onto Starlink's ~562 kbps shaped budget with nowhere
+else to go, visibly maxing out Starlink's send rate and degrading the concurrent
+VoWiFi call sharing that path — even though real-time duplication onto both paths was
+confirmed still working correctly throughout.
+
+**Two designs were discussed, and the second is the one to build:**
+
+1. **Rejected direction: mirror bulk's per-packet cascade for transactional, reversed.**
+   Bulk fills highest-latency-first because it doesn't care about latency. Transactional
+   could analogously fill lowest-latency-first (primary) and spill onto higher-latency
+   paths under pressure, flipping to bulk's ordering if/when the classifier promotes the
+   flow to bulk mid-flight (classification is already decided fresh per packet, so this
+   transition would fall out naturally with no special-casing). **Risk:** this needs the
+   same far-end resequencer bulk uses, and the resequencer's hold budget
+   (`resequencer_max_hold_ms`, 200 ms default) would tax exactly the latency-sensitive
+   traffic transactional exists to protect — `scheduler.admit()`'s own comment on why
+   transactional is never gated is "withholding it was the daemon destroying the traffic
+   the user is watching in order to protect the traffic they are listening to." Trading a
+   drop for an up-to-200ms reorder hold is a smaller version of the same harm, not an
+   escape from it.
+
+2. **Chosen direction: per-flow migration, not per-packet spreading.** Track each
+   transactional flow's *currently assigned* path (new state — today's per-flow hash
+   spread, `txFor`'s `txBulkSpread` lookup, is stateless and is superseded by the cascade
+   in cascade mode anyway per D-052). When a flow's current path runs out of room in its
+   *transactional* band specifically, migrate the whole flow — not per-packet — to the
+   next-best (lowest-latency, among paths with room) path, and stay there until it too
+   runs out. Because a flow lives entirely on one path at any moment, this needs no
+   resequencer: at most one brief reordering event at the migration instant (which TCP
+   already tolerates from an ordinary route change), never sustained interleaving. This
+   sidesteps D-044's original spread failure too ("spreading a flow into a receiver that
+   cannot reorder it... fell to 4 Mbit").
+
+**What building direction 2 needs:**
+- A transactional-band-specific room check, parallel to `pathShaper.hasRoom()` (which
+  today only looks at the *bulk* band's backlog — D-060 gave transactional its own band
+  but nothing reads its backlog yet).
+- A per-flow "current path" table for transactional flows (doesn't exist today).
+- Stickiness matching D-033's reasoning for bulk: migrate only when the current path is
+  actually out of room, never chasing a marginally better one — D-033: "a scheduler
+  chasing the better link each time two scores crossed would pay for the move repeatedly
+  in exactly the traffic it was trying to speed up."
+- A decision on the ranking metric for "next best": probably live/scoring delay (which
+  reflects current congestion), not `baseDelayMs` (bulk's cascade metric, chosen
+  specifically to *ignore* self-inflicted queue) — the trigger here is congestion, so the
+  candidate check should care whether the destination is also congested.
+- Sharing a path that also carries a real-time duplicate is already fine, per D-056 (the
+  shaper protects real-time regardless of what else is queued behind it) — no new
+  precedent needed there.
+
+**Read before starting:** D-033 (stickiness rationale, and the original "same for
+duplication targets" exclusion that D-056 already reopened for cascade mode), D-044/045/046
+(the old per-flow spread's membership rules — a similar health/membership gate may be
+needed for migration candidates), D-052 (bulk's cascade — the mechanism *not* to copy
+wholesale here), D-056 (path-sharing with real-time is settled), D-060 (transactional's
+shaper band). Code: `internal/relay/scheduler.go` (`buildTx`, `txFor`),
+`internal/relay/cascade.go` (bulk's cascade, for contrast), `internal/relay/shaper.go`
+(`hasRoom`, band definitions).
+
 ## Explicitly out of scope
 
 - IPv6 (D-026) - dropped on the WAN rather than carried in the tunnel, for now
