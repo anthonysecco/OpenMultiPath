@@ -656,3 +656,89 @@ func TestLeavingFallbackDoesNotCycleATunnelWgQuickDoesNotOwn(t *testing.T) {
 		t.Error("did not remove its own catch-all rule")
 	}
 }
+
+// tunBox is a box with omp-tun-up installed, two per-link transports and the
+// production wg0, and the TUN present. Only wg1's ip rule exists, which is
+// what the vehicle looks like with its second link down: networkd removes a
+// link's rules with the link.
+func tunBox(t *testing.T) *box {
+	b := newBox(t)
+	src, err := os.ReadFile("omp-tun-up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(b.sbin, "omp-tun-up"), src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b.fake("wg", `
+case "$*" in
+  "show interfaces") echo "wg0 wg1 wg2 wg9" ;;
+  "show wg0 fwmark") echo "off" ;;
+  "show wg1 fwmark") echo "0x2001" ;;
+  "show wg2 fwmark") echo "0x2002" ;;
+  "show wg9 fwmark") echo "0xbeef" ;;
+esac`)
+	b.fake("ip", `
+case "$*" in
+  "link show omp0") echo "12: omp0: <POINTOPOINT,UP> mtu 1288"; exit 0 ;;
+esac
+exit 0`)
+	return b
+}
+
+// A link that is down takes its tunnel down with it (D-069). Every marked
+// transport gets an unreachable rule just after its lookup, so a packet for a
+// dead link fails - whether its table lost its default route or networkd took
+// the lookup rule away - instead of falling through to main and riding the
+// tunnel over another link.
+func TestTunUpPinsEveryTransportToItsLink(t *testing.T) {
+	b := tunBox(t)
+	out := b.run_("omp-tun-up", "initiator")
+	calls := b.calls()
+
+	for _, want := range []string{
+		"ip rule add fwmark 0x2001 priority 2101 unreachable",
+		"ip rule add fwmark 0x2002 priority 2102 unreachable",
+		`nft add rule inet omp-tun guard oifname "omp0" udp dport 48219 counter drop`,
+	} {
+		if !strings.Contains(calls, want) {
+			t.Errorf("missing %q\ncalls:\n%s", want, calls)
+		}
+	}
+	if strings.Contains(calls, "fwmark off") {
+		t.Error("guarded wg0, which has no mark")
+	}
+	if strings.Contains(calls, "beef") || !strings.Contains(out, "wg9 fwmark 0xbeef does not name a table") {
+		t.Errorf("a mark that names no table was acted on or not reported\nout: %s\ncalls:\n%s", out, calls)
+	}
+}
+
+// Run again - every ompd restart runs it - it adds nothing twice.
+func TestTunUpGuardIsIdempotent(t *testing.T) {
+	b := tunBox(t)
+	b.fake("ip", `
+case "$*" in
+  "link show omp0") echo "12: omp0: <POINTOPOINT,UP> mtu 1288"; exit 0 ;;
+  "rule show priority 2101") echo "2101:	from all fwmark 0x2001 unreachable" ;;
+  "rule show priority 2102") echo "2102:	from all fwmark 0x2002 unreachable" ;;
+esac
+exit 0`)
+	b.run_("omp-tun-up", "initiator")
+	if strings.Contains(b.calls(), "ip rule add") {
+		t.Errorf("re-added a guard that was already there\n%s", b.calls())
+	}
+}
+
+// Home never answers a transport over the tunnel, which is how a peer roamed
+// onto a tunnel address.
+func TestTunUpResponderDropsTransportIntoTheTunnel(t *testing.T) {
+	b := tunBox(t)
+	b.run_("omp-tun-up", "responder")
+	calls := b.calls()
+	if !strings.Contains(calls, `nft add rule inet omp-tun guard oifname "omp0" udp sport 48219 counter drop`) {
+		t.Errorf("no guard at home\ncalls:\n%s", calls)
+	}
+	if strings.Contains(calls, "unreachable") {
+		t.Error("home touched per-link tables it does not have")
+	}
+}

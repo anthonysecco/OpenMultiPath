@@ -3435,3 +3435,67 @@ vehicle re-sent anything.
 `10.30.0.0/24` that had only existed live. The RV's own egress and PEP-proxied TCP lost NAT
 for about 2 minutes. Both are restored, and the masquerade is now in the file; a reboot
 would previously have caused the same outage.
+
+## D-069 · A link that is down takes its tunnel down with it
+
+**Decision.** Each WireGuard transport is fixed to its own link. If the link or its
+connection goes down, so does that tunnel's path. It must never keep working by riding
+inside the tunnel over another link. There are three parts.
+- **An unreachable rule per transport.** `omp-tun-up` adds
+  `fwmark <mark> priority <table+100> unreachable` just after each transport's lookup
+  rule (`0x2001` → 2101, `0x2002` → 2102). A marked packet the link's table cannot route
+  now fails, rather than falling through to main.
+- **networkd leaves that rule alone.** `ManageForeignRoutingPolicyRules=no`
+  (`deploy/networkd-omp.conf`, installed as `/etc/systemd/networkd.conf.d/omp.conf`)
+  stops networkd deleting rules it did not write when it restarts.
+- **No WireGuard transport inside the tunnel.** Both ends drop WireGuard transport packets
+  headed into `omp0`: the vehicle by destination port 48219, home by source port 48219,
+  in `omp-tun-up`'s `omp-tun` table.
+
+**Found on the real links** (2026-09-15). Starlink (`enp1s0`, `wg2`) had lost carrier, yet
+ompd showed its path as stable, alive and sending.
+- **Fall-through.** networkd withdraws a link's default route and its fwmark rule when the
+  link goes down. `wg2`'s packets then fell through to the main table, whose default is
+  `omp0`, and rode inside the tunnel over AT&T.
+- **Fake redundancy.** Probes kept answering, so the call's duplicate copy and every
+  handover treated a dead link as a second path. Both copies were on AT&T.
+- **Roaming.** WireGuard roamed both peers onto tunnel addresses (the vehicle's to
+  `10.30.0.1`, home's to `10.30.0.2`). Once the link came back, that could black-hole it.
+
+**First attempt failed, and why.** An unreachable default route inside each link's table
+did nothing when the link actually went down. networkd had deleted the fwmark rule, so
+nothing looked the table up. A rule does not depend on the table being consulted.
+
+**Verified on the real links** (2026-09-15). Starlink was taken down for 40 s by a
+self-restoring unit.
+- **While it was down:** marked packets got "Network is unreachable", the Starlink path
+  was down within 12 s, AT&T stayed stable, and egress kept working.
+- **When it came back:** the lookup rule returned, the path recovered on `enp1s0`, and
+  home's peers showed each ISP's own public address (AT&T 166.170.42.131, Starlink
+  98.97.61.2). The earlier roamed endpoint was re-pinned by hand once.
+
+**Power-cut test by the owner** (2026-09-15, Starlink dish unpowered, AT&T carrying the
+tunnel throughout, no egress failures):
+
+| Time | Link | Tunnel path |
+|---|---|---|
+| 18:06:12 | Carrier lost; networkd removed the lookup rule | Marked packets unreachable |
+| 18:06:15 | | Down, 3 s after carrier loss |
+| 18:06:43-57 | Carrier flapped twice while the dish booted; the guard caught each drop | Down |
+| 18:07:04 | Temporary boot-time lease, 206.214.239.194 via .195 | Down: the pinned gateway 100.64.0.1 was unreachable |
+| 18:07:56 | Normal lease back, 100.110.247.30 via 100.64.0.1 | |
+| 18:07:59 | | Up (unstable) |
+| 18:09:01 | | Stable, from Starlink's own address at home |
+
+Starlink takes minutes to come online after power-on, so judge recovery over five minutes,
+not seconds.
+
+**Known fragility, not fixed here.** Each link's table pins a gateway by hand in
+`60-wan-i226.yaml` (`via 100.64.0.1`, `via 192.168.225.1`). A lease with a different
+gateway, such as the dish's boot-time one, leaves the path down until the usual gateway
+returns. It recovered here only because the dish went back to its normal lease. The WAN
+auto-provisioning should follow the DHCP gateway instead of pinning one.
+
+**Transports are named by convention.** The table is the fwmark's hex digits and the guard
+priority is the table plus 100. The WAN auto-provisioning still to be built must follow
+it.
