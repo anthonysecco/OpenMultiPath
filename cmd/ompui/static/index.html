@@ -211,6 +211,7 @@
   <main>
     <div id="view-home">
       <div id="freshness" class="stale">Waiting for the daemon&hairsp;&hellip;</div>
+      <div id="wan-alerts"></div>
 
       <section>
         <h2>Overlay</h2>
@@ -747,7 +748,7 @@ function renderPaths(s) {
 
     return `<div class="path ${(owns && !p.bound) ? "dead" : p.alive ? "alive" : "dead"}">
       <div class="path-head">
-        <span class="path-name">${p.label || p.name || "path " + p.id}</span>${p.label && p.name ? `<span class="tag">${p.name}</span>` : ""}
+        <span class="path-name">${esc(p.label || p.name || "path " + p.id)}</span>${p.label && p.name ? `<span class="tag">${esc(p.name)}</span>` : ""}${p.isp && p.isp !== p.label ? `<span class="tag" title="ISP, from ipinfo.io through this link">${esc(p.isp)}</span>` : ""}
         <span class="muted">#${p.id}</span>
         ${tags}
       </div>
@@ -1608,6 +1609,70 @@ function renderLANClients() {
 }
 $("lan-client-filter").addEventListener("input", () => lanStatus && renderLANClients());
 
+// ---- New WAN links (D-070) --------------------------------------------
+//
+// A link nothing claimed is probed in the background for DHCP and the
+// internet. One that has both is offered here, at the top of Home, and only
+// becomes a WAN link when somebody presses Add - which restarts the daemon.
+const WAN_STATE_TEXT = {
+  "probing": "Checking for DHCP and the internet (up to 5 minutes)…",
+  "no-internet": "Has an address, but no internet.",
+  "error": "The check could not run.",
+  "no-dhcp": "No DHCP answer. Replug it to check again.",
+  "ignored": "Ignored. Replug it to check again.",
+  "adding": "Adding as a WAN link… the daemon will restart and the tunnel drop for a moment.",
+  "add-failed": "Adding it failed, and nothing was changed.",
+};
+
+async function refreshWAN() {
+  let r;
+  try {
+    r = await (await fetch("/api/wan")).json();
+  } catch (e) {
+    return;
+  }
+  if (!r.available) { $("wan-alerts").innerHTML = ""; return; }
+  const now = r.now_unix;
+  const out = [];
+  for (const c of r.candidates || []) {
+    const isp = c.isp ? `${esc(c.isp.name)}${c.isp.public_ip ? ` · ${esc(c.isp.public_ip)}` : ""}${c.isp.city ? ` · ${esc(c.isp.city)}, ${esc(c.isp.region || c.isp.country)}` : ""}` : "";
+    if (c.state === "ready") {
+      out.push(`<div class="banner good">
+        New WAN link detected on <b>${esc(c.interface)}</b>${isp ? ` — ${isp}` : ""}. It has internet.
+        <div class="muted" style="margin-top:4px;font-weight:500">Adding it gives it its own tunnel and makes it a path. The daemon restarts, which drops the tunnel for a moment.</div>
+        <div class="row" style="margin-top:8px">
+          <button type="button" data-wan-add="${esc(c.interface)}">Add as a WAN link</button>
+          <button class="secondary" type="button" data-wan-ignore="${esc(c.interface)}">Ignore</button>
+        </div></div>`);
+    } else if (c.state === "adding" || c.state === "add-failed") {
+      out.push(`<div class="banner ${c.state === "adding" ? "warn" : "bad"}">
+        <b>${esc(c.interface)}</b>${isp ? ` — ${isp}` : ""}: ${WAN_STATE_TEXT[c.state]}${c.detail ? `<div class="muted" style="font-weight:500">${esc(c.detail)}</div>` : ""}
+        ${c.state === "add-failed" ? `<div class="row" style="margin-top:8px"><button type="button" data-wan-add="${esc(c.interface)}">Try again</button><button class="secondary" type="button" data-wan-ignore="${esc(c.interface)}">Ignore</button></div>` : ""}
+      </div>`);
+    } else if (WAN_STATE_TEXT[c.state]) {
+      let extra = c.detail ? ` <span class="muted">(${esc(c.detail)})</span>` : "";
+      if ((c.state === "no-internet" || c.state === "error") && c.retry_unix) {
+        extra += ` <span class="muted">Checking again in ${duration(Math.max(0, c.retry_unix - now))}.</span>`;
+      }
+      const recheck = ["no-internet", "error", "no-dhcp", "ignored"].includes(c.state)
+        ? ` <button class="secondary small" type="button" data-wan-recheck="${esc(c.interface)}">Check now</button>` : "";
+      out.push(`<div class="muted" style="margin:-8px 0 14px">New link <b>${esc(c.interface)}</b>: ${WAN_STATE_TEXT[c.state]}${extra}${recheck}</div>`);
+    }
+  }
+  $("wan-alerts").innerHTML = out.join("");
+  const act = (sel, path, confirmText) => document.querySelectorAll(`[${sel}]`).forEach(b => b.onclick = async () => {
+    const iface = b.getAttribute(sel);
+    if (confirmText && !confirm(confirmText(iface))) return;
+    b.disabled = true;
+    const res = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({interface: iface})});
+    if (!res.ok) alert(await res.text());
+    refreshWAN();
+  });
+  act("data-wan-add", "/api/wan/add", i => `Add ${i} as a WAN link? The daemon restarts and the tunnel drops for a moment.`);
+  act("data-wan-ignore", "/api/wan/ignore");
+  act("data-wan-recheck", "/api/wan/recheck");
+}
+
 // Which of the two views is showing. Everything keeps polling underneath
 // regardless of which is active - state is cheap to fetch and switching
 // tabs should never feel like a fresh load.
@@ -1627,6 +1692,8 @@ loadConfig();
 loadLogs();
 setInterval(refreshState, 1000);
 refreshLAN();
+refreshWAN();
+setInterval(refreshWAN, 5000);
 // The LAN tab polls only while it is showing: it runs ip and reads leases
 // on every request, which is not worth doing every second for nobody.
 setInterval(() => { if (!$("view-lan").hidden) refreshLAN(); }, 3000);

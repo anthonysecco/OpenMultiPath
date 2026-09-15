@@ -90,7 +90,7 @@ case "$*" in
      if [ -e "$FAKE/down_$dev" ]; then exit 1; fi
      if [ -e "$FAKE/exists_$dev" ]; then echo "9: $dev: <BROADCAST> mtu 1500 state UP"; exit 0; fi
      exit 1 ;;
-  *"route show default dev "*)
+  *"default dev "*)
      dev=${!#}
      if [ -e "$FAKE/gw_$dev" ]; then echo "default via $(cat "$FAKE/gw_$dev") dev $dev proto dhcp"; fi
      exit 0 ;;
@@ -729,6 +729,30 @@ exit 0`)
 	}
 }
 
+// guard re-asserts the transport rules alone: no TUN is needed, and nothing
+// else about the routing is touched. ompui runs it after every networkd
+// reload, which can delete them.
+func TestTunUpGuardAlone(t *testing.T) {
+	b := tunBox(t)
+	// No TUN: "link show omp0" fails.
+	b.fake("ip", `
+case "$*" in
+  "link show omp0") exit 1 ;;
+esac
+exit 0`)
+	b.run_("omp-tun-up", "guard")
+	calls := b.calls()
+	if !strings.Contains(calls, "ip rule add fwmark 0x2001 priority 2101 unreachable") ||
+		!strings.Contains(calls, "ip rule add fwmark 0x2002 priority 2102 unreachable") {
+		t.Errorf("guard did not add the rules\n%s", calls)
+	}
+	for _, other := range []string{"route replace", "nft", "link show omp0"} {
+		if strings.Contains(calls, other) {
+			t.Errorf("guard touched %q\n%s", other, calls)
+		}
+	}
+}
+
 // Home never answers a transport over the tunnel, which is how a peer roamed
 // onto a tunnel address.
 func TestTunUpResponderDropsTransportIntoTheTunnel(t *testing.T) {
@@ -740,5 +764,125 @@ func TestTunUpResponderDropsTransportIntoTheTunnel(t *testing.T) {
 	}
 	if strings.Contains(calls, "unreachable") {
 		t.Error("home touched per-link tables it does not have")
+	}
+}
+
+// probeBox is a box with omp-wan-probe installed and fakes for the namespace,
+// dhcpcd and curl. lease decides whether the fake DHCP server answers, code
+// what the connectivity check returns.
+func probeBox(t *testing.T, lease bool, code string) *box {
+	b := newBox(t)
+	src, err := os.ReadFile("omp-wan-probe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(b.sbin, "omp-wan-probe"), src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b.fake("ip", `
+case "$*" in
+  "link show ens20") exit 0 ;;
+  "link show "*) exit 1 ;;
+  "netns exec "*) shift 3; exec "$@" ;;
+esac
+exit 0`)
+	hook := ""
+	if lease {
+		hook = `script=""; while [ $# -gt 0 ]; do [ "$1" = -c ] && script=$2; shift; done
+reason=BOUND new_ip_address=100.70.1.9 new_subnet_cidr=24 new_routers="100.70.1.1 100.70.1.2" new_domain_name_servers="9.9.9.9" "$script"`
+	}
+	b.fake("dhcpcd", hook+`
+trap 'echo released >> "$FAKE/released"; exit 0' ALRM
+while :; do sleep 0.1; done`)
+	b.fake("sysctl", `exit 0`)
+	b.fake("curl", `
+case "$*" in
+  *generate_204*) printf '%s' "`+code+`" ;;
+  *ipinfo*) printf '{\n "ip": "172.56.1.2",\n "org": "AS21928 T-Mobile USA, Inc."\n}' ;;
+esac`)
+	return b
+}
+
+func (b *box) probe(window string) (string, string) {
+	b.t.Helper()
+	etc := filepath.Join(b.root, "netns-etc")
+	cmd := exec.Command(filepath.Join(b.sbin, "omp-wan-probe"), "ens20", window)
+	cmd.Env = append(b.env(), "OMP_NETNS_ETC="+etc)
+	out, _ := cmd.CombinedOutput()
+	return string(out), b.calls()
+}
+
+// Every probe, whatever it found, ends with the interface back in the host
+// and the namespace gone - a virtual interface left in a deleted namespace is
+// destroyed, and a physical one returns down and forgotten.
+func assertCleanedUp(t *testing.T, calls string) {
+	t.Helper()
+	for _, want := range []string{"ip -n omp-probe-ens20 link set ens20 netns 1", "ip netns del omp-probe-ens20"} {
+		if !strings.Contains(calls, want) {
+			t.Errorf("missing cleanup %q\ncalls:\n%s", want, calls)
+		}
+	}
+	if strings.Index(calls, "link set ens20 netns 1") > strings.LastIndex(calls, "ip netns del omp-probe-ens20") {
+		t.Error("the namespace was deleted before the interface was moved out of it")
+	}
+	up := strings.LastIndex(calls, "ip link set ens20 up")
+	v6 := strings.LastIndex(calls, "sysctl -qw net.ipv6.conf.ens20.disable_ipv6=1")
+	if up < 0 || v6 < 0 || v6 > up {
+		t.Errorf("the interface was not brought back up with IPv6 off first\ncalls:\n%s", calls)
+	}
+}
+
+func TestWANProbeFindsTheInternet(t *testing.T) {
+	b := probeBox(t, true, "204")
+	out, calls := b.probe("20")
+	for _, want := range []string{"ip=100.70.1.9", "gateway=100.70.1.1\n", "dns=9.9.9.9", "http_code=204", `"org": "AS21928 T-Mobile USA, Inc."`, "result=internet"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Count(out, "\nipinfo=") != 1 {
+		t.Errorf("ipinfo not on one line:\n%s", out)
+	}
+	if !strings.Contains(calls, "ip link set ens20 netns omp-probe-ens20") {
+		t.Error("the probe did not isolate the interface in its namespace")
+	}
+	if !strings.Contains(calls, "-c ") || strings.Contains(calls, "dhcpcd-run-hooks") {
+		t.Error("dhcpcd ran with its stock hooks, which set the hostname and resolv.conf")
+	}
+	if _, err := os.Stat(filepath.Join(b.root, "released")); err != nil {
+		t.Error("the lease was not released")
+	}
+	resolv, _ := os.ReadFile(filepath.Join(b.root, "netns-etc", "omp-probe-ens20", "resolv.conf"))
+	if len(resolv) != 0 {
+		t.Error("the namespace's resolv.conf was left behind")
+	}
+	assertCleanedUp(t, calls)
+}
+
+func TestWANProbeCaptivePortalIsNotTheInternet(t *testing.T) {
+	b := probeBox(t, true, "302")
+	out, calls := b.probe("3")
+	if !strings.Contains(out, "result=no-internet") || !strings.Contains(out, "answered 302") || strings.Contains(out, "ipinfo=") {
+		t.Errorf("output:\n%s", out)
+	}
+	assertCleanedUp(t, calls)
+}
+
+func TestWANProbeNoLease(t *testing.T) {
+	b := probeBox(t, false, "204")
+	out, calls := b.probe("2")
+	if !strings.Contains(out, "result=no-dhcp") || strings.Contains(out, "ip=") || strings.Contains(calls, "curl") {
+		t.Errorf("output:\n%s\ncalls:\n%s", out, calls)
+	}
+	assertCleanedUp(t, calls)
+}
+
+func TestWANProbeMissingInterface(t *testing.T) {
+	b := probeBox(t, true, "204")
+	cmd := exec.Command(filepath.Join(b.sbin, "omp-wan-probe"), "nope0", "2")
+	cmd.Env = b.env()
+	out, _ := cmd.CombinedOutput()
+	if !strings.Contains(string(out), "result=error") || strings.Contains(b.calls(), "netns add") {
+		t.Errorf("output:\n%s\ncalls:\n%s", out, b.calls())
 	}
 }

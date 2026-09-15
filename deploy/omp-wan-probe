@@ -1,0 +1,168 @@
+#!/bin/bash
+# Find out whether an interface nothing has claimed is a way to the internet
+# (D-070).
+#
+#     omp-wan-probe <interface> [window-seconds]
+#
+# Prints key=value lines, ending with result=:
+#
+#     result=internet      DHCP gave an address and Google's check answered 204
+#     result=no-internet   DHCP gave an address, but the check never answered 204
+#                          within the window (no service yet, or a captive portal)
+#     result=no-dhcp       no DHCP lease within the window
+#     result=error         the probe itself could not run; see detail=
+#
+# plus ip=, cidr=, gateway=, dns=, http_code= and, with internet, ipinfo=
+# (ipinfo.io's JSON on one line, for the ISP's name).
+#
+# The whole probe happens in a network namespace of its own. The interface is
+# moved into it, leased, tested and moved back, so nothing it learns - an
+# address, a default route, a DNS server, a hostname - can touch the vehicle's
+# routing while it is still unknown. A cellular modem that hands out a default
+# route is exactly the thing that must not become the vehicle's default route
+# by being plugged in. The lease is released at the end: provisioning, if the
+# owner chooses it, asks for its own.
+#
+# A link is given the whole window, five minutes by default, before it is
+# judged. Starlink takes minutes after power-on to hand out a real lease, and
+# gives a temporary one first; a link that is still booting is not a link
+# with nothing on it.
+set -u
+
+IFACE="${1:-}"
+WINDOW="${2:-${OMP_WAN_PROBE_SECONDS:-300}}"
+CHECK_URL="${OMP_WAN_CHECK_URL:-http://connectivitycheck.gstatic.com/generate_204}"
+IPINFO_URL="${OMP_WAN_IPINFO_URL:-https://ipinfo.io/json}"
+NETNS_ETC="${OMP_NETNS_ETC:-/etc/netns}"
+
+say() { printf '%s=%s\n' "$1" "$2"; }
+
+if [ -z "$IFACE" ] || ! ip link show "$IFACE" >/dev/null 2>&1; then
+	say detail "no such interface: ${IFACE:-none}"
+	say result error
+	exit 2
+fi
+
+NS="omp-probe-$IFACE"
+WORK=$(mktemp -d)
+DHCPCD_PID=""
+
+# Always put the interface back. A virtual interface is destroyed along with
+# a namespace rather than returned, and a physical one returns down and
+# unnamed-in-our-records, so it is moved out explicitly before the namespace
+# goes - on every exit, including the ones nobody planned.
+cleanup() {
+	if [ -n "$DHCPCD_PID" ] && kill -0 "$DHCPCD_PID" 2>/dev/null; then
+		# SIGALRM makes dhcpcd release the lease and exit.
+		kill -ALRM "$DHCPCD_PID" 2>/dev/null
+		for _ in 1 2 3 4 5 6 7 8 9 10; do
+			kill -0 "$DHCPCD_PID" 2>/dev/null || break
+			sleep 0.3
+		done
+		kill -TERM "$DHCPCD_PID" 2>/dev/null
+	fi
+	ip -n "$NS" link set "$IFACE" down 2>/dev/null
+	ip -n "$NS" link set "$IFACE" netns 1 2>/dev/null
+	ip netns del "$NS" 2>/dev/null
+	# Back up, so its carrier can still be read - with IPv6 off first: the move
+	# reset it, and the kernel would otherwise take a router advertisement's
+	# default route out of this unapproved link (D-026).
+	sysctl -qw "net.ipv6.conf.$IFACE.disable_ipv6=1" 2>/dev/null
+	ip link set "$IFACE" up 2>/dev/null
+	rm -rf "${NETNS_ETC:?}/$NS" "$WORK"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM
+
+# A namespace left by a probe that was killed outright is cleared first.
+ip netns del "$NS" 2>/dev/null
+if ! ip netns add "$NS"; then
+	say detail "could not create namespace $NS"
+	say result error
+	exit 1
+fi
+if ! ip link set "$IFACE" netns "$NS"; then
+	say detail "could not move $IFACE into $NS"
+	say result error
+	exit 1
+fi
+ip -n "$NS" link set lo up
+ip -n "$NS" link set "$IFACE" up
+
+# ip netns exec bind-mounts this over /etc/resolv.conf, so the check resolves
+# through the link's own DNS rather than the vehicle's stub resolver, which
+# does not exist inside the namespace.
+mkdir -p "$NETNS_ETC/$NS"
+: > "$NETNS_ETC/$NS/resolv.conf"
+
+# dhcpcd's hooks are replaced by this one, which only writes the lease down.
+# The stock hooks set the hostname and rewrite resolv.conf; none of that is
+# wanted from a link nobody has approved. The lease file's path is written into
+# the hook, because dhcpcd runs its script with an environment of its own.
+cat > "$WORK/hook" <<HOOK
+#!/bin/sh
+case "\$reason" in
+BOUND|RENEW|REBIND|REBOOT|STATIC)
+	{
+		echo "ip=\$new_ip_address"
+		echo "cidr=\$new_subnet_cidr"
+		echo "gateway=\${new_routers%% *}"
+		echo "dns=\$new_domain_name_servers"
+	} > "$WORK/lease.tmp" && mv "$WORK/lease.tmp" "$WORK/lease"
+	;;
+esac
+HOOK
+chmod 0755 "$WORK/hook"
+
+deadline=$(( $(date +%s) + WINDOW ))
+ip netns exec "$NS" dhcpcd -4 -B --noipv4ll -t 0 -c "$WORK/hook" "$IFACE" \
+	>"$WORK/dhcpcd.log" 2>&1 &
+DHCPCD_PID=$!
+
+while [ ! -s "$WORK/lease" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+	if ! kill -0 "$DHCPCD_PID" 2>/dev/null; then
+		say detail "dhcpcd exited: $(tail -1 "$WORK/dhcpcd.log" 2>/dev/null)"
+		say result error
+		exit 1
+	fi
+	sleep 1
+done
+if [ ! -s "$WORK/lease" ]; then
+	say detail "no DHCP lease in ${WINDOW}s"
+	say result no-dhcp
+	exit 0
+fi
+cat "$WORK/lease"
+
+dns=$(sed -n 's/^dns=//p' "$WORK/lease")
+for server in ${dns:-${OMP_WAN_FALLBACK_DNS:-1.1.1.1}}; do
+	echo "nameserver $server" >> "$NETNS_ETC/$NS/resolv.conf"
+done
+
+# Keep asking until the window closes. A link can lease an address well before
+# it can reach anything - Starlink does exactly that while it boots.
+code=000
+while :; do
+	code=$(ip netns exec "$NS" curl -s -m 10 -o /dev/null -w '%{http_code}' "$CHECK_URL" 2>/dev/null)
+	code=${code:-000}
+	[ "$code" = 204 ] && break
+	[ "$(date +%s)" -ge "$deadline" ] && break
+	sleep 5
+done
+say http_code "$code"
+
+if [ "$code" != 204 ]; then
+	# A captive portal answers the check with a page and a 200 or a redirect.
+	# That is not the internet, and it is not this tool's place to click
+	# through somebody's terms of service.
+	say detail "the connectivity check answered $code, not 204"
+	say result no-internet
+	exit 0
+fi
+
+# Who the link belongs to, from its own egress. Failing to learn the name is
+# not a reason to call a working link anything but working.
+info=$(ip netns exec "$NS" curl -s -m 10 "$IPINFO_URL" 2>/dev/null | tr -d '\n\r')
+[ -n "$info" ] && say ipinfo "$info"
+say result internet
+exit 0

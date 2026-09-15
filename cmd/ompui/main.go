@@ -58,6 +58,10 @@ type server struct {
 	// lan manages the LAN tab (D-067); nil where there is none to manage,
 	// which is home.
 	lan *lanManager
+
+	// wan finds new WAN links and names every link's ISP (D-070, D-071); nil
+	// at home, which does not own its links.
+	wan *wanManager
 }
 
 func main() {
@@ -69,6 +73,8 @@ func main() {
 	flowtestServer := flag.String("flowtest-server", "10.20.1.1:5202", "initiator only: home's omp-flowtest address for the on-demand per-path uplink test (D-053)")
 	linkSpeedPath := flag.String("linkspeed", linkspeed.DefaultPath, "initiator only: where a flow test's result is saved as the link's measured speed, which ompd shapes to (D-055)")
 	lanPath := flag.String("lan-config", "", "vehicle only: the LAN settings file the LAN tab manages (D-067), e.g. /etc/openmultipath/lan.json; empty hides the tab. Also restricts the interface to LAN addresses")
+	wanDetect := flag.Bool("wan-detect", false, "vehicle only: probe links nothing has claimed for DHCP and the internet, offer the ones that have both as new WAN links, and look up every link's ISP (D-070, D-071)")
+	wanTestIfaces := flag.String("wan-test-interfaces", "", "testing only: comma-separated virtual interfaces -wan-detect should treat as hardware, e.g. a veth standing in for a new NIC")
 	flag.Parse()
 
 	s := &server{
@@ -92,6 +98,20 @@ func main() {
 	mux.HandleFunc("/api/lan", s.handleLAN)
 	mux.HandleFunc("/api/lan/confirm", s.handleLANConfirm)
 	mux.HandleFunc("/api/lan/revert", s.handleLANRevert)
+	mux.HandleFunc("/api/wan", s.handleWAN)
+	mux.HandleFunc("/api/wan/add", s.handleWANAction((*wanManager).add))
+	mux.HandleFunc("/api/wan/ignore", s.handleWANAction((*wanManager).ignore))
+	mux.HandleFunc("/api/wan/recheck", s.handleWANAction((*wanManager).recheck))
+	if *wanDetect {
+		s.wan = newWANManager(*statePath, *lanPath, *unit)
+		s.wan.treatAsHardware = map[string]bool{}
+		for _, n := range strings.Split(*wanTestIfaces, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				s.wan.treatAsHardware[n] = true
+			}
+		}
+		s.wan.start()
+	}
 
 	var handler http.Handler = mux
 	if *lanPath != "" {

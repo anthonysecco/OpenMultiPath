@@ -374,6 +374,11 @@ type session struct {
 
 	// The vehicle's LAN subnets, under mu (D-068, lanroutes.go).
 	lan lanRoutes
+
+	// The vehicle's WireGuard transports, under mu (D-070, transports.go),
+	// and each path's ISP name, read without it (D-071).
+	tr   transports
+	isps atomic.Pointer[map[uint8]string]
 }
 
 func newSession(cfg *config.Holder, node, role string) *session {
@@ -975,10 +980,15 @@ func (s *session) runProbes(pathIDs func() []uint8, send func(pathID uint8, pkt 
 			}
 		}
 
-		// The same for a changed set of LANs (D-068).
+		// The same for a changed set of LANs (D-068), and of transports (D-070).
 		if payload := s.lanRoutesDue(now); payload != nil {
 			for _, id := range pathIDs() {
 				send(id, s.build(protocol.TypeLANRoutes, id, s.nextGlobalSeq(), payload, buf))
+			}
+		}
+		if payload := s.transportsDue(now); payload != nil {
+			for _, id := range pathIDs() {
+				send(id, s.build(protocol.TypeTransports, id, s.nextGlobalSeq(), payload, buf))
 			}
 		}
 
@@ -1042,6 +1052,7 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 		// due again (D-055), and may hold an older set of LANs (D-068).
 		s.speedsAcked = false
 		s.peerRestartedLANLocked()
+		s.peerRestartedTransportsLocked()
 	}
 	p.stats.noteBytes(wireLen)
 	if h.HasFlow {
@@ -1162,7 +1173,7 @@ func (s *session) metrics(now time.Duration) []pathMetric {
 			sendKbps:       p.meter.kbps,
 			shapedKbps:     s.shapedKbpsLocked(id),
 			budget:         s.budgetState(s.names[id], c),
-			label:          c.LabelFor(s.names[id]),
+			label:          s.displayLabel(c, id),
 
 			haveTx:       p.peer.fresh(now),
 			txSpreadMs:   p.peer.spreadMs,
@@ -1332,7 +1343,7 @@ func (s *session) logStats() {
 			st := &p.stats
 			log.Printf("%s: %s | rtt %.1fms p95-spread %.1fms jitter %.1fms queue %.1fms | "+
 				"rx %d lost %d bursts %v | samples %d%s | mtu %d | tx %.0fkbps | %s",
-				pathLabel(id, s.cfg.Get().LabelFor(s.names[id])), describe(d, id),
+				pathLabel(id, s.displayLabel(s.cfg.Get(), id)), describe(d, id),
 				ms(p.rtt), msi(st.spread()), st.jitter/1000, msi(st.queueDelay),
 				st.received, st.lost, st.bursts,
 				st.filled, thinNote(st.thin()),
@@ -1355,7 +1366,7 @@ func (s *session) logStats() {
 		if s.sched != nil {
 			// Named from the session's own table rather than the scheduler's,
 			// which belongs to the evaluation goroutine.
-			name := func(id uint8) string { return pathLabel(id, s.cfg.Get().LabelFor(s.names[id])) }
+			name := func(id uint8) string { return pathLabel(id, s.displayLabel(s.cfg.Get(), id)) }
 			log.Printf("bulk: %s; %d sent past every allowance", describeCascade(d, name), s.sched.overflowed.Load())
 			if n := s.sched.transMoved.Load(); n > 0 {
 				log.Printf("transactional: %d flows moved off a full path", n)
@@ -1489,7 +1500,8 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 		path := state.Path{
 			ID:                id,
 			Name:              s.names[id],
-			Label:             labelOrEmpty(snap.Config, s.names[id]),
+			Label:             s.labelFor(snap.Config, id),
+			ISP:               s.ispFor(id),
 			Budget:            budget.Band.String(),
 			BudgetMetered:     budget.Metered,
 			CapBytes:          budgetFor(s.names[id], c).CapBytes,
@@ -1639,6 +1651,7 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 	snap.LinkSpeedsHeld = s.haveSpeeds && len(s.speeds) > 0
 	snap.LinkSpeedsAcknowledged = s.role == roleInitiator && s.speedsAcked
 	snap.LANRoutes = s.lanRoutesSnapshotLocked()
+	snap.Transports = s.transportsSnapshotLocked()
 	if s.reseq != nil {
 		snap.Scheduler.Resequencer = s.reseq.stats()
 	}

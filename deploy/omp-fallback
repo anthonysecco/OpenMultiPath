@@ -104,9 +104,11 @@ ranked_links() {
 	ip -o route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'
 }
 
-# gateway_for prints the next hop for an interface's default route.
+# gateway_for prints the next hop for an interface's default route. Any
+# table, not only main: a WAN link added from the web interface keeps its DHCP
+# routes in its transport's table (D-070), and has no default in main at all.
 gateway_for() {
-	ip -o route show default dev "$1" 2>/dev/null |
+	ip -o route show table all default dev "$1" 2>/dev/null |
 		awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}'
 }
 

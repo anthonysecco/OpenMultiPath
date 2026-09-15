@@ -130,6 +130,12 @@ const (
 	// off while one goes unanswered; see lanroutes.go.
 	TypeLANRoutes    uint8 = 5
 	TypeLANRoutesAck uint8 = 6
+
+	// TypeTransports and TypeTransportsAck carry the vehicle's WireGuard
+	// transports and their ISP names to home (D-070); see transports.go.
+	// Versionless, like the LAN routes.
+	TypeTransports    uint8 = 7
+	TypeTransportsAck uint8 = 8
 )
 
 // Traffic classes, set by internal/classify from the inner packet.

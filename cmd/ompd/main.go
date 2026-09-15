@@ -23,6 +23,7 @@ import (
 	"github.com/anthonysecco/OpenMultiPath/internal/linkdisco"
 	"github.com/anthonysecco/OpenMultiPath/internal/linkspeed"
 	"github.com/anthonysecco/OpenMultiPath/internal/relay"
+	"github.com/anthonysecco/OpenMultiPath/internal/wan"
 )
 
 // hostname names this box in the web interface, so the two ends are
@@ -49,6 +50,9 @@ func main() {
 	linkSpeedPath := flag.String("linkspeed", linkspeed.DefaultPath, "initiator only: the measured link speeds ompui saves after a flow test; each link is shaped to 90% of its measurement and the set is passed to home (D-055). A missing file leaves every link unshaped")
 	lanPath := flag.String("lan-config", lan.DefaultPath, "initiator only: the LAN tab's settings (D-067); their subnets are passed to home to route back (D-068). A missing file sends nothing")
 	lanRoutesPath := flag.String("lan-routes", lan.DefaultRoutesPath, "responder only, with -tun: where the vehicle's LAN subnets are kept so they are routed again at startup (D-068)")
+	ispPath := flag.String("isp", wan.DefaultISPPath, "initiator only, with -tun: ompui's record of each link's ISP (D-071), passed to home with the transports (D-070)")
+	wgTransport := flag.String("wg-transport", "wgm", "responder only, with -tun: home's WireGuard interface for the vehicle's transports; a peer is added for any transport the vehicle reports that it lacks (D-070). Empty disables that")
+	wgTransportConf := flag.String("wg-transport-conf", "/etc/wireguard/wgm.conf", "responder only: the wg-quick file an added peer is saved to")
 	configPath := flag.String("config", "/etc/openmultipath/config.json", "adjustable settings, reloaded when the file changes")
 	wgInterface := flag.String("wg-interface", "wg0", "tunnel interface, read for its current MTU")
 	node := flag.String("node", hostname(), "this box's name, shown in the web interface")
@@ -109,6 +113,7 @@ func main() {
 
 			LinkSpeedPath: *linkSpeedPath,
 			LANPath:       *lanPath,
+			ISPPath:       *ispPath,
 		}
 		if err := relay.RunInitiator(cfg); err != nil {
 			log.Fatal(err)
@@ -125,6 +130,9 @@ func main() {
 			AuthKey:        authKey,
 			Tun:            relay.TunConfig{Name: *tunName, Addr: *tunAddr, MTU: *tunMTU},
 			LANRoutesPath:  *lanRoutesPath,
+
+			WGTransport:     *wgTransport,
+			WGTransportConf: *wgTransportConf,
 		}
 		if err := relay.RunResponder(cfg); err != nil {
 			log.Fatal(err)

@@ -55,6 +55,10 @@ type Snapshot struct {
 	// from the LAN tab.
 	LANRoutes []LANRoute `json:"lan_routes"`
 
+	// Transports is the vehicle's WireGuard transports and whether home has a
+	// peer for each (D-070).
+	Transports []TransportPeer `json:"transports"`
+
 	Paths     []Path        `json:"paths"`
 	Aggregate Aggregate     `json:"aggregate"`
 	Scheduler Scheduler     `json:"scheduler"`
@@ -207,7 +211,10 @@ type Path struct {
 	// configured. Name stays the interface, because the interface is what
 	// every other tool on the box is keyed by and renaming it here would
 	// break the one thing this file is for.
-	Label  string `json:"label,omitempty"`
+	Label string `json:"label,omitempty"`
+	// ISP is who the link belongs to, as ipinfo.io named it from the link's
+	// own egress (D-071); Label falls back to it.
+	ISP    string `json:"isp,omitempty"`
 	Remote string `json:"remote,omitempty"`
 
 	RTTMs        float64 `json:"rtt_ms"`
@@ -446,4 +453,17 @@ type LANRoute struct {
 	Routed bool `json:"routed"`
 	// Reason is why home refused it; home's snapshot only.
 	Reason string `json:"reason,omitempty"`
+}
+
+// TransportPeer is one of the vehicle's WireGuard transports as home was told
+// it (D-070).
+type TransportPeer struct {
+	PathID       uint8  `json:"path_id"`
+	PublicKey    string `json:"public_key"`
+	Address      string `json:"address"`
+	ISP          string `json:"isp,omitempty"`
+	Acknowledged bool   `json:"acknowledged"`
+	// Peered is home holding a wgm peer for it.
+	Peered bool   `json:"peered"`
+	Reason string `json:"reason,omitempty"` // why home refused it; home's snapshot only
 }

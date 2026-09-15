@@ -11,6 +11,7 @@ import (
 	"github.com/anthonysecco/OpenMultiPath/internal/lan"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 	"github.com/anthonysecco/OpenMultiPath/internal/record"
+	"github.com/anthonysecco/OpenMultiPath/internal/wan"
 )
 
 type ResponderConfig struct {
@@ -36,6 +37,12 @@ type ResponderConfig struct {
 	// sent them, so they are routed again at startup (D-068). Only used on a
 	// TUN, where home owns the routes into the tunnel.
 	LANRoutesPath string
+
+	// WGTransport is home's WireGuard interface for the vehicle's transports,
+	// and WGTransportConf its wg-quick file. Home adds a peer to both for any
+	// transport the vehicle reports that it lacks (D-070). Only on a TUN.
+	WGTransport     string
+	WGTransportConf string
 }
 
 // RunResponder relays between the public endpoint, reachable from any of
@@ -80,6 +87,10 @@ func RunResponder(cfg ResponderConfig) error {
 	if cfg.Tun.Enabled() {
 		hr := &lan.HomeRoutes{Tun: cfg.Tun.Name, Path: cfg.LANRoutesPath}
 		sess.setLANApplier(hr.Apply, hr.Restore())
+		if cfg.WGTransport != "" {
+			hp := &wan.HomePeers{Interface: cfg.WGTransport, ConfPath: cfg.WGTransportConf}
+			sess.setTransportsApplier(hp.Apply)
+		}
 	}
 
 	// v0.2: bulk the far end spread across paths is put back in order here
@@ -158,6 +169,14 @@ func RunResponder(cfg ResponderConfig) error {
 		if h.Type == protocol.TypeLANRoutes {
 			if ack := sess.receiveLANRoutes(payload); ack != nil {
 				sess.sendControl(h.PathID, sess.build(protocol.TypeLANRoutesAck, h.PathID, sess.nextGlobalSeq(), ack, make([]byte, 0, maxHeaderLen+len(ack))))
+			}
+			return
+		}
+
+		// The vehicle's transports (D-070), answered the same way.
+		if h.Type == protocol.TypeTransports {
+			if ack := sess.receiveTransports(payload); ack != nil {
+				sess.sendControl(h.PathID, sess.build(protocol.TypeTransportsAck, h.PathID, sess.nextGlobalSeq(), ack, make([]byte, 0, maxHeaderLen+len(ack))))
 			}
 			return
 		}

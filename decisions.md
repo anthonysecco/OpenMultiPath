@@ -3499,3 +3499,114 @@ auto-provisioning should follow the DHCP gateway instead of pinning one.
 **Transports are named by convention.** The table is the fwmark's hex digits and the guard
 priority is the table plus 100. The WAN auto-provisioning still to be built must follow
 it.
+
+**Follow-up (2026-09-15, during D-070's test).** The guard rules were found deleted on
+remote1. networkd reads `ManageForeignRoutingPolicyRules=no` only when it starts, and it
+had not restarted since the drop-in was installed. Until it did, every `networkctl reload`
+deleted every rule networkd had not written itself, and both the LAN tab and WAN
+provisioning run that command. Two fixes:
+- **networkd was restarted once.** A reload afterwards kept all the rules. Installing
+  `networkd-omp.conf` now means restarting `systemd-networkd` once.
+- **`omp-tun-up guard` re-asserts only the transport rules**, needs no TUN, and runs after
+  every `networkctl reload` ompui does. The guard no longer depends on networkd having been
+  restarted.
+
+## D-070 · New WAN links: probe automatically, add only when the owner says so
+
+**Decision.** A physical interface that nothing has claimed is checked automatically. It
+becomes a WAN link only when the owner clicks **Add** on the Home tab of the vehicle's web
+interface.
+
+**Candidates.** An interface is a candidate only when all of these hold (`wan.Unclaimed`):
+- it is hardware, meaning the kernel names a device behind it;
+- it is not a LAN;
+- no other netplan file configures it;
+- it has no address. Someone configured it, and probing moves an interface into a
+  namespace, which strips its addresses.
+
+A new NIC arrives administratively down and shows no carrier until brought up. ompui brings
+candidates up **with IPv6 disabled first**, because the kernel accepts router advertisements
+by default and would otherwise take an IPv6 default route out of an unapproved link
+(D-026).
+
+**Probing** (`deploy/omp-wan-probe`) happens in a network namespace of its own, so nothing
+learned about the link can touch the vehicle's routing:
+- DHCP by `dhcpcd` with its stock hooks replaced, so a lease cannot change the hostname or
+  `resolv.conf`.
+- Then Google's `generate_204` check, retried within the window. A captive portal's 200 or
+  redirect counts as no internet.
+- Then ipinfo.io for the ISP.
+- The lease is released, and the interface is moved back out before the namespace is
+  deleted (deleting a namespace destroys a virtual interface).
+
+The window is five minutes, because Starlink takes minutes to come online after power-on.
+
+**Outcomes, as the owner set them:**
+
+| Probe result | What happens |
+|---|---|
+| No lease | Nothing, until the link is replugged (carrier_changes moves) |
+| Lease but no internet | Nothing, but probed again every 10 minutes and on a replug |
+| Lease and internet | "New WAN link detected on ens20 — ISP", with Add and Ignore |
+| No carrier | Nothing (see Future) |
+
+**Add** (`cmd/ompui/wan.go`) follows the existing conventions:
+- **Transport:** the next free `wgN`, fwmark `0x200N` routed by table `200N`, the next free
+  10.20.1.x, and peer settings copied from an existing transport.
+- **Files:** a netplan file with DHCP (carrier DNS unused, no IPv6), plus a networkd drop-in
+  `[DHCPv4] RouteTable=200N`. The link's default route follows its lease's gateway rather
+  than pinning one, which avoids D-069's known fragility.
+- **Start-up:** `wg-quick@wgN` is started. Anything that fails is undone.
+- **Daemon:** ompd is restarted, which picks the transport up as a path.
+
+**Home learns the peer over the wire.** It is the D-068 exchange again, with two new
+versionless types, `TypeTransports` and `TypeTransportsAck`. They carry each path's
+WireGuard public key, tunnel address and ISP name. Home only ever adds peers, live and
+appended to `wgm.conf`:
+- it never changes or removes a peer;
+- it never gives an address to a second key;
+- it never gives out an address outside wgm's subnet.
+
+Its acknowledgement says which transports have a peer.
+
+**Rejected.** Adding links without asking: a restart drops the tunnel, and a probe cannot
+tell a WAN link from, say, a campground router the owner did not mean to use. A
+home-grown DHCP client: dhcpcd already does it. Probing in the host's own namespace: a
+modem's default route would become the vehicle's.
+
+**Verified on the real nodes** (2026-09-15) with a fake ISP: a namespace running its own
+DHCP server, NATed out AT&T, cabled to the host by a veth.
+- **Probe:** the link reached "ready" in 9 s, named AT&T from its own egress.
+- **Add (owner's click):** `wg3` was provisioned, home added its peer and acknowledged
+  within the same second, and ompd restarted with path 2. Path 2 went stable at 31.6 ms,
+  labelled AT&T at both ends.
+- **Test-only workaround:** netplan matches by `PermanentMACAddress`, which a veth lacks, so
+  a name-matched network file was used. Real NICs match normally.
+- **Found and fixed during the test:**
+  - a hand-addressed interface was probed and lost its address;
+  - a new NIC was never probed because it was down;
+  - the guard-rule deletion above.
+- The test link was removed afterwards.
+
+**Future.** A port with nothing attached is left alone. What to do with one is a future
+enhancement. There is no "remove WAN link" button yet; removing one is manual.
+
+## D-071 · Paths are named after their ISP, from ipinfo.io through the link itself
+
+**Decision.** Each link's ISP is looked up at ipinfo.io when its path comes up, and again
+when the stored answer is over 6 hours old, at most once every 5 minutes per link. The
+request is made from a socket carrying the transport's fwmark, so it leaves by that link
+and the answer describes the link's own egress. A new link is named by its probe.
+
+- **Name.** ipinfo's `org` field, with the AS number and legal suffixes stripped. A few
+  carriers use a brand name instead: AS14593 is Starlink, not Space Exploration
+  Technologies.
+- **Storage.** The name is kept in `/var/lib/openmultipath/isp.json`.
+- **Distribution.** The vehicle's ompd watches the file and sends the names to home in the
+  transport list (D-070).
+- **Where it shows.** Both ends label each path in logs, state, metrics and the web
+  interface in this order: a label set in settings, then the ISP name, then the interface.
+  The ISP is also always shown as its own tag.
+
+**Verified** (2026-09-15): `wg1` was named AT&T and `wg2` Starlink, each looked up through
+its own link.

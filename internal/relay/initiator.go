@@ -54,6 +54,10 @@ type InitiatorConfig struct {
 	// to home so home can route them back (D-068). A missing file sends
 	// nothing, and home keeps whatever routes it was given by hand.
 	LANPath string
+
+	// ISPPath is ompui's record of each link's ISP (D-071). The transports
+	// and their ISP names are passed to home (D-070).
+	ISPPath string
 }
 
 // RunInitiator relays between a local WireGuard interface and the home
@@ -153,6 +157,9 @@ func RunInitiator(cfg InitiatorConfig) error {
 		case protocol.TypeLANRoutesAck:
 			sess.noteLANRoutesAck(payload)
 			return
+		case protocol.TypeTransportsAck:
+			sess.noteTransportsAck(payload)
+			return
 		}
 
 		// Reports and probes carry no tunnel traffic; they exist only to
@@ -179,6 +186,10 @@ func RunInitiator(cfg InitiatorConfig) error {
 	}
 	if cfg.LANPath != "" {
 		go sess.watchLANFile(cfg.LANPath)
+	}
+	// Only above WireGuard do the paths have transports of their own.
+	if cfg.Tun.Enabled() {
+		go sess.watchTransports(cfg.ISPPath)
 	}
 
 	// Probes and reports go out every bound path, not just the chosen

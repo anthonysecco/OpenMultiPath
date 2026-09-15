@@ -2,7 +2,7 @@
 # Put the routing around D-020's TUN in place, once the daemon has
 # created it.
 #
-#     omp-tun-up initiator|responder
+#     omp-tun-up initiator|responder|guard
 #
 # Run as ExecStartPost on ompd.service, so the routes come back with the
 # daemon rather than needing a human after every restart.
@@ -21,6 +21,63 @@ LAN="${OMP_LAN:-10.0.0.0/24}"
 PEER_TUN="${OMP_PEER_TUN:-10.30.0.2}"
 # Home's WireGuard transport port (wgm's ListenPort), for the guard below.
 WG_PORT="${OMP_WG_PORT:-48219}"
+
+# guard_transports gives every per-link WireGuard transport its unreachable
+# rule, so a link that is down takes its tunnel down with it (D-069).
+guard_transports() {
+	# A link that is down takes its path down with it (D-069).
+	#
+	# The fwmark pinning (see the initiator case) has a hole. When a link loses carrier, networkd
+	# withdraws its table's default route, and a marked packet that finds
+	# nothing in its table falls through to main - whose default is the TUN.
+	# The transport then rides inside the tunnel over some other link, its
+	# probes keep answering, and the daemon reports a dead link as a healthy
+	# path: the call's duplicate copy lands on the same link as the original,
+	# which is no redundancy at all. WireGuard makes it worse by roaming its
+	# peer onto the tunnel address, which can black-hole the link when it
+	# comes back.
+	#
+	# So every transport also gets a rule of its own, just after its lookup:
+	# a packet carrying its mark that the lookup did not route is unreachable.
+	# That covers the link's table having lost its default route, and the
+	# lookup rule itself being gone - networkd deletes a link's rules when
+	# the link goes down, and never installs them for a link that is down at
+	# boot. A rule rather than an unreachable route in the table, because a
+	# route in a table nothing looks up does nothing; that was the first
+	# attempt, and it failed the first time a link actually went down.
+	#
+	# Priority is the table plus 100 (0x2001 is table 2001, guarded at 2101),
+	# the convention every transport so far has used. networkd must be told
+	# to leave rules it did not write alone (deploy/networkd-omp.conf), and
+	# restarted once after that is installed: until then every `networkctl
+	# reload` deletes these. `omp-tun-up guard` re-asserts them and nothing
+	# else, and ompui runs it after every reload it does.
+	for wg in $(wg show interfaces 2>/dev/null); do
+		mark=$(wg show "$wg" fwmark 2>/dev/null)
+		case "$mark" in
+		0x*) ;;
+		*) continue ;; # no mark: not a per-link transport
+		esac
+		table=${mark#0x}
+		case "$table" in
+		*[!0-9]*)
+			echo "omp-tun-up: $wg fwmark $mark does not name a table; not guarding it" >&2
+			continue
+			;;
+		esac
+		guard=$((10#$table + 100))
+		if ! ip rule show priority "$guard" | grep -q "fwmark $mark.*unreachable"; then
+			ip rule add fwmark "$mark" priority "$guard" unreachable
+		fi
+	done
+}
+
+# guard only re-asserts those rules. It needs no TUN, so it runs before
+# waiting for one.
+if [ "$ROLE" = guard ]; then
+	guard_transports
+	exit 0
+fi
 
 # The daemon opens the device early, but "early" is not "before systemd
 # runs the next line". A few seconds of patience here is the difference
@@ -61,49 +118,7 @@ initiator)
 		ip route replace "$pin/32" dev "$TUN" metric 40
 	done
 
-	# A link that is down takes its path down with it (D-069).
-	#
-	# The pinning above has a hole. When a link loses carrier, networkd
-	# withdraws its table's default route, and a marked packet that finds
-	# nothing in its table falls through to main - whose default is the TUN.
-	# The transport then rides inside the tunnel over some other link, its
-	# probes keep answering, and the daemon reports a dead link as a healthy
-	# path: the call's duplicate copy lands on the same link as the original,
-	# which is no redundancy at all. WireGuard makes it worse by roaming its
-	# peer onto the tunnel address, which can black-hole the link when it
-	# comes back.
-	#
-	# So every transport also gets a rule of its own, just after its lookup:
-	# a packet carrying its mark that the lookup did not route is unreachable.
-	# That covers the link's table having lost its default route, and the
-	# lookup rule itself being gone - networkd deletes a link's rules when
-	# the link goes down, and never installs them for a link that is down at
-	# boot. A rule rather than an unreachable route in the table, because a
-	# route in a table nothing looks up does nothing; that was the first
-	# attempt, and it failed the first time a link actually went down.
-	#
-	# Priority is the table plus 100 (0x2001 is table 2001, guarded at 2101),
-	# the convention every transport so far has used. networkd must be told
-	# to leave rules it did not write alone (deploy/networkd-omp.conf), or
-	# it removes these whenever it restarts.
-	for wg in $(wg show interfaces 2>/dev/null); do
-		mark=$(wg show "$wg" fwmark 2>/dev/null)
-		case "$mark" in
-		0x*) ;;
-		*) continue ;; # no mark: not a per-link transport
-		esac
-		table=${mark#0x}
-		case "$table" in
-		*[!0-9]*)
-			echo "omp-tun-up: $wg fwmark $mark does not name a table; not guarding it" >&2
-			continue
-			;;
-		esac
-		guard=$((10#$table + 100))
-		if ! ip rule show priority "$guard" | grep -q "fwmark $mark.*unreachable"; then
-			ip rule add fwmark "$mark" priority "$guard" unreachable
-		fi
-	done
+	guard_transports
 	;;
 responder)
 	# Home has to know where the vehicle's LAN lives now. Without this
@@ -115,7 +130,7 @@ responder)
 	ip route replace "$PEER_TUN"/32 dev "$TUN"
 	;;
 *)
-	echo "usage: omp-tun-up initiator|responder" >&2
+	echo "usage: omp-tun-up initiator|responder|guard" >&2
 	exit 2
 	;;
 esac

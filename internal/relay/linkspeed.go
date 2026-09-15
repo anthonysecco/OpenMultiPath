@@ -242,7 +242,7 @@ func (s *session) describeSpeedsLocked() string {
 			out += "; "
 		}
 		out += fmt.Sprintf("%s up %s down %s, shaped to %s",
-			pathLabel(uint8(id), s.cfg.Get().LabelFor(s.names[uint8(id)])),
+			pathLabel(uint8(id), s.displayLabel(s.cfg.Get(), uint8(id))),
 			kbpsText(float64(ls.UpKbps)), kbpsText(float64(ls.DownKbps)),
 			kbpsText(s.shapedKbpsLocked(uint8(id))))
 	}

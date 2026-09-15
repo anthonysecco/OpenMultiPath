@@ -82,6 +82,20 @@ func TestFirstApplyWritesEverythingWithoutProbation(t *testing.T) {
 	if !tl.ran("netplan generate") || !tl.ran("networkctl reload") {
 		t.Errorf("netplan/networkd not applied: %v", tl.cmds)
 	}
+	// A networkd reload can delete the transport guard rules (D-069); every
+	// reload is followed by putting them back.
+	reload, guard := -1, -1
+	for i, c := range tl.cmds {
+		if c == "networkctl reload" {
+			reload = i
+		}
+		if c == "omp-tun-up guard" {
+			guard = i
+		}
+	}
+	if reload < 0 || guard < reload {
+		t.Errorf("the transport guard was not re-asserted after networkctl reload: %v", tl.cmds)
+	}
 }
 
 // An address change stays only if confirmed. Unconfirmed, it is undone by

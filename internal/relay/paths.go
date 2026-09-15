@@ -368,6 +368,9 @@ func (ps *pathSet) name(id uint8) string {
 		if spec.id == id {
 			if ps.sess != nil && ps.sess.cfg != nil {
 				label = labelOrEmpty(ps.sess.cfg.Get(), spec.name)
+				if label == "" {
+					label = ps.sess.ispFor(id)
+				}
 			}
 			if label == "" {
 				label = spec.name

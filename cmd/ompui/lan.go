@@ -32,6 +32,7 @@ import (
 
 	"github.com/anthonysecco/OpenMultiPath/internal/lan"
 	"github.com/anthonysecco/OpenMultiPath/internal/state"
+	"github.com/anthonysecco/OpenMultiPath/internal/wan"
 )
 
 // lanProbationSeconds is how long an address change has to be confirmed.
@@ -394,6 +395,7 @@ func (m *lanManager) activate(from, to *lan.File) {
 	if out, err := m.run(nil, "networkctl", "reload"); err != nil {
 		log.Printf("ompui: networkctl reload: %v: %s", err, strings.TrimSpace(string(out)))
 	}
+	reassertGuard(m.run)
 	// Only the interfaces whose addressing changed. Reconfiguring a link
 	// re-applies its addresses, and a LAN whose settings did not change has
 	// devices on it that should not see it blink because a lease time on
@@ -453,6 +455,17 @@ func changedInterfaces(from, to *lan.File) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// reassertGuard puts back the transport guard rules (D-069) after a networkd
+// reload. A networkd that has not been restarted since its foreign-rule
+// setting was installed deletes every rule it did not write on reload, and
+// the guard is exactly such a rule; without it a dead link's tunnel falls
+// back into the tunnel over another link.
+func reassertGuard(run func(env []string, name string, args ...string) ([]byte, error)) {
+	if out, err := run(nil, "omp-tun-up", "guard"); err != nil {
+		log.Printf("ompui: omp-tun-up guard: %v: %s", err, strings.TrimSpace(string(out)))
+	}
 }
 
 func subnetList(f lan.File) string {
@@ -586,6 +599,8 @@ func liveInterfaces(m *lanManager, f *lan.File) []liveIface {
 			li.Role = "lan"
 		case defaults[i.Name]:
 			li.Role, li.Reason = "wan", "carries a default route"
+		case strings.HasPrefix(filepath.Base(elsewhere[i.Name]), wan.NetplanFilePrefix):
+			li.Role, li.Reason = "wan", "added as a WAN link"
 		case elsewhere[i.Name] != "":
 			li.Role, li.Reason = "unmanaged", "configured in "+elsewhere[i.Name]
 		default:
