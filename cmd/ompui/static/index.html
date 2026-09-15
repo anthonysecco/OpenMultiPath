@@ -169,6 +169,28 @@
   }
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .muted { color: var(--dim); font-size: 13px; }
+
+  /* LAN tab. Each LAN is a card the width of the page; its settings are
+     a grid of labelled inputs that folds to one column on a phone. */
+  .lan-card { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--line);
+              border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; }
+  .lan-card.up { border-left-color: var(--good); }
+  .lan-card.down { border-left-color: var(--bad); }
+  .lan-grid { display: grid; gap: 10px 18px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); margin-top: 10px; }
+  .lan-grid label { display: block; color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 3px; }
+  .lan-grid input[type=text], .lan-grid input[type=number], .lan-grid select { width: 100%; }
+  .lan-sub { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .lan-sub h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 0 0 8px; font-weight: 600; }
+  .lan-card table input[type=text] { width: 100%; min-width: 110px; }
+  .banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-weight: 600; border: 1px solid; }
+  .banner.warn { background: #2b2210; color: var(--warn); border-color: #4a3a12; }
+  .banner.bad { background: #2d1618; color: var(--bad); border-color: #5c2326; }
+  .banner.good { background: #10281a; color: var(--good); border-color: #1c4429; }
+  .banner ul { margin: 6px 0 0; padding-left: 18px; font-weight: 500; }
+  button.danger { background: transparent; color: var(--bad); border: 1px solid #5c2326; }
+  button.small { padding: 4px 10px; font-size: 13px; font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--line); margin-right: 6px; }
+  .dot.on { background: var(--good); }
 </style>
 </head>
 <body>
@@ -182,6 +204,7 @@
   <nav class="tabs">
     <button class="tab-btn" data-view="home" type="button">Home</button>
     <button class="tab-btn" data-view="flows" type="button">Flows</button>
+    <button class="tab-btn" data-view="lan" type="button" hidden>LAN</button>
     <button class="tab-btn" data-view="settings" type="button">Settings</button>
   </nav>
 
@@ -226,6 +249,39 @@
           <button class="secondary" id="flow-filter-clear" type="button">Clear</button>
         </div>
         <div id="flows-result"></div>
+      </section>
+    </div>
+
+    <div id="view-lan">
+      <div id="lan-banner"></div>
+      <section>
+        <h2>LANs</h2>
+        <div id="lan-segments"></div>
+        <div id="lan-unassigned"></div>
+      </section>
+      <section>
+        <h2>DNS</h2>
+        <form id="lan-dns" onsubmit="return false">
+          <div class="lan-grid" style="margin-top:0">
+            <div><label for="lan-domain">Local domain</label><input type="text" id="lan-domain">
+              <div class="muted">Devices are reachable as <i>hostname</i>.<span id="lan-domain-eg">lan</span>; the router is router.<span id="lan-domain-eg2">lan</span>.</div></div>
+            <div><label for="lan-upstream">Router forwards to</label><input type="text" id="lan-upstream">
+              <div class="muted">Comma-separated. Queries go through the tunnel.</div></div>
+          </div>
+        </form>
+      </section>
+      <div class="row" style="margin-bottom:26px">
+        <button id="lan-save" type="button">Save LAN settings</button>
+        <button class="secondary" id="lan-discard" type="button">Discard changes</button>
+        <span class="muted" id="lan-save-note"></span>
+      </div>
+      <section>
+        <h2>Clients</h2>
+        <div class="row" style="margin-bottom:10px">
+          <input type="text" id="lan-client-filter" placeholder="Filter: name, IP or MAC">
+          <span class="muted" id="lan-client-count"></span>
+        </div>
+        <div id="lan-clients"></div>
       </section>
     </div>
 
@@ -1179,12 +1235,386 @@ $("restart").addEventListener("click", async () => {
   setTimeout(loadLogs, 1500);
 });
 
+// ---- LAN tab (D-067) ----------------------------------------------------
+//
+// lanStatus is the last /api/lan response; lanDraft is the settings being
+// edited. The poll refreshes status, clients and interface state every few
+// seconds, but never the draft once somebody has changed it - a form that
+// resets under your cursor is worse than one that is a few seconds stale.
+let lanStatus = null, lanDraft = null, lanDirty = false, lanSaving = false;
+
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const LEASE_PRESETS = [[60, "1 hour"], [240, "4 hours"], [720, "12 hours"], [1440, "1 day"], [10080, "1 week"]];
+
+async function refreshLAN() {
+  let r;
+  try {
+    r = await (await fetch("/api/lan")).json();
+  } catch (e) {
+    return;
+  }
+  document.querySelector('.tab-btn[data-view="lan"]').hidden = !r.available;
+  if (!r.available) return;
+  lanStatus = r;
+  if (!lanDirty && !lanSaving) {
+    lanDraft = JSON.parse(JSON.stringify(r.settings));
+    renderLANForm();
+  }
+  renderLANBanner();
+  renderLANLive();
+  renderLANClients();
+}
+
+function markLANDirty() {
+  lanDirty = true;
+  $("lan-save-note").textContent = "Unsaved changes.";
+}
+
+function renderLANBanner() {
+  const r = lanStatus, out = [];
+  if (r.probation) {
+    out.push(`<div class="banner warn">
+      The new addressing is live on probation. Confirm within ${r.probation.seconds_left}s or it is undone automatically.
+      <div class="row" style="margin-top:8px">
+        <button id="lan-confirm" type="button">Keep these settings</button>
+        <button class="secondary" id="lan-revert" type="button">Undo now</button>
+      </div></div>`);
+  }
+  if (r.notice) out.push(`<div class="banner bad">${esc(r.notice)}</div>`);
+  if (!r.configured) {
+    out.push(`<div class="banner warn">These LANs are not managed from here yet. The settings below were read from the interfaces as they are now; nothing changes until you save.</div>`);
+  }
+  if (r.dnsmasq && !r.dnsmasq.installed) {
+    out.push(`<div class="banner bad">dnsmasq is not installed, so DHCP and the router's DNS are unavailable. Install it with <code>apt install dnsmasq</code>.</div>`);
+  } else if (r.configured && r.dnsmasq && !r.dnsmasq.active) {
+    out.push(`<div class="banner bad">dnsmasq is not running. DHCP and the router's DNS are down; check <code>journalctl -u dnsmasq</code>.</div>`);
+  }
+  if (r.error) out.push(`<div class="banner bad">${esc(r.error)}</div>`);
+  $("lan-banner").innerHTML = out.join("");
+  if (r.probation) {
+    $("lan-confirm").onclick = async () => {
+      await fetch("/api/lan/confirm", {method: "POST"});
+      refreshLAN();
+    };
+    $("lan-revert").onclick = async () => {
+      if (!confirm("Put the previous LAN settings back now?")) return;
+      await fetch("/api/lan/revert", {method: "POST"});
+      lanDirty = false;
+      refreshLAN();
+    };
+  }
+}
+
+function ifaceByName(name) {
+  return (lanStatus.interfaces || []).find(i => i.name === name) || null;
+}
+
+function homeRouteFor(address) {
+  const routes = lanStatus.home_routes || [];
+  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/.exec(address || "");
+  if (!m) return null;
+  const bits = +m[5];
+  const ip = ((+m[1] << 24) | (+m[2] << 16) | (+m[3] << 8) | +m[4]) >>> 0;
+  const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
+  const net = ((ip & mask) >>> 0);
+  const subnet = [net >>> 24, (net >>> 16) & 255, (net >>> 8) & 255, net & 255].join(".") + "/" + bits;
+  return routes.find(r => r.subnet === subnet) || {subnet, missing: true};
+}
+
+// The live parts of each card - link state and home routing - are filled in
+// separately from the inputs, so the poll can update them without touching
+// what is being typed.
+function renderLANLive() {
+  (lanDraft ? lanDraft.segments : []).forEach((seg, i) => {
+    const el = $("lan-live-" + i);
+    if (!el) return;
+    const li = ifaceByName(seg.interface);
+    const card = $("lan-card-" + i);
+    let link;
+    if (!li) link = `<span class="tag bad">interface missing</span>`;
+    else if (!li.up) link = `<span class="tag bad">down</span>`;
+    else if (!li.carrier) link = `<span class="tag bad">no cable / no carrier</span>`;
+    else link = `<span class="tag good">link up</span>`;
+    if (card) card.className = "lan-card " + (li && li.up && li.carrier ? "up" : "down");
+
+    let home = "";
+    const hr = homeRouteFor(seg.address);
+    if (lanStatus.configured && hr) {
+      if (hr.missing) home = `<span class="tag warn" title="Home has not been told about this subnet yet. It is sent when the settings are saved.">home: not yet told</span>`;
+      else if (!hr.acknowledged) home = `<span class="tag warn" title="The vehicle is telling home about this subnet and waiting for it to confirm.">home: sending…</span>`;
+      else if (hr.routed) home = `<span class="tag good" title="Home routes this subnet back down the tunnel.">home routes it</span>`;
+      else home = `<span class="tag bad" title="Home refused to route this subnet, usually because it overlaps a network home is on itself. Devices on this LAN have no internet. See home's daemon log.">home refused</span>`;
+    }
+    const addrs = li && li.addresses && li.addresses.length ? li.addresses.join(", ") : "no address";
+    const clients = (lanStatus.clients || []).filter(c => c.interface === seg.interface);
+    const online = clients.filter(c => c.online).length;
+    el.innerHTML = `${link} ${home}
+      <span class="muted">${esc(addrs)} · ${esc(li ? li.mac : "")} · ${clients.length} client${clients.length === 1 ? "" : "s"} (${online} active)
+      ${li ? " · ↓ " + bytes(li.rx_bytes) + " ↑ " + bytes(li.tx_bytes) : ""}</span>`;
+  });
+
+  const spare = (lanStatus.interfaces || []).filter(i => i.role === "unassigned" && !(lanDraft && lanDraft.segments.some(s => s.interface === i.name)));
+  $("lan-unassigned").innerHTML = spare.length ? `<div class="lan-card">
+      <div class="path-name">Unassigned interfaces</div>
+      <p class="muted" style="margin:4px 0 10px">Not a LAN, and not configured anywhere else. One that is really a WAN link that is down should be left alone.</p>
+      <table><tbody>${spare.map(i => `<tr>
+        <td><b>${esc(i.name)}</b></td><td>${esc(i.mac)}</td>
+        <td>${i.up && i.carrier ? '<span class="tag good">link up</span>' : '<span class="tag">no link</span>'}</td>
+        <td>${esc((i.addresses || []).join(", ") || "no address")}</td>
+        <td><button class="secondary small" type="button" data-add-lan="${esc(i.name)}">Use as a LAN</button></td>
+      </tr>`).join("")}</tbody></table></div>` : "";
+  document.querySelectorAll("[data-add-lan]").forEach(b => b.onclick = () => addLAN(b.dataset.addLan));
+}
+
+// suggestSubnet picks the first 10.0.N.1/24 no LAN uses yet.
+function suggestSubnet() {
+  const used = new Set(lanDraft.segments.map(s => (s.address || "").split(".").slice(0, 3).join(".")));
+  for (let n = 0; n < 255; n++) if (!used.has("10.0." + n)) return `10.0.${n}.1/24`;
+  return "";
+}
+
+function defaultRange(address) {
+  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/24$/.exec(address || "");
+  if (!m) return ["", ""];
+  const base = `${m[1]}.${m[2]}.${m[3]}.`;
+  return +m[4] >= 100 && +m[4] <= 199 ? [base + (+m[4] + 1), base + "199"] : [base + "100", base + "199"];
+}
+
+function addLAN(name) {
+  const li = ifaceByName(name);
+  const address = (li && li.addresses && li.addresses[0]) || suggestSubnet();
+  const [start, end] = defaultRange(address);
+  lanDraft.segments.push({
+    interface: name, name: "LAN " + (lanDraft.segments.length + 1), mac: li ? li.mac : "", address,
+    dhcp: {enabled: true, range_start: start, range_end: end, lease_minutes: 720, dns_mode: "router", dns_servers: [], reservations: []},
+  });
+  markLANDirty();
+  renderLANForm();
+  renderLANLive();
+}
+
+function renderLANForm() {
+  if (!lanDraft) return;
+  $("lan-domain").value = lanDraft.domain || "lan";
+  $("lan-upstream").value = (lanDraft.upstream_dns || []).join(", ");
+  $("lan-domain-eg").textContent = $("lan-domain-eg2").textContent = lanDraft.domain || "lan";
+
+  $("lan-segments").innerHTML = lanDraft.segments.map((s, i) => {
+    const d = s.dhcp;
+    const leasePreset = LEASE_PRESETS.some(([m]) => m === d.lease_minutes);
+    const res = (d.reservations || []).map((r, j) => `<tr>
+        <td><input type="text" data-seg="${i}" data-res="${j}" data-rk="hostname" value="${esc(r.hostname)}" placeholder="optional"></td>
+        <td><input type="text" data-seg="${i}" data-res="${j}" data-rk="mac" value="${esc(r.mac)}" placeholder="aa:bb:cc:dd:ee:ff"></td>
+        <td><input type="text" data-seg="${i}" data-res="${j}" data-rk="ip" value="${esc(r.ip)}"></td>
+        <td><button class="danger small" type="button" data-del-res="${i}:${j}">Remove</button></td>
+      </tr>`).join("");
+    return `<div class="lan-card" id="lan-card-${i}">
+      <div class="path-head" style="margin-bottom:4px">
+        <span class="path-name">${esc(s.name || s.interface)}</span>
+        <span class="tag">${esc(s.interface)}</span>
+        <span id="lan-live-${i}"></span>
+      </div>
+      <div class="lan-grid">
+        <div><label>Name</label><input type="text" data-seg="${i}" data-k="name" value="${esc(s.name)}"></div>
+        <div><label>Router address</label><input type="text" data-seg="${i}" data-k="address" value="${esc(s.address)}" placeholder="10.0.1.1/24">
+          <div class="muted">Address and prefix length. Changing it goes on probation.</div></div>
+      </div>
+      <div class="lan-sub">
+        <h3>DHCP server</h3>
+        <div class="row"><label style="display:flex;gap:8px;align-items:center;cursor:pointer">
+          <input type="checkbox" data-seg="${i}" data-dk="enabled" ${d.enabled ? "checked" : ""}> Hand out addresses on this LAN</label></div>
+        <div class="lan-grid" ${d.enabled ? "" : "hidden"}>
+          <div><label>Pool start</label><input type="text" data-seg="${i}" data-dk="range_start" value="${esc(d.range_start)}"></div>
+          <div><label>Pool end</label><input type="text" data-seg="${i}" data-dk="range_end" value="${esc(d.range_end)}"></div>
+          <div><label>Lease time</label><select data-seg="${i}" data-dk="lease_preset">
+            ${LEASE_PRESETS.map(([m, l]) => `<option value="${m}" ${m === d.lease_minutes ? "selected" : ""}>${l}</option>`).join("")}
+            <option value="custom" ${leasePreset ? "" : "selected"}>Custom…</option></select>
+            <input type="number" data-seg="${i}" data-dk="lease_minutes" value="${d.lease_minutes}" min="2" max="10080" ${leasePreset ? "hidden" : ""} style="margin-top:6px"> <span class="muted" ${leasePreset ? "hidden" : ""}>minutes</span></div>
+          <div><label>DNS given to clients</label><select data-seg="${i}" data-dk="dns_mode">
+            <option value="router" ${d.dns_mode === "router" ? "selected" : ""}>The router (default)</option>
+            <option value="custom" ${d.dns_mode === "custom" ? "selected" : ""}>Custom servers</option></select>
+            <input type="text" data-seg="${i}" data-dk="dns_servers" value="${esc((d.dns_servers || []).join(", "))}" placeholder="1.1.1.1, 1.0.0.1" ${d.dns_mode === "custom" ? "" : "hidden"} style="margin-top:6px">
+            <div class="muted">${d.dns_mode === "custom" ? "Clients skip the router; local hostnames will not resolve for them." : "Lets devices find each other by hostname."}</div></div>
+        </div>
+      </div>
+      <div class="lan-sub" ${d.enabled ? "" : "hidden"}>
+        <h3>Address reservations</h3>
+        ${res ? `<div style="overflow-x:auto"><table><thead><tr><th>Hostname</th><th>MAC</th><th>IP</th><th></th></tr></thead><tbody>${res}</tbody></table></div>` : `<p class="muted" style="margin:0 0 8px">None. Reserve a device from the client list below, or add one by hand.</p>`}
+        <button class="secondary small" type="button" data-add-res="${i}" style="margin-top:8px">Add reservation</button>
+      </div>
+      <div class="lan-sub row" style="justify-content:flex-end">
+        <button class="danger small" type="button" data-del-seg="${i}">Stop managing this LAN</button>
+      </div>
+    </div>`;
+  }).join("");
+
+  document.querySelectorAll("#lan-segments [data-seg]").forEach(el => {
+    el.addEventListener(el.type === "checkbox" || el.tagName === "SELECT" ? "change" : "input", () => onLANInput(el));
+  });
+  document.querySelectorAll("[data-del-res]").forEach(b => b.onclick = () => {
+    const [i, j] = b.dataset.delRes.split(":").map(Number);
+    lanDraft.segments[i].dhcp.reservations.splice(j, 1);
+    markLANDirty(); renderLANForm(); renderLANLive();
+  });
+  document.querySelectorAll("[data-add-res]").forEach(b => b.onclick = () => {
+    const d = lanDraft.segments[+b.dataset.addRes].dhcp;
+    d.reservations = d.reservations || [];
+    d.reservations.push({mac: "", ip: "", hostname: ""});
+    markLANDirty(); renderLANForm(); renderLANLive();
+  });
+  document.querySelectorAll("[data-del-seg]").forEach(b => b.onclick = () => {
+    const s = lanDraft.segments[+b.dataset.delSeg];
+    if (!confirm(`Stop managing ${s.name || s.interface}? Its address and DHCP are removed when you save, and its devices lose their connection.`)) return;
+    lanDraft.segments.splice(+b.dataset.delSeg, 1);
+    markLANDirty(); renderLANForm(); renderLANLive();
+  });
+}
+
+function onLANInput(el) {
+  const s = lanDraft.segments[+el.dataset.seg];
+  const csv = v => v.split(",").map(x => x.trim()).filter(Boolean);
+  let rerender = false;
+  if (el.dataset.k) {
+    s[el.dataset.k] = el.value.trim();
+  } else if (el.dataset.res !== undefined) {
+    s.dhcp.reservations[+el.dataset.res][el.dataset.rk] = el.value.trim();
+  } else {
+    const k = el.dataset.dk;
+    if (k === "enabled") {
+      s.dhcp.enabled = el.checked;
+      if (el.checked && !s.dhcp.range_start) [s.dhcp.range_start, s.dhcp.range_end] = defaultRange(s.address);
+      rerender = true;
+    } else if (k === "lease_preset") {
+      if (el.value !== "custom") s.dhcp.lease_minutes = +el.value;
+      rerender = true;
+    } else if (k === "lease_minutes") s.dhcp.lease_minutes = +el.value;
+    else if (k === "dns_mode") { s.dhcp.dns_mode = el.value; rerender = true; }
+    else if (k === "dns_servers") s.dhcp.dns_servers = csv(el.value);
+    else s.dhcp[k] = el.value.trim();
+  }
+  markLANDirty();
+  if (rerender) {
+    renderLANForm();
+    renderLANLive();
+    if (el.dataset.dk === "lease_preset" && el.value === "custom") {
+      const n = document.querySelector(`[data-seg="${el.dataset.seg}"][data-dk="lease_minutes"]`);
+      if (n) { n.hidden = false; n.nextElementSibling.hidden = false; n.focus(); }
+    }
+  }
+}
+
+["lan-domain", "lan-upstream"].forEach(id => $(id).addEventListener("input", () => {
+  lanDraft.domain = $("lan-domain").value.trim();
+  lanDraft.upstream_dns = $("lan-upstream").value.split(",").map(x => x.trim()).filter(Boolean);
+  $("lan-domain-eg").textContent = $("lan-domain-eg2").textContent = lanDraft.domain || "lan";
+  markLANDirty();
+}));
+
+async function saveLAN(note) {
+  if (!lanDraft) return;
+  // Which router address this page was loaded from, to say where to go if
+  // the save moves it.
+  const here = location.hostname;
+  const before = (lanStatus.settings.segments || []).find(s => (s.address || "").split("/")[0] === here);
+  lanSaving = true;
+  $("lan-save-note").textContent = note || "Applying…";
+  let res, body;
+  try {
+    res = await fetch("/api/lan", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(lanDraft)});
+    body = await res.json();
+  } catch (e) {
+    // Expected when the save moved the address this page is on.
+    body = {errors: ["The connection dropped while applying - the address this page is on may have changed."]};
+  }
+  lanSaving = false;
+  if (body.errors) {
+    $("lan-save-note").textContent = "";
+    $("lan-banner").insertAdjacentHTML("afterbegin",
+      `<div class="banner bad">Not saved:<ul>${body.errors.map(e => `<li>${esc(e)}</li>`).join("")}</ul></div>`);
+    window.scrollTo({top: 0, behavior: "smooth"});
+    return false;
+  }
+  lanDirty = false;
+  $("lan-save-note").textContent = body.probation ? "Applied on probation - confirm above." : "Saved and applied.";
+  if (body.probation && before) {
+    const after = lanDraft.segments.find(s => s.interface === before.interface);
+    const newHost = after && after.address.split("/")[0];
+    if (newHost && newHost !== here) {
+      $("lan-save-note").innerHTML = `Applied on probation. This LAN moved: reconnect (or renew DHCP) and open
+        <a href="${location.protocol}//${esc(newHost)}:${esc(location.port || "80")}/" style="color:var(--accent)">${esc(newHost)}</a>
+        within ${lanStatus.probation_seconds_total}s to keep it.`;
+    }
+  }
+  setTimeout(() => { if (!lanDirty) $("lan-save-note").textContent = ""; }, 8000);
+  refreshLAN();
+  return true;
+}
+
+$("lan-save").addEventListener("click", () => saveLAN());
+$("lan-discard").addEventListener("click", () => {
+  lanDirty = false;
+  $("lan-save-note").textContent = "";
+  refreshLAN();
+});
+
+function renderLANClients() {
+  const all = lanStatus.clients || [];
+  const term = $("lan-client-filter").value.trim().toLowerCase();
+  const list = all.filter(c => !term || [c.hostname, c.ip, c.mac, c.segment].some(v => (v || "").toLowerCase().includes(term)));
+  $("lan-client-count").textContent = `${all.length} device${all.length === 1 ? "" : "s"}, ${all.filter(c => c.online).length} active`;
+  if (!list.length) {
+    $("lan-clients").innerHTML = `<p class="muted">${all.length ? "No devices match." : "No devices seen on any LAN yet."}</p>`;
+    return;
+  }
+  const now = Date.now() / 1000;
+  const rows = list.map(c => {
+    const lease = c.kind === "dhcp" || (c.reserved && c.lease_expires_unix)
+      ? (c.lease_expires_unix === 0 ? "never" : "in " + duration(Math.max(0, c.lease_expires_unix - now)))
+      : "—";
+    const kind = {dhcp: "DHCP", reserved: "Reserved", static: "Static"}[c.kind] || c.kind;
+    const action = c.reserved
+      ? `<button class="secondary small" type="button" data-unreserve="${esc(c.mac)}" data-iface="${esc(c.interface)}">Release</button>`
+      : `<button class="secondary small" type="button" data-reserve="${esc(c.mac)}" data-ip="${esc(c.ip)}" data-host="${esc(c.hostname)}" data-iface="${esc(c.interface)}">Reserve</button>`;
+    return `<tr>
+      <td><span class="dot ${c.online ? "on" : ""}" title="${c.online ? "Active in the last few seconds" : "Not heard from recently"}"></span>${esc(c.hostname) || '<span class="muted">unknown</span>'}</td>
+      <td>${esc(c.ip)}</td><td>${esc(c.mac)}</td><td>${esc(c.segment || c.interface)}</td>
+      <td>${kind}</td><td>${lease}</td><td>${action}</td></tr>`;
+  }).join("");
+  $("lan-clients").innerHTML = `<div style="overflow-x:auto"><table>
+    <thead><tr><th>Name</th><th>IP address</th><th>MAC</th><th>LAN</th>
+      <th title="DHCP: leased from the pool. Reserved: always gets the same address. Static: set its own address; seen on the network only.">Type</th>
+      <th>Lease expires</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+
+  document.querySelectorAll("[data-reserve]").forEach(b => b.onclick = async () => {
+    if (lanDirty && !confirm("You have unsaved LAN changes. Reserving saves them too. Continue?")) return;
+    const seg = lanDraft.segments.find(s => s.interface === b.dataset.iface);
+    if (!seg) return;
+    const host = prompt("Name for this device (letters, digits and hyphens; leave empty to keep none):", b.dataset.host || "");
+    if (host === null) return;
+    seg.dhcp.reservations = seg.dhcp.reservations || [];
+    seg.dhcp.reservations.push({mac: b.dataset.reserve, ip: b.dataset.ip, hostname: host.trim()});
+    if (!await saveLAN("Reserving…")) seg.dhcp.reservations.pop();
+    renderLANForm(); renderLANLive();
+  });
+  document.querySelectorAll("[data-unreserve]").forEach(b => b.onclick = async () => {
+    if (lanDirty && !confirm("You have unsaved LAN changes. Releasing saves them too. Continue?")) return;
+    const seg = lanDraft.segments.find(s => s.interface === b.dataset.iface);
+    if (!seg) return;
+    seg.dhcp.reservations = (seg.dhcp.reservations || []).filter(r => r.mac !== b.dataset.unreserve);
+    await saveLAN("Releasing…");
+    renderLANForm(); renderLANLive();
+  });
+}
+$("lan-client-filter").addEventListener("input", () => lanStatus && renderLANClients());
+
 // Which of the two views is showing. Everything keeps polling underneath
 // regardless of which is active - state is cheap to fetch and switching
 // tabs should never feel like a fresh load.
 function showView(view) {
   $("view-home").hidden = view !== "home";
   $("view-flows").hidden = view !== "flows";
+  $("view-lan").hidden = view !== "lan";
   $("view-settings").hidden = view !== "settings";
   document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.view === view));
 }
@@ -1196,6 +1626,10 @@ refreshState();
 loadConfig();
 loadLogs();
 setInterval(refreshState, 1000);
+refreshLAN();
+// The LAN tab polls only while it is showing: it runs ip and reads leases
+// on every request, which is not worth doing every second for nobody.
+setInterval(() => { if (!$("view-lan").hidden) refreshLAN(); }, 3000);
 </script>
 </body>
 </html>

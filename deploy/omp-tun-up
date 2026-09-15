@@ -15,6 +15,8 @@ set +e
 
 ROLE="${1:-}"
 TUN="${OMP_TUN:-omp0}"
+# Space-separated: the vehicle can have more than one LAN segment, and home
+# needs a route back to every one of them.
 LAN="${OMP_LAN:-10.0.0.0/24}"
 PEER_TUN="${OMP_PEER_TUN:-10.30.0.2}"
 
@@ -61,7 +63,9 @@ responder)
 	# Home has to know where the vehicle's LAN lives now. Without this
 	# the inner packets arrive, get written into home's stack, and their
 	# replies have nowhere to go.
-	ip route replace "$LAN" dev "$TUN"
+	for net in $LAN; do
+		ip route replace "$net" dev "$TUN"
+	done
 	ip route replace "$PEER_TUN"/32 dev "$TUN"
 	;;
 *)

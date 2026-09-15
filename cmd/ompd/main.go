@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
+	"github.com/anthonysecco/OpenMultiPath/internal/lan"
 	"github.com/anthonysecco/OpenMultiPath/internal/linkdisco"
 	"github.com/anthonysecco/OpenMultiPath/internal/linkspeed"
 	"github.com/anthonysecco/OpenMultiPath/internal/relay"
@@ -39,13 +40,15 @@ func main() {
 	loopback := flag.String("loopback", "127.0.0.1:51900", "initiator only: local address WireGuard's peer Endpoint points at (this daemon listens here)")
 	wgTarget := flag.String("wg-target", "127.0.0.1:51821", "responder only: local address WireGuard itself is listening on (its ListenPort)")
 	paths := flag.String("paths", "", "initiator only: comma-separated interface names, e.g. enp1s0,enp2s0; each may be given as name=ip to pin a local address instead of discovering it. \"auto\" detects the WAN uplinks itself")
-	lan := flag.String("lan", "10.0.0.0/24", "initiator only: the vehicle's own LAN subnet, excluded from -paths auto so the LAN side and the Wi-Fi lifeline are never taken for uplinks")
+	lanSubnet := flag.String("lan", "10.0.0.0/24", "initiator only: the vehicle's own LAN subnet, excluded from -paths auto so the LAN side and the Wi-Fi lifeline are never taken for uplinks")
 	remote := flag.String("remote", "", "initiator only: home's public endpoint, e.g. 162.231.243.253:48219")
 	public := flag.String("public", "0.0.0.0:48219", "responder only: the forwarded public port to listen on")
 	statePath := flag.String("state", "/var/lib/openmultipath/state.json", "where to write the snapshot the web interface reads")
 	recordPath := flag.String("record", "/var/lib/openmultipath/history.jsonl", "where to append the rotating telemetry history; empty disables recording")
 	usagePath := flag.String("usage", "/var/lib/openmultipath/usage.json", "initiator only: where to keep per-link billing-cycle totals; empty disables cost tracking")
 	linkSpeedPath := flag.String("linkspeed", linkspeed.DefaultPath, "initiator only: the measured link speeds ompui saves after a flow test; each link is shaped to 90% of its measurement and the set is passed to home (D-055). A missing file leaves every link unshaped")
+	lanPath := flag.String("lan-config", lan.DefaultPath, "initiator only: the LAN tab's settings (D-067); their subnets are passed to home to route back (D-068). A missing file sends nothing")
+	lanRoutesPath := flag.String("lan-routes", lan.DefaultRoutesPath, "responder only, with -tun: where the vehicle's LAN subnets are kept so they are routed again at startup (D-068)")
 	configPath := flag.String("config", "/etc/openmultipath/config.json", "adjustable settings, reloaded when the file changes")
 	wgInterface := flag.String("wg-interface", "wg0", "tunnel interface, read for its current MTU")
 	node := flag.String("node", hostname(), "this box's name, shown in the web interface")
@@ -94,7 +97,7 @@ func main() {
 		cfg := relay.InitiatorConfig{
 			LoopbackAddr: *loopback,
 			RemoteAddr:   *remote,
-			Paths:        resolvePaths(*paths, *lan, *wgInterface, *tunName),
+			Paths:        resolvePaths(*paths, *lanSubnet, *wgInterface, *tunName),
 			Node:         *node,
 			StatePath:    *statePath,
 			RecordPath:   *recordPath,
@@ -105,6 +108,7 @@ func main() {
 			Tun:          relay.TunConfig{Name: *tunName, Addr: *tunAddr, MTU: *tunMTU},
 
 			LinkSpeedPath: *linkSpeedPath,
+			LANPath:       *lanPath,
 		}
 		if err := relay.RunInitiator(cfg); err != nil {
 			log.Fatal(err)
@@ -120,6 +124,7 @@ func main() {
 			Settings:       holder,
 			AuthKey:        authKey,
 			Tun:            relay.TunConfig{Name: *tunName, Addr: *tunAddr, MTU: *tunMTU},
+			LANRoutesPath:  *lanRoutesPath,
 		}
 		if err := relay.RunResponder(cfg); err != nil {
 			log.Fatal(err)

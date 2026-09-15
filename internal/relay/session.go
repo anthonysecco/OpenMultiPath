@@ -371,6 +371,9 @@ type session struct {
 	speedsAcked   bool
 	lastSpeedSent time.Duration
 	speedPayload  []byte
+
+	// The vehicle's LAN subnets, under mu (D-068, lanroutes.go).
+	lan lanRoutes
 }
 
 func newSession(cfg *config.Holder, node, role string) *session {
@@ -972,6 +975,13 @@ func (s *session) runProbes(pathIDs func() []uint8, send func(pathID uint8, pkt 
 			}
 		}
 
+		// The same for a changed set of LANs (D-068).
+		if payload := s.lanRoutesDue(now); payload != nil {
+			for _, id := range pathIDs() {
+				send(id, s.build(protocol.TypeLANRoutes, id, s.nextGlobalSeq(), payload, buf))
+			}
+		}
+
 		if now-lastProbe >= s.cfg.Get().ProbeInterval() {
 			lastProbe = now
 			for _, id := range pathIDs() {
@@ -1029,8 +1039,9 @@ func (s *session) observe(h *protocol.Header, wireLen int) {
 		}
 
 		// And it has forgotten the link speeds it was told, so they are
-		// due again (D-055).
+		// due again (D-055), and may hold an older set of LANs (D-068).
 		s.speedsAcked = false
+		s.peerRestartedLANLocked()
 	}
 	p.stats.noteBytes(wireLen)
 	if h.HasFlow {
@@ -1627,6 +1638,7 @@ func (s *session) snapshot(tunnelMTU int) state.Snapshot {
 	snap.Scheduler.WireVersion = int(s.emitVersion())
 	snap.LinkSpeedsHeld = s.haveSpeeds && len(s.speeds) > 0
 	snap.LinkSpeedsAcknowledged = s.role == roleInitiator && s.speedsAcked
+	snap.LANRoutes = s.lanRoutesSnapshotLocked()
 	if s.reseq != nil {
 		snap.Scheduler.Resequencer = s.reseq.stats()
 	}

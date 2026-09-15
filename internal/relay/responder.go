@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/anthonysecco/OpenMultiPath/internal/config"
+	"github.com/anthonysecco/OpenMultiPath/internal/lan"
 	"github.com/anthonysecco/OpenMultiPath/internal/protocol"
 	"github.com/anthonysecco/OpenMultiPath/internal/record"
 )
@@ -30,6 +31,11 @@ type ResponderConfig struct {
 	// inner packets into the host stack for egress - when its Name is
 	// set. Empty keeps the loopback relay.
 	Tun TunConfig
+
+	// LANRoutesPath is where the vehicle's LAN subnets are kept once it has
+	// sent them, so they are routed again at startup (D-068). Only used on a
+	// TUN, where home owns the routes into the tunnel.
+	LANRoutesPath string
 }
 
 // RunResponder relays between the public endpoint, reachable from any of
@@ -66,6 +72,15 @@ func RunResponder(cfg ResponderConfig) error {
 
 	sess := newSession(cfg.Settings, cfg.Node, roleResponder)
 	sess.setAuthKey(cfg.AuthKey)
+
+	// Routes back to the vehicle's LANs (D-068). Only on a TUN: below
+	// WireGuard the routes point at wg0, which wg-quick owns. The device
+	// exists by now, so the set kept from last time goes straight back in
+	// rather than waiting for the vehicle to be reachable.
+	if cfg.Tun.Enabled() {
+		hr := &lan.HomeRoutes{Tun: cfg.Tun.Name, Path: cfg.LANRoutesPath}
+		sess.setLANApplier(hr.Apply, hr.Restore())
+	}
 
 	// v0.2: bulk the far end spread across paths is put back in order here
 	// before it reaches the local endpoint. Only packets carrying a flow
@@ -135,6 +150,14 @@ func RunResponder(cfg ResponderConfig) error {
 		if h.Type == protocol.TypeLinkSpeed {
 			if ack := sess.receiveLinkSpeeds(payload); ack != nil {
 				sess.sendControl(h.PathID, sess.build(protocol.TypeLinkSpeedAck, h.PathID, sess.nextGlobalSeq(), ack, make([]byte, 0, maxHeaderLen+len(ack))))
+			}
+			return
+		}
+
+		// The vehicle's LAN subnets (D-068), answered the same way.
+		if h.Type == protocol.TypeLANRoutes {
+			if ack := sess.receiveLANRoutes(payload); ack != nil {
+				sess.sendControl(h.PathID, sess.build(protocol.TypeLANRoutesAck, h.PathID, sess.nextGlobalSeq(), ack, make([]byte, 0, maxHeaderLen+len(ack))))
 			}
 			return
 		}

@@ -50,6 +50,11 @@ type Snapshot struct {
 	LinkSpeedsHeld         bool `json:"link_speeds_held"`
 	LinkSpeedsAcknowledged bool `json:"link_speeds_acknowledged"`
 
+	// LANRoutes is the vehicle's LAN subnets and whether home routes each
+	// one back down the tunnel (D-068). Empty when the LAN is not managed
+	// from the LAN tab.
+	LANRoutes []LANRoute `json:"lan_routes"`
+
 	Paths     []Path        `json:"paths"`
 	Aggregate Aggregate     `json:"aggregate"`
 	Scheduler Scheduler     `json:"scheduler"`
@@ -430,4 +435,15 @@ func (s Snapshot) Age() time.Duration {
 	}
 	sec, frac := int64(s.UpdatedUnix), s.UpdatedUnix-float64(int64(s.UpdatedUnix))
 	return time.Since(time.Unix(sec, int64(frac*1e9)))
+}
+
+// LANRoute is one vehicle LAN subnet as home was told it (D-068).
+type LANRoute struct {
+	Subnet string `json:"subnet"`
+	// Acknowledged is home having confirmed it holds the current set.
+	Acknowledged bool `json:"acknowledged"`
+	// Routed is home routing the subnet down the tunnel.
+	Routed bool `json:"routed"`
+	// Reason is why home refused it; home's snapshot only.
+	Reason string `json:"reason,omitempty"`
 }

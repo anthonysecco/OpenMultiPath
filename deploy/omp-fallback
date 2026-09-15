@@ -40,7 +40,7 @@ RUNDIR="${OMP_RUN:-/run/openmultipath}"
 MARKER="$RUNDIR/fallback"
 ORDER_FILE="${OMP_FALLBACK_ORDER:-/etc/openmultipath/fallback.order}"
 WG="${OMP_WG_INTERFACE:-wg0}"
-LAN="${OMP_LAN:-10.0.0.0/24}"
+LAN="${OMP_LAN:-10.0.0.0/24}" # space-separated, one entry per LAN segment
 
 # The routing table holding our single default route, and the rule
 # priority wg-quick uses for its tunnel catch-all - which is the one we
@@ -178,8 +178,10 @@ enter() {
 		nft add table ip "$NFT_TABLE" 2>/dev/null
 		nft add chain ip "$NFT_TABLE" postrouting \
 			'{ type nat hook postrouting priority 100 ; }' 2>/dev/null
-		nft add rule ip "$NFT_TABLE" postrouting \
-			ip saddr "$LAN" oifname "$dev" masquerade 2>/dev/null
+		for net in $LAN; do
+			nft add rule ip "$NFT_TABLE" postrouting \
+				ip saddr "$net" oifname "$dev" masquerade 2>/dev/null
+		done
 	fi
 
 	printf '%s %s\n' "$dev" "$gw" > "$MARKER"

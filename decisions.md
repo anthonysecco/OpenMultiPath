@@ -3327,3 +3327,111 @@ for 66 s:
 
 The one-packet difference in each direction was still in flight when the capture
 stopped. Over the call, home discarded 2,746 duplicate copies and the vehicle 3,499.
+
+## D-067 · A LAN tab: addresses by netplan, DHCP and DNS by dnsmasq, changes on probation
+
+**Decision.** The vehicle's LAN segments are managed from a LAN tab in ompui, which works
+like a consumer router's. Each LAN gets a router address, an optional DHCP server (pool,
+lease time, reservations), and a choice of DNS for its clients: the router, which is the
+default, or custom servers. The tab lists every client with its hostname, address, MAC, how
+it got its address (DHCP, reserved, or static), when its lease expires, and whether it is
+active. Any client can be reserved in one click.
+
+- **Settings.** One file, `/etc/openmultipath/lan.json` (`internal/lan`). ompui is its only
+  writer (D-032's rule).
+- **Addresses.** Rendered to `/etc/netplan/40-omp-lan.yaml`, then `netplan generate`,
+  `networkctl reload`, and `networkctl reconfigure` on only the interfaces whose
+  addressing changed. A LAN has no DHCP client and no RA (the D-026 reasoning), and is
+  pinned by MAC.
+- **DHCP and DNS.** dnsmasq, rendered to `/etc/dnsmasq.d/omp-lan.conf` and checked with
+  `dnsmasq --test` before it replaces the running file. It binds only the LAN addresses
+  (`bind-dynamic`), so it never listens on a WAN link or collides with systemd-resolved.
+  It forwards to 1.1.1.1 and 1.0.0.1, which omp-tun-up already pins into the tunnel. Local
+  names resolve as `host.lan`, and `router.lan` resolves to whichever router address the
+  asker can reach.
+- **Scripts.** `/etc/default/openmultipath` (`OMP_LAN`, now space-separated) is written
+  for omp-pep-rules, omp-fallback and omp-tun-up. The PEP's interception rules move with
+  the subnets, and only if interception is already on.
+
+**Why dnsmasq.** It is what OpenWrt ships, is one Debian package, and does DHCP, DNS and
+lease-based hostname resolution in one process. Writing a DHCP server into ompui was
+rejected: CLAUDE.md says not to reinvent what exists, and a home-grown DHCP server is
+exactly the kind of thing that fails at 2am.
+
+**Not authoritative.** A second DHCP server left running on a segment would have its
+clients refused outright by an authoritative dnsmasq. Without that setting the two only
+compete for new clients, which is the failure you can recover from.
+
+**Address changes go on probation (principle 5).** A change that adds, removes or
+re-addresses a LAN can cut off the browser that made it. It stays for 120 s, and is kept
+only if someone confirms it, from either the old or the new address. Otherwise ompui puts
+the previous files back and re-applies them by itself. The deadline and backup are on disk,
+so a restart or reboot during probation still ends in a network somebody can reach.
+DHCP-only edits apply immediately. Settings that fail validation, fail
+`netplan generate` or `dnsmasq --test`, or collide with another netplan file configuring
+the same interface are refused, and nothing is changed.
+
+**The interface listens on every address and serves only LAN ones.** It used to be bound
+to 10.0.0.1. That address can now change, so it listens on `:8080` and returns 403 to any
+request that arrived on an address outside the LAN subnets (loopback excepted, and the old
+subnets are still allowed during probation). With no LAN settings it allows everything,
+because a management page nobody can reach is the worse failure.
+
+**Deployed and verified** on omp-remote1 (2026-09-15). cloud-init's network config was
+disabled and its eth0 stanza, plus a hand-made ens19 one, were moved to
+`/root/netplan-before-lan-tab/`. DHCP is on for both LANs, pool .100–.199, per the owner.
+- A full DHCP exchange was run on each LAN; the offers carried the router and DNS as the
+  router address with a 12 h lease.
+- The client was listed with its hostname, which resolved from the other LAN.
+  `router.lan` answered per LAN, an internet name forwarded, and an unknown `.lan` name
+  returned NXDOMAIN.
+- An unconfirmed test LAN reverted by itself after 120 s, at both ends.
+
+The Wi-Fi lifeline's AP drops DHCP broadcasts, so DHCP cannot be tested from the dev box
+over that path.
+
+## D-068 · The vehicle tells home its LAN subnets; home routes and NATs them
+
+**Decision.** Home learns the vehicle's LAN subnets from the vehicle, rather than from
+`OMP_LAN` and nftables.conf edited by hand. This follows the D-055 pattern: the whole set
+with a digest, repeated until home acknowledges that digest, then silence until it changes,
+and sent again when the peer restarts. There are two new packet types, `TypeLANRoutes`
+and `TypeLANRoutesAck` (`internal/protocol/lanroutes.go`).
+- **Routes.** Home installs `ip route replace <subnet> dev omp0` for each subnet and
+  removes the ones it installed for a previous set.
+- **NAT.** Home keeps nftables set `inet omp-nat vehicle_lans` in step, in one
+  transaction. If there is no such set, NAT is off (D-013's escape hatch) and nothing is
+  touched.
+- **Persistence.** The set is kept in `/var/lib/openmultipath/lan-routes.json` and applied
+  again at startup, before the vehicle is reachable.
+
+**Home screens every subnet** (`lan.Screen`). It will not route anything wider than a /16,
+anything outside private ranges, anything overlapping the tunnel's own subnets, or anything
+overlapping a network home is attached to. A subnet off the wire is being written into
+home's routing table, and `ip route replace` of home's own LAN would take home off its own
+network. The acknowledgement carries a bitmask of what was actually routed, so a refusal
+shows up on the vehicle's LAN tab ("home refused"), where the person who picked the subnet
+is.
+
+**No wire version.** The header's capability flag bits are used up (`flagCapableV4` was the
+last). A version-5 nibble would also be rejected outright by a v4 peer, taking the tunnel
+down mid-upgrade. Older builds already ignore packet types they do not know, so the vehicle
+sends the new type to any peer. Because it cannot tell an old home from a lost
+acknowledgement, it backs off exponentially from 1 s to one packet a minute instead of
+repeating every second.
+
+**Rejected.** SNAT on the vehicle, so home never needs the subnets: that breaks reaching
+vehicle devices from home, which is D-013's whole reason for a routed subnet. Routing a
+covering block such as 10.0.0.0/16 at home: it collides with home's own 10.10.10.0/24 and
+still breaks the first time a LAN is moved outside it.
+
+**Verified** (2026-09-15). The first save reached home in the same second, and both
+subnets were routed and added to the NAT set. A test LAN added and then reverted was
+routed and unrouted at both ends. A home restart restored the routes from disk before the
+vehicle re-sent anything.
+
+**Incident during setup.** Reloading home's `/etc/nftables.conf`, which begins with
+`flush ruleset`, wiped the `omp-tun` table and a masquerade for `10.20.0.0/24` and
+`10.30.0.0/24` that had only existed live. The RV's own egress and PEP-proxied TCP lost NAT
+for about 2 minutes. Both are restored, and the masquerade is now in the file; a reboot
+would previously have caused the same outage.

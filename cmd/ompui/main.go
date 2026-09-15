@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,6 +54,10 @@ type server struct {
 	linkSpeedPath string
 
 	diagMu sync.Mutex
+
+	// lan manages the LAN tab (D-067); nil where there is none to manage,
+	// which is home.
+	lan *lanManager
 }
 
 func main() {
@@ -63,6 +68,7 @@ func main() {
 	unit := flag.String("unit", "ompd", "systemd unit for the daemon, for log access and restarts")
 	flowtestServer := flag.String("flowtest-server", "10.20.1.1:5202", "initiator only: home's omp-flowtest address for the on-demand per-path uplink test (D-053)")
 	linkSpeedPath := flag.String("linkspeed", linkspeed.DefaultPath, "initiator only: where a flow test's result is saved as the link's measured speed, which ompd shapes to (D-055)")
+	lanPath := flag.String("lan-config", "", "vehicle only: the LAN settings file the LAN tab manages (D-067), e.g. /etc/openmultipath/lan.json; empty hides the tab. Also restricts the interface to LAN addresses")
 	flag.Parse()
 
 	s := &server{
@@ -83,11 +89,24 @@ func main() {
 	mux.HandleFunc("/api/diag/speedtest", s.handleDiagSpeedtest)
 	mux.HandleFunc("/api/linkspeed/clear", s.handleLinkSpeedClear)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/api/lan", s.handleLAN)
+	mux.HandleFunc("/api/lan/confirm", s.handleLANConfirm)
+	mux.HandleFunc("/api/lan/revert", s.handleLANRevert)
+
+	var handler http.Handler = mux
+	if *lanPath != "" {
+		s.lan = newLANManager(*lanPath, filepath.Dir(*statePath))
+		s.lan.resume()
+		// The LAN's addresses can now change under the interface, so it
+		// listens on every address and turns away what did not arrive on a
+		// LAN one, rather than binding one address that may be gone.
+		handler = s.lanGuard(mux)
+	}
 
 	log.Printf("ompui: serving on http://%s (state %s)", *listen, *statePath)
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	log.Fatal(srv.ListenAndServe())

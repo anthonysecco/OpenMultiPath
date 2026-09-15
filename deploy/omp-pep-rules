@@ -10,27 +10,44 @@
 # staying on the LAN is returned before the redirect so client-to-client and
 # client-to-vehicle connections are left alone. Only TCP is touched; UDP and
 # QUIC pass through to their own, already loss-tolerant, congestion control.
+#
+# OMP_LAN is space-separated, one entry per LAN segment. Traffic between two
+# of the vehicle's segments is local too, so every pair is returned, not just
+# a segment to itself.
 set -e
 LAN="${OMP_LAN:-10.0.0.0/24}"
 PORT="${OMP_PEP_PORT:-9050}"
 
 add() { iptables -t nat -C PREROUTING "$@" 2>/dev/null || iptables -t nat -A PREROUTING "$@"; }
+# The local-traffic exemptions are inserted rather than appended, so one added
+# for a new segment still lands ahead of a redirect that is already in place.
+ins() { iptables -t nat -C PREROUTING "$@" 2>/dev/null || iptables -t nat -I PREROUTING "$@"; }
 del() { iptables -t nat -D PREROUTING "$@" 2>/dev/null || true; }
 
 case "${1:-status}" in
 on)
-	add -s "$LAN" -d "$LAN" -p tcp -j RETURN
-	add -s "$LAN" -p tcp -j REDIRECT --to-ports "$PORT"
+	for src in $LAN; do
+		for dst in $LAN; do
+			ins -s "$src" -d "$dst" -p tcp -j RETURN
+		done
+	done
+	for src in $LAN; do
+		add -s "$src" -p tcp -j REDIRECT --to-ports "$PORT"
+	done
 	echo "omp-pep-rules: interception on for $LAN -> :$PORT"
 	;;
 off)
-	del -s "$LAN" -p tcp -j REDIRECT --to-ports "$PORT"
-	del -s "$LAN" -d "$LAN" -p tcp -j RETURN
+	for src in $LAN; do
+		del -s "$src" -p tcp -j REDIRECT --to-ports "$PORT"
+		for dst in $LAN; do
+			del -s "$src" -d "$dst" -p tcp -j RETURN
+		done
+	done
 	echo "omp-pep-rules: interception off"
 	;;
 status)
 	if iptables -t nat -S PREROUTING | grep -q "REDIRECT --to-ports $PORT"; then
-		echo "on"; iptables -t nat -S PREROUTING | grep -E "RETURN|REDIRECT" | grep "$LAN"
+		echo "on"; iptables -t nat -S PREROUTING | grep -E "RETURN|REDIRECT"
 	else
 		echo "off"
 	fi

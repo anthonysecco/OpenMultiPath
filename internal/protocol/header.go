@@ -123,6 +123,13 @@ const (
 	// content as payload; see linkspeed.go.
 	TypeLinkSpeed    uint8 = 3
 	TypeLinkSpeedAck uint8 = 4
+
+	// TypeLANRoutes and TypeLANRoutesAck need no version (D-068). The flag
+	// bits that advertise one are used up, and older builds already ignore a
+	// type they do not know, so the vehicle sends them to any peer and backs
+	// off while one goes unanswered; see lanroutes.go.
+	TypeLANRoutes    uint8 = 5
+	TypeLANRoutesAck uint8 = 6
 )
 
 // Traffic classes, set by internal/classify from the inner packet.

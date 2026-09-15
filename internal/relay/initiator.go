@@ -49,6 +49,11 @@ type InitiatorConfig struct {
 	// (D-055). Each link is shaped to 90% of its measured upload, and the
 	// set is passed to home. A missing file leaves every link unshaped.
 	LinkSpeedPath string
+
+	// LANPath is the LAN tab's settings file (D-067). Its subnets are passed
+	// to home so home can route them back (D-068). A missing file sends
+	// nothing, and home keeps whatever routes it was given by hand.
+	LANPath string
 }
 
 // RunInitiator relays between a local WireGuard interface and the home
@@ -141,8 +146,12 @@ func RunInitiator(cfg InitiatorConfig) error {
 		sess.notePeerVersion(ver)
 		sess.observe(&h, len(buf))
 
-		if h.Type == protocol.TypeLinkSpeedAck {
+		switch h.Type {
+		case protocol.TypeLinkSpeedAck:
 			sess.noteLinkSpeedAck(payload)
+			return
+		case protocol.TypeLANRoutesAck:
+			sess.noteLANRoutesAck(payload)
 			return
 		}
 
@@ -167,6 +176,9 @@ func RunInitiator(cfg InitiatorConfig) error {
 	sess.setPathWriter(paths.send, cfg.Tun.Enabled())
 	if cfg.LinkSpeedPath != "" {
 		go sess.watchLinkSpeeds(cfg.LinkSpeedPath)
+	}
+	if cfg.LANPath != "" {
+		go sess.watchLANFile(cfg.LANPath)
 	}
 
 	// Probes and reports go out every bound path, not just the chosen
